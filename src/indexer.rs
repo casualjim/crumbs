@@ -1,0 +1,145 @@
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use eyre::{Result, eyre};
+use futures::StreamExt;
+use text_chunking::{Chunk, WalkOptions, walk_project, Tokenizer};
+use uuid::Uuid;
+
+use crate::db::{ChunkRecord, Db};
+use crate::embedding::{Client as EmbedClient, EmbeddingInput, EmbeddingProvider};
+
+pub struct IndexerConfig {
+  pub repo_path: PathBuf,
+  pub max_chunk_size: usize,
+  pub overlap_percentage: f32,
+  pub tokenizer: Tokenizer,
+  pub max_parallel: usize,
+  pub max_file_size: Option<u64>,
+  pub large_file_threads: usize,
+}
+
+pub struct Indexer {
+  db: Db,
+  embedder: EmbedClient,
+  config: IndexerConfig,
+}
+
+impl Indexer {
+  pub fn new(db: Db, embedder: EmbedClient, config: IndexerConfig) -> Self {
+    Self { db, embedder, config }
+  }
+
+  pub async fn index(self) -> Result<()> {
+    let existing_hashes = self.db.load_existing_hashes()?;
+    let options = WalkOptions {
+      max_chunk_size: self.config.max_chunk_size,
+      tokenizer: self.config.tokenizer.clone(),
+      overlap_percentage: self.config.overlap_percentage,
+      max_parallel: self.config.max_parallel,
+      max_file_size: self.config.max_file_size,
+      large_file_threads: self.config.large_file_threads,
+      existing_hashes,
+      cancel_token: None,
+    };
+
+    let mut stream = walk_project(&self.config.repo_path, options);
+    let mut seen_files: HashSet<String> = HashSet::new();
+    let mut ordinals: HashMap<String, usize> = HashMap::new();
+
+    while let Some(item) = stream.next().await {
+      let project_chunk = item?;
+      match project_chunk.chunk {
+        Chunk::Delete { file_path } => {
+          self.db.delete_file(&file_path)?;
+          seen_files.remove(&file_path);
+          ordinals.remove(&file_path);
+        }
+        Chunk::Semantic(chunk) => {
+          let file_path = project_chunk.file_path.clone();
+          if !seen_files.contains(&file_path) {
+            self.db.clear_file_chunks(&file_path)?;
+            seen_files.insert(file_path.clone());
+            ordinals.insert(file_path.clone(), 0);
+          }
+
+          let ordinal = ordinals.get_mut(&file_path).map(|value| {
+            let current = *value;
+            *value += 1;
+            current
+          }).unwrap_or(0);
+
+          let embedding = embed_text(&self.embedder, chunk.text.clone()).await?;
+
+          let record = ChunkRecord {
+            id: Uuid::now_v7().to_string(),
+            file_path,
+            start_byte: chunk.start_byte,
+            end_byte: chunk.end_byte,
+            text: chunk.text,
+            kind: "semantic".to_string(),
+            ordinal,
+          };
+
+          self.db.insert_chunk(&record, &embedding)?;
+        }
+        Chunk::Text(chunk) => {
+          let file_path = project_chunk.file_path.clone();
+          if !seen_files.contains(&file_path) {
+            self.db.clear_file_chunks(&file_path)?;
+            seen_files.insert(file_path.clone());
+            ordinals.insert(file_path.clone(), 0);
+          }
+
+          let ordinal = ordinals.get_mut(&file_path).map(|value| {
+            let current = *value;
+            *value += 1;
+            current
+          }).unwrap_or(0);
+
+          let embedding = embed_text(&self.embedder, chunk.text.clone()).await?;
+
+          let record = ChunkRecord {
+            id: Uuid::now_v7().to_string(),
+            file_path,
+            start_byte: chunk.start_byte,
+            end_byte: chunk.end_byte,
+            text: chunk.text,
+            kind: "text".to_string(),
+            ordinal,
+          };
+
+          self.db.insert_chunk(&record, &embedding)?;
+        }
+        Chunk::EndOfFile {
+          file_path,
+          content_hash,
+          ..
+        } => {
+          if let Some(hash) = content_hash {
+            self
+              .db
+              .upsert_file(&file_path, project_chunk.file_size, hash)?;
+          } else {
+            return Err(eyre!(
+              "missing content hash for {}",
+              file_path
+            ));
+          }
+        }
+      }
+    }
+
+    Ok(())
+  }
+}
+
+async fn embed_text(client: &EmbedClient, text: String) -> Result<Vec<f32>> {
+  let input = EmbeddingInput { text, token_count: None };
+  let output = EmbeddingProvider::embed(client, &[input]).await?;
+  let mut embeddings = output.embeddings;
+  if embeddings.is_empty() {
+    return Err(eyre!("embedder returned no embeddings"));
+  }
+  Ok(embeddings.remove(0))
+}

@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@kumos/tree-sitter-parsers": "^0.1.7"
+  },
+  "trustedDependencies": [
+    "@kumos/tree-sitter-parsers"
+  ]
+}

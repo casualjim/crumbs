@@ -1,0 +1,7 @@
+/target
+node_modules
+.codex/config.toml
+*.log
+.codex/sessions
+.codex/*.jsonl
+.codex/auth.json
