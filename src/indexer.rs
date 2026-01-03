@@ -7,7 +7,7 @@ use text_chunking::{Chunk, WalkOptions, walk_project, Tokenizer};
 use uuid::Uuid;
 
 use crate::db::{ChunkRecord, Db};
-use crate::embedding::{Client as EmbedClient, EmbeddingInput, EmbeddingProvider};
+use crate::embedding::{EmbeddingInput, EmbeddingProvider};
 
 pub struct IndexerConfig {
   pub repo_path: PathBuf,
@@ -21,13 +21,13 @@ pub struct IndexerConfig {
 
 pub struct Indexer {
   db: Db,
-  embedder: EmbedClient,
+  embedder: Box<dyn EmbeddingProvider>,
   config: IndexerConfig,
 }
 
 impl Indexer {
-  pub fn new(db: Db, embedder: EmbedClient, config: IndexerConfig) -> Self {
-    Self { db, embedder, config }
+  pub fn new<E: EmbeddingProvider + 'static>(db: Db, embedder: E, config: IndexerConfig) -> Self {
+    Self { db, embedder: Box::new(embedder), config }
   }
 
   pub async fn index(self) -> Result<()> {
@@ -58,6 +58,7 @@ impl Indexer {
         Chunk::Semantic(chunk) => {
           let file_path = project_chunk.file_path.clone();
           if !seen_files.contains(&file_path) {
+            self.db.ensure_file(&file_path, project_chunk.file_size)?;
             self.db.clear_file_chunks(&file_path)?;
             seen_files.insert(file_path.clone());
             ordinals.insert(file_path.clone(), 0);
@@ -69,7 +70,7 @@ impl Indexer {
             current
           }).unwrap_or(0);
 
-          let embedding = embed_text(&self.embedder, chunk.text.clone()).await?;
+          let embedding = embed_text(self.embedder.as_ref(), chunk.text.clone()).await?;
 
           let record = ChunkRecord {
             id: Uuid::now_v7().to_string(),
@@ -86,6 +87,7 @@ impl Indexer {
         Chunk::Text(chunk) => {
           let file_path = project_chunk.file_path.clone();
           if !seen_files.contains(&file_path) {
+            self.db.ensure_file(&file_path, project_chunk.file_size)?;
             self.db.clear_file_chunks(&file_path)?;
             seen_files.insert(file_path.clone());
             ordinals.insert(file_path.clone(), 0);
@@ -97,7 +99,7 @@ impl Indexer {
             current
           }).unwrap_or(0);
 
-          let embedding = embed_text(&self.embedder, chunk.text.clone()).await?;
+          let embedding = embed_text(self.embedder.as_ref(), chunk.text.clone()).await?;
 
           let record = ChunkRecord {
             id: Uuid::now_v7().to_string(),
@@ -134,12 +136,69 @@ impl Indexer {
   }
 }
 
-async fn embed_text(client: &EmbedClient, text: String) -> Result<Vec<f32>> {
+async fn embed_text(client: &dyn EmbeddingProvider, text: String) -> Result<Vec<f32>> {
   let input = EmbeddingInput { text, token_count: None };
-  let output = EmbeddingProvider::embed(client, &[input]).await?;
+  let output = client.embed(&[input]).await?;
   let mut embeddings = output.embeddings;
   if embeddings.is_empty() {
     return Err(eyre!("embedder returned no embeddings"));
   }
   Ok(embeddings.remove(0))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use async_trait::async_trait;
+  use tempfile::TempDir;
+  use text_chunking::Tokenizer;
+
+  use crate::search;
+  use crate::test_support::write_fixture_repo;
+
+  #[derive(Clone)]
+  struct FakeEmbedder {
+    embedding: Vec<f32>,
+  }
+
+  #[async_trait]
+  impl EmbeddingProvider for FakeEmbedder {
+    async fn embed(&self, input: &[EmbeddingInput]) -> Result<crate::embedding::EmbedOutput> {
+      Ok(crate::embedding::EmbedOutput {
+        embeddings: vec![self.embedding.clone(); input.len()],
+      })
+    }
+  }
+
+  #[tokio::test]
+  async fn end_to_end_index_and_search() -> Result<()> {
+    let dir = TempDir::new()?;
+    write_fixture_repo(dir.path())?;
+
+    let db_path = dir.path().join("context.duckdb");
+    let embedder = FakeEmbedder {
+      embedding: vec![0.1, 0.2],
+    };
+    let db = Db::open(&db_path, Some(2))?;
+    let config = IndexerConfig {
+      repo_path: dir.path().to_path_buf(),
+      max_chunk_size: 512,
+      overlap_percentage: 0.1,
+      tokenizer: Tokenizer::Characters,
+      max_parallel: 2,
+      max_file_size: Some(5 * 1024 * 1024),
+      large_file_threads: 2,
+    };
+    let indexer = Indexer::new(db, embedder, config);
+    indexer.index().await?;
+
+    let embedder = FakeEmbedder {
+      embedding: vec![0.1, 0.2],
+    };
+    let db = Db::open(&db_path, Some(2))?;
+    let results = search::search(&db, &embedder, "add numbers", 5).await?;
+
+    assert!(!results.is_empty(), "expected search to return results");
+    Ok(())
+  }
 }

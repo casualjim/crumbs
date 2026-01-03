@@ -208,6 +208,11 @@ impl Db {
 
   pub fn clear_file_graph(&self, file_path: &str) -> Result<()> {
     self.conn.execute(
+      "DELETE FROM reference_symbol_edges WHERE symbol_id IN \
+       (SELECT id FROM symbols WHERE file_path = ?)",
+      params![file_path],
+    )?;
+    self.conn.execute(
       "DELETE FROM reference_symbol_edges WHERE reference_id IN \
        (SELECT id FROM symbol_references WHERE file_path = ?)",
       params![file_path],
@@ -249,11 +254,31 @@ impl Db {
     Ok(())
   }
 
+  pub fn ensure_file(&self, file_path: &str, file_size: u64) -> Result<()> {
+    self.conn.execute(
+      "INSERT INTO files (path, size, updated_at)
+       VALUES (?, ?, now())
+       ON CONFLICT(path) DO UPDATE SET
+         size = excluded.size,
+         updated_at = now()",
+      params![file_path, file_size as i64],
+    )?;
+    Ok(())
+  }
+
   pub fn insert_chunk(
     &self,
     record: &ChunkRecord,
     embedding: &[f32],
   ) -> Result<()> {
+    self.ensure_file_exists(&record.file_path)?;
+    if record.start_byte > record.end_byte {
+      return Err(eyre!(
+        "chunk byte range invalid: start {} > end {}",
+        record.start_byte,
+        record.end_byte
+      ));
+    }
     if embedding.len() != self.embedding_dim {
       return Err(eyre!(
         "embedding dimension mismatch: expected {}, got {}",
@@ -293,6 +318,7 @@ impl Db {
   }
 
   pub fn insert_symbol(&self, record: &SymbolRecord) -> Result<()> {
+    self.ensure_file_exists(&record.file_path)?;
     self.conn.execute(
       "INSERT INTO symbols (id, file_path, name, kind, start_byte, end_byte, language) \
        VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -314,6 +340,7 @@ impl Db {
   }
 
   pub fn insert_reference(&self, record: &ReferenceRecord) -> Result<()> {
+    self.ensure_file_exists(&record.file_path)?;
     self.conn.execute(
       "INSERT INTO symbol_references (id, file_path, name, start_byte, end_byte, language) \
        VALUES (?, ?, ?, ?, ?, ?)",
@@ -334,6 +361,8 @@ impl Db {
   }
 
   pub fn link_reference_symbol(&self, reference_id: &str, symbol_id: &str) -> Result<()> {
+    self.ensure_reference_exists(reference_id)?;
+    self.ensure_symbol_exists(symbol_id)?;
     self.conn.execute(
       "INSERT INTO reference_symbol_edges (reference_id, symbol_id) VALUES (?, ?)",
       params![reference_id, symbol_id],
@@ -376,6 +405,51 @@ impl Db {
       });
     }
     Ok(results)
+  }
+
+  fn ensure_file_exists(&self, file_path: &str) -> Result<()> {
+    let exists: Option<i64> = self
+      .conn
+      .query_row(
+        "SELECT 1 FROM files WHERE path = ?",
+        params![file_path],
+        |row| row.get(0),
+      )
+      .optional()?;
+    if exists.is_none() {
+      return Err(eyre!("file not found: {}", file_path));
+    }
+    Ok(())
+  }
+
+  fn ensure_reference_exists(&self, reference_id: &str) -> Result<()> {
+    let exists: Option<i64> = self
+      .conn
+      .query_row(
+        "SELECT 1 FROM symbol_references WHERE id = ?",
+        params![reference_id],
+        |row| row.get(0),
+      )
+      .optional()?;
+    if exists.is_none() {
+      return Err(eyre!("reference not found: {}", reference_id));
+    }
+    Ok(())
+  }
+
+  fn ensure_symbol_exists(&self, symbol_id: &str) -> Result<()> {
+    let exists: Option<i64> = self
+      .conn
+      .query_row(
+        "SELECT 1 FROM symbols WHERE id = ?",
+        params![symbol_id],
+        |row| row.get(0),
+      )
+      .optional()?;
+    if exists.is_none() {
+      return Err(eyre!("symbol not found: {}", symbol_id));
+    }
+    Ok(())
   }
 }
 
@@ -437,4 +511,180 @@ fn load_required_extension(conn: &Connection, name: &str, from: Option<&str>) ->
   };
   conn.execute_batch(&install)?;
   Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use duckdb::Connection;
+  use tempfile::TempDir;
+
+  #[test]
+  fn db_enforces_embedding_dim() -> Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("context.duckdb");
+
+    let _db = Db::open(&db_path, Some(2))?;
+    let mismatch = Db::open(&db_path, Some(3));
+    assert!(mismatch.is_err(), "expected embedding_dim mismatch error");
+    Ok(())
+  }
+
+  #[test]
+  fn db_rejects_chunk_without_file_row() -> Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("context.duckdb");
+    let db = Db::open(&db_path, Some(2))?;
+
+    let record = ChunkRecord {
+      id: "chunk-1".to_string(),
+      file_path: "missing.rs".to_string(),
+      start_byte: 0,
+      end_byte: 5,
+      text: "hello".to_string(),
+      kind: "text".to_string(),
+      ordinal: 0,
+    };
+    let result = db.insert_chunk(&record, &[0.1, 0.2]);
+
+    assert!(
+      result.is_err(),
+      "expected insert_chunk to fail when file row is missing"
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn db_rejects_chunk_with_inverted_bounds() -> Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("context.duckdb");
+    let db = Db::open(&db_path, Some(2))?;
+    let hash = [0u8; 32];
+
+    db.upsert_file("existing.rs", 12, hash)?;
+
+    let record = ChunkRecord {
+      id: "chunk-2".to_string(),
+      file_path: "existing.rs".to_string(),
+      start_byte: 10,
+      end_byte: 5,
+      text: "broken".to_string(),
+      kind: "text".to_string(),
+      ordinal: 0,
+    };
+    let result = db.insert_chunk(&record, &[0.1, 0.2]);
+
+    assert!(
+      result.is_err(),
+      "expected insert_chunk to reject inverted byte ranges"
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn db_rejects_symbol_without_file_row() -> Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("context.duckdb");
+    let db = Db::open(&db_path, Some(2))?;
+
+    let record = SymbolRecord {
+      id: "symbol-1".to_string(),
+      file_path: "missing.rs".to_string(),
+      name: "add".to_string(),
+      kind: "definition".to_string(),
+      start_byte: 0,
+      end_byte: 3,
+      language: "rust".to_string(),
+    };
+    let result = db.insert_symbol(&record);
+
+    assert!(
+      result.is_err(),
+      "expected insert_symbol to fail when file row is missing"
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn db_rejects_reference_without_file_row() -> Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("context.duckdb");
+    let db = Db::open(&db_path, Some(2))?;
+
+    let record = ReferenceRecord {
+      id: "ref-1".to_string(),
+      file_path: "missing.rs".to_string(),
+      name: "add".to_string(),
+      start_byte: 10,
+      end_byte: 13,
+      language: "rust".to_string(),
+    };
+    let result = db.insert_reference(&record);
+
+    assert!(
+      result.is_err(),
+      "expected insert_reference to fail when file row is missing"
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn db_rejects_reference_symbol_links_for_missing_ids() -> Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("context.duckdb");
+    let db = Db::open(&db_path, Some(2))?;
+
+    let result = db.link_reference_symbol("missing-ref", "missing-sym");
+
+    assert!(
+      result.is_err(),
+      "expected link_reference_symbol to fail for missing ids"
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn db_delete_file_cleans_cross_file_reference_edges() -> Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("context.duckdb");
+    let db = Db::open(&db_path, Some(2))?;
+    let hash = [0u8; 32];
+
+    db.upsert_file("a.rs", 12, hash)?;
+    db.upsert_file("b.rs", 12, hash)?;
+
+    let symbol = SymbolRecord {
+      id: "sym-1".to_string(),
+      file_path: "a.rs".to_string(),
+      name: "add".to_string(),
+      kind: "definition".to_string(),
+      start_byte: 0,
+      end_byte: 3,
+      language: "rust".to_string(),
+    };
+    let reference = ReferenceRecord {
+      id: "ref-2".to_string(),
+      file_path: "b.rs".to_string(),
+      name: "add".to_string(),
+      start_byte: 10,
+      end_byte: 13,
+      language: "rust".to_string(),
+    };
+
+    db.insert_symbol(&symbol)?;
+    db.insert_reference(&reference)?;
+    db.link_reference_symbol(&reference.id, &symbol.id)?;
+
+    db.delete_file("a.rs")?;
+
+    let conn = Connection::open(&db_path)?;
+    let edge_count: i64 =
+      conn.query_row("SELECT COUNT(*) FROM reference_symbol_edges", [], |row| row.get(0))?;
+
+    assert_eq!(
+      edge_count, 0,
+      "expected reference_symbol_edges to be removed when symbols are deleted"
+    );
+    Ok(())
+  }
 }

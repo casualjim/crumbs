@@ -237,3 +237,42 @@ async fn detect_language(file_path: &str, source: &str) -> Result<Option<String>
   };
   Ok(Some(normalized))
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tempfile::TempDir;
+  use text_chunking::Tokenizer;
+
+  use crate::test_support::write_fixture_repo;
+
+  #[tokio::test]
+  async fn graph_build_populates_symbols_and_references() -> Result<()> {
+    let dir = TempDir::new()?;
+    write_fixture_repo(dir.path())?;
+
+    let db_path = dir.path().join("context.duckdb");
+    let db = Db::open(&db_path, Some(2))?;
+
+    let config = GraphConfig {
+      repo_path: dir.path().to_path_buf(),
+      max_chunk_size: 1500,
+      overlap_percentage: 0.2,
+      tokenizer: Tokenizer::Characters,
+      max_parallel: 4,
+      max_file_size: Some(5 * 1024 * 1024),
+      large_file_threads: 2,
+    };
+    let indexer = GraphIndexer::new(db, config);
+    indexer.index().await?;
+
+    let conn = duckdb::Connection::open(&db_path)?;
+    let symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+    let references: i64 =
+      conn.query_row("SELECT COUNT(*) FROM symbol_references", [], |row| row.get(0))?;
+
+    assert!(symbols > 0, "expected symbols to be populated");
+    assert!(references > 0, "expected references to be populated");
+    Ok(())
+  }
+}

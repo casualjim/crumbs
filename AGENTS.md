@@ -1,0 +1,71 @@
+# Repository Guidelines
+
+## Project Overview
+
+`remark` is a Rust terminal UI (TUI) for writing code review notes in Git repos. Reviews are stored as git notes (default `refs/notes/remark`) and can be rendered into a collated prompt via `remark prompt`.
+
+## Project Structure
+
+- `src/`: Rust source code (single binary crate; entrypoint in `src/main.rs`).
+- `.github/workflows/`: CI and release automation (Rust checks, release-plz, cargo-dist).
+- `wix/`: Windows installer metadata used by `cargo-dist`/WiX.
+- `dist-workspace.toml`: release configuration (artifacts).
+
+## Build, Test, and Development Commands
+
+- `cargo build`: build a debug binary.
+- `cargo build --release`: build `target/release/remark`.
+- `cargo run -- <args>`: run locally (example: `cargo run -- prompt --filter base`).
+- `cargo fmt --all`: format code (CI enforces `-- --check`).
+- `cargo clippy --all-targets --all-features -- -D warnings`: lint (CI treats warnings as errors).
+- `cargo test --all`: run unit tests.
+
+## Coding Style & Naming Conventions
+
+- Rust edition: 2024 (see `Cargo.toml`).
+- Formatting: `rustfmt` with default settings; keep diffs small and idiomatic.
+- Linting: address `clippy` warnings instead of suppressing them.
+- Naming: follow standard Rust conventions (`UpperCamelCase` types, `snake_case` fns/modules).
+
+## Testing Guidelines
+
+- Tests are primarily unit tests colocated in modules (`mod tests { ... }` in `src/*.rs`).
+- Prefer small, behavior-focused tests; add new tests near the code they cover.
+- Run `cargo test --all` before opening a PR.
+
+## Commit & Pull Request Guidelines
+
+- Commit messages follow Conventional Commits (examples: `feat: ...`, `fix: ...`, `chore: ...`, `refactor: ...`, `test: ...`).
+- PRs should include: a clear description, rationale, and any user-facing behavior changes.
+- Ensure CI passes (`fmt`, `clippy`, `test`) before merging.
+- CRITICAL: Do not create commits unless the user explicitly asks. Always confirm before staging or committing changes.
+
+## Release Notes (Maintainers)
+
+Releases are cut automatically after CI passes on pushes to `main`. The `Cut Release` workflow runs `git-cliff` to update `CHANGELOG.md` and then uses `cargo-release` to bump the patch version and tag `vX.Y.Z`. Pushing the tag triggers `cargo-dist` to publish GitHub Release artifacts. A repo secret named `RELEASE_TOKEN` is required so the tag push can trigger the `Release` workflow. There is no release PR flow.
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds

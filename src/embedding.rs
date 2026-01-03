@@ -66,11 +66,16 @@ pub struct Client {
   base_url: String,
   model: String,
   dimension: usize,
+  context_length: usize,
+  max_batch_size: usize,
   dialect: ProviderDialect,
 }
 
 impl Client {
   pub fn new(config: EmbedderConfig) -> Result<Self> {
+    if config.embedding_dim == 0 {
+      return Err(eyre::eyre!("embedding_dim must be > 0"));
+    }
     if config.context_length == 0 {
       return Err(eyre::eyre!("context_length must be > 0"));
     }
@@ -79,18 +84,16 @@ impl Client {
     }
     let _ = config.tokens_per_minute;
 
+    let mut headers = http::HeaderMap::new();
+    if let Some(api_key) = &config.api_key {
+      let value = HeaderValue::from_str(&format!("Bearer {}", api_key.expose_secret()))
+        .map_err(|err| eyre::eyre!("invalid embedder api key: {err}"))?;
+      headers.insert(AUTHORIZATION, value);
+    }
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
     let client = HttpClient::builder()
-      .default_headers({
-        let mut headers = http::HeaderMap::new();
-        if let Some(api_key) = &config.api_key {
-          headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", api_key.expose_secret())).unwrap(),
-          );
-        }
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers
-      })
+      .default_headers(headers)
       .user_agent(format!(
         "Context/Embeddings; dialect={}",
         config.dialect
@@ -104,8 +107,65 @@ impl Client {
       base_url: config.base_url,
       model: config.model,
       dimension: config.embedding_dim,
+      context_length: config.context_length,
+      max_batch_size: config.max_batch_size,
       dialect: config.dialect,
     })
+  }
+
+  fn prepare_inputs(&self, input: &[EmbeddingInput]) -> Result<Vec<String>> {
+    if input.is_empty() {
+      return Err(eyre::eyre!("input batch cannot be empty"));
+    }
+    if input.len() > self.max_batch_size {
+      return Err(eyre::eyre!(
+        "input batch size {} exceeds max_batch_size {}",
+        input.len(),
+        self.max_batch_size
+      ));
+    }
+
+    let mut batch_texts = Vec::with_capacity(input.len());
+    for inp in input {
+      let trimmed = inp.text.trim();
+      if trimmed.is_empty() {
+        return Err(eyre::eyre!("Input text cannot be empty"));
+      }
+      let token_count = inp.token_count.unwrap_or_else(|| trimmed.chars().count());
+      if token_count > self.context_length {
+        return Err(eyre::eyre!(
+          "input length {} exceeds context_length {}",
+          token_count,
+          self.context_length
+        ));
+      }
+      batch_texts.push(trimmed.to_string());
+    }
+    Ok(batch_texts)
+  }
+
+  fn validate_embeddings(&self, input_len: usize, embeddings: &[Vec<f32>]) -> Result<()> {
+    if embeddings.is_empty() {
+      return Err(eyre::eyre!("embedder returned no embeddings"));
+    }
+    if embeddings.len() != input_len {
+      return Err(eyre::eyre!(
+        "embedding count mismatch: expected {}, got {}",
+        input_len,
+        embeddings.len()
+      ));
+    }
+    for (idx, embedding) in embeddings.iter().enumerate() {
+      if embedding.len() != self.dimension {
+        return Err(eyre::eyre!(
+          "embedding dimension mismatch at index {}: expected {}, got {}",
+          idx,
+          self.dimension,
+          embedding.len()
+        ));
+      }
+    }
+    Ok(())
   }
 }
 
@@ -125,13 +185,7 @@ struct EmbedApiResponse {
 impl EmbeddingProvider for Client {
   async fn embed(&self, input: &[EmbeddingInput]) -> Result<EmbedOutput> {
     debug!("Embedding input batch_size: {}", input.len());
-    let mut batch_texts = Vec::with_capacity(input.len());
-    for inp in input {
-      if inp.text.trim().is_empty() {
-        return Err(eyre::eyre!("Input text cannot be empty"));
-      }
-      batch_texts.push(inp.text.trim());
-    }
+    let batch_texts = self.prepare_inputs(input)?;
 
     let payload = match self.dialect {
       ProviderDialect::OpenAI | ProviderDialect::DeepInfra => {
@@ -171,8 +225,160 @@ impl EmbeddingProvider for Client {
         e
       })?;
 
-    Ok(EmbedOutput {
-      embeddings: response.data.into_iter().map(|embedding| embedding.embedding).collect(),
+    let embeddings: Vec<Vec<f32>> =
+      response.data.into_iter().map(|embedding| embedding.embedding).collect();
+    self.validate_embeddings(input.len(), &embeddings)?;
+
+    Ok(EmbedOutput { embeddings })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::panic;
+  use std::time::Duration;
+
+  use secrecy::SecretString;
+
+  fn build_test_embedder(
+    embedding_dim: usize,
+    context_length: usize,
+    max_batch_size: usize,
+  ) -> Client {
+    Client::new(EmbedderConfig {
+      api_key: None,
+      base_url: "http://127.0.0.1:1".to_string(),
+      timeout: Duration::from_secs(5),
+      dialect: ProviderDialect::OpenAI,
+      model: "test-model".to_string(),
+      embedding_dim,
+      context_length,
+      max_batch_size,
+      tokens_per_minute: 1_000,
     })
+    .expect("build test embedder")
+  }
+
+  #[test]
+  fn embedder_new_should_not_panic_on_invalid_api_key() {
+    let result = panic::catch_unwind(|| {
+      let _ = Client::new(EmbedderConfig {
+        api_key: Some(SecretString::from("bad\nkey")),
+        base_url: "http://127.0.0.1:1".to_string(),
+        timeout: Duration::from_secs(1),
+        dialect: ProviderDialect::OpenAI,
+        model: "test-model".to_string(),
+        embedding_dim: 2,
+        context_length: 8,
+        max_batch_size: 1,
+        tokens_per_minute: 1,
+      });
+    });
+
+    assert!(
+      result.is_ok(),
+      "Client::new should return Err, not panic, for invalid API keys"
+    );
+  }
+
+  #[test]
+  fn embedder_new_rejects_zero_dimension() {
+    let result = Client::new(EmbedderConfig {
+      api_key: None,
+      base_url: "http://127.0.0.1:1".to_string(),
+      timeout: Duration::from_secs(1),
+      dialect: ProviderDialect::OpenAI,
+      model: "test-model".to_string(),
+      embedding_dim: 0,
+      context_length: 8,
+      max_batch_size: 1,
+      tokens_per_minute: 1,
+    });
+
+    assert!(
+      result.is_err(),
+      "expected Client::new to reject embedding_dim = 0"
+    );
+  }
+
+  #[test]
+  fn embedder_rejects_empty_input_batch() {
+    let client = build_test_embedder(2, 8, 4);
+    let result = client.prepare_inputs(&[]);
+
+    assert!(
+      result.is_err(),
+      "expected embedder to reject empty input batches"
+    );
+  }
+
+  #[test]
+  fn embedder_rejects_mismatched_embedding_count() {
+    let client = build_test_embedder(2, 8, 4);
+    let result = client.validate_embeddings(1, &[vec![0.1, 0.2], vec![0.3, 0.4]]);
+
+    assert!(
+      result.is_err(),
+      "expected error when embedding count does not match inputs"
+    );
+  }
+
+  #[test]
+  fn embedder_rejects_dimension_mismatch() {
+    let client = build_test_embedder(2, 8, 4);
+    let result = client.validate_embeddings(1, &[vec![0.1]]);
+
+    assert!(
+      result.is_err(),
+      "expected error when embedding dimension does not match config"
+    );
+  }
+
+  #[test]
+  fn embedder_rejects_empty_response() {
+    let client = build_test_embedder(2, 8, 4);
+    let result = client.validate_embeddings(1, &[]);
+
+    assert!(
+      result.is_err(),
+      "expected error when embedder returns no embeddings"
+    );
+  }
+
+  #[test]
+  fn embedder_enforces_max_batch_size() {
+    let client = build_test_embedder(2, 8, 1);
+    let inputs = vec![
+      EmbeddingInput {
+        text: "first".to_string(),
+        token_count: None,
+      },
+      EmbeddingInput {
+        text: "second".to_string(),
+        token_count: None,
+      },
+    ];
+    let result = client.prepare_inputs(&inputs);
+
+    assert!(
+      result.is_err(),
+      "expected error when batch exceeds max_batch_size"
+    );
+  }
+
+  #[test]
+  fn embedder_enforces_context_length() {
+    let client = build_test_embedder(2, 1, 4);
+    let inputs = vec![EmbeddingInput {
+      text: "hello".to_string(),
+      token_count: None,
+    }];
+    let result = client.prepare_inputs(&inputs);
+
+    assert!(
+      result.is_err(),
+      "expected error when input exceeds context_length"
+    );
   }
 }

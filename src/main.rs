@@ -5,7 +5,7 @@ mod graph;
 mod indexer;
 mod search;
 #[cfg(test)]
-mod tests;
+mod test_support;
 
 use std::time::Duration;
 
@@ -27,9 +27,13 @@ async fn main() -> Result<()> {
     Command::Index(_) => {
       let tokenizer = parse_tokenizer(&cfg.chunking.tokenizer)?;
       let embedder = build_embedder(&cfg.embedding)?;
-      let db = Db::open(&cfg.database.path, Some(cfg.database.embedding_dim))?;
+      let db = Db::open(&cfg.database.path, Some(cfg.embedding.embedding_dim))?;
       let config = IndexerConfig {
-        repo_path: cfg.index.repo.clone(),
+        repo_path: cfg
+          .paths
+          .repo
+          .clone()
+          .expect("repo path resolved"),
         max_chunk_size: cfg.chunking.max_chunk_size,
         overlap_percentage: cfg.chunking.overlap,
         tokenizer,
@@ -42,9 +46,13 @@ async fn main() -> Result<()> {
     }
     Command::Graph(_) => {
       let tokenizer = parse_tokenizer(&cfg.chunking.tokenizer)?;
-      let db = Db::open(&cfg.database.path, Some(cfg.database.embedding_dim))?;
+      let db = Db::open(&cfg.database.path, Some(cfg.embedding.embedding_dim))?;
       let config = graph::GraphConfig {
-        repo_path: cfg.graph.repo.clone(),
+        repo_path: cfg
+          .paths
+          .repo
+          .clone()
+          .expect("repo path resolved"),
         max_chunk_size: cfg.chunking.max_chunk_size,
         overlap_percentage: cfg.chunking.overlap,
         tokenizer,
@@ -57,7 +65,7 @@ async fn main() -> Result<()> {
     }
     Command::Search(cmd) => {
       let embedder = build_embedder(&cfg.embedding)?;
-      let db = Db::open(&cfg.database.path, Some(cfg.database.embedding_dim))?;
+      let db = Db::open(&cfg.database.path, Some(cfg.embedding.embedding_dim))?;
       let results = search::search(&db, &embedder, &cmd.query, cfg.search.limit).await?;
       for (idx, result) in results.iter().enumerate() {
         let score = 1.0 - result.distance;
@@ -81,7 +89,7 @@ fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {
   let dialect = parse_dialect(cfg.dialect.as_str())?;
   let config = EmbedderConfig {
     api_key: cfg.api_key.clone(),
-    base_url: cfg.base_url.clone(),
+    base_url: cfg.url.clone(),
     timeout: Duration::from_secs(cfg.timeout_seconds),
     dialect,
     model: cfg.model.clone(),
