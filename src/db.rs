@@ -1,10 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use duckdb::types::Value;
 use duckdb::{Connection, OptionalExt, params, params_from_iter};
 use eyre::{Result, eyre};
 use tracing::warn;
+
+use crate::repository::Repository;
 
 pub struct Db {
     conn: Connection,
@@ -95,6 +97,18 @@ impl Db {
           size BIGINT,
           updated_at TIMESTAMP DEFAULT now()
         );
+        CREATE TABLE IF NOT EXISTS file_commit_edges (
+          file_path TEXT NOT NULL REFERENCES files(path),
+          commit_id TEXT NOT NULL,
+          PRIMARY KEY (file_path, commit_id)
+        );
+        CREATE TABLE IF NOT EXISTS file_cochange_edges (
+          src_path TEXT NOT NULL REFERENCES files(path),
+          dst_path TEXT NOT NULL REFERENCES files(path),
+          commit_count BIGINT NOT NULL,
+          weight DOUBLE NOT NULL,
+          PRIMARY KEY (src_path, dst_path)
+        );
         CREATE TABLE IF NOT EXISTS chunks (
           id TEXT PRIMARY KEY,
           file_path TEXT NOT NULL REFERENCES files(path),
@@ -144,6 +158,10 @@ impl Db {
           PRIMARY KEY (reference_id, symbol_id)
         );
         CREATE INDEX IF NOT EXISTS chunks_file_path_idx ON chunks (file_path);
+        CREATE INDEX IF NOT EXISTS file_commit_edges_file_idx ON file_commit_edges (file_path);
+        CREATE INDEX IF NOT EXISTS file_commit_edges_commit_idx ON file_commit_edges (commit_id);
+        CREATE INDEX IF NOT EXISTS file_cochange_edges_src_idx ON file_cochange_edges (src_path);
+        CREATE INDEX IF NOT EXISTS file_cochange_edges_dst_idx ON file_cochange_edges (dst_path);
         CREATE INDEX IF NOT EXISTS file_chunk_edges_file_idx ON file_chunk_edges (file_path);
         CREATE INDEX IF NOT EXISTS symbols_file_path_idx ON symbols (file_path);
         CREATE INDEX IF NOT EXISTS references_file_path_idx ON symbol_references (file_path);",
@@ -181,7 +199,11 @@ impl Db {
           reference_symbol_edges
             SOURCE KEY (reference_id) REFERENCES symbol_references (id)
             DESTINATION KEY (symbol_id) REFERENCES symbols (id)
-            LABEL resolves
+            LABEL resolves,
+          file_cochange_edges
+            SOURCE KEY (src_path) REFERENCES files (path)
+            DESTINATION KEY (dst_path) REFERENCES files (path)
+            LABEL cochanges
         );";
             let _ = self.conn.execute_batch(graph_sql);
         }
@@ -206,6 +228,17 @@ impl Db {
             hashes.insert(PathBuf::from(path), buf);
         }
         Ok(hashes)
+    }
+
+    pub fn list_files(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let mut rows = stmt.query([])?;
+        let mut files = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            files.push(path);
+        }
+        Ok(files)
     }
 
     pub fn clear_file_chunks(&self, file_path: &str) -> Result<()> {
@@ -248,9 +281,22 @@ impl Db {
         Ok(())
     }
 
+    pub fn clear_file_history(&self, file_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_commit_edges WHERE file_path = ?",
+            params![file_path],
+        )?;
+        self.conn.execute(
+            "DELETE FROM file_cochange_edges WHERE src_path = ? OR dst_path = ?",
+            params![file_path, file_path],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_file(&self, file_path: &str) -> Result<()> {
         self.clear_file_graph(file_path)?;
         self.clear_file_chunks(file_path)?;
+        self.clear_file_history(file_path)?;
         self.conn
             .execute("DELETE FROM files WHERE path = ?", params![file_path])?;
         Ok(())
@@ -575,6 +621,86 @@ impl Db {
         })?;
         Ok(())
     }
+
+    pub fn replace_file_graph(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        content_hash: [u8; 32],
+        language: &str,
+        graph: GraphData,
+    ) -> Result<()> {
+        self.with_transaction(|db| {
+            db.ensure_file(file_path, file_size)?;
+            db.clear_file_graph(file_path)?;
+            db.persist_graph(file_path, language, graph)?;
+            db.upsert_file(file_path, file_size, content_hash)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn persist_graph(&self, file_path: &str, language: &str, graph: GraphData) -> Result<()> {
+        let mut symbols_by_name: HashMap<String, Vec<String>> = HashMap::new();
+
+        for mut symbol in graph.symbols {
+            symbol.file_path = file_path.to_string();
+            symbol.language = language.to_string();
+            symbols_by_name
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(symbol.id.clone());
+            self.insert_symbol(&symbol)?;
+        }
+
+        for mut reference in graph.references {
+            reference.file_path = file_path.to_string();
+            reference.language = language.to_string();
+            self.insert_reference(&reference)?;
+
+            if let Some(symbol_ids) = symbols_by_name.get(&reference.name)
+                && symbol_ids.len() == 1
+            {
+                let symbol_id = &symbol_ids[0];
+                self.link_reference_symbol(&reference.id, symbol_id)?;
+            }
+        }
+
+        for (reference_id, symbol_id) in graph.resolutions {
+            self.link_reference_symbol(&reference_id, &symbol_id)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn replace_history_edges(
+        &self,
+        file_commit_edges: &[(String, String)],
+        cochange_edges: &[(String, String, i64, f64)],
+    ) -> Result<()> {
+        self.with_transaction(|db| {
+            db.conn.execute("DELETE FROM file_commit_edges", [])?;
+            db.conn.execute("DELETE FROM file_cochange_edges", [])?;
+
+            for (file_path, commit_id) in file_commit_edges {
+                db.conn.execute(
+                    "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?)",
+                    params![file_path, commit_id],
+                )?;
+            }
+
+            for (src, dst, commit_count, weight) in cochange_edges {
+                db.conn.execute(
+                    "INSERT INTO file_cochange_edges \
+                     (src_path, dst_path, commit_count, weight) VALUES (?, ?, ?, ?)",
+                    params![src, dst, commit_count, weight],
+                )?;
+            }
+
+            Ok(())
+        })?;
+        Ok(())
+    }
 }
 
 pub struct ChunkRecord {
@@ -604,6 +730,12 @@ pub struct ReferenceRecord {
     pub start_byte: usize,
     pub end_byte: usize,
     pub language: String,
+}
+
+pub struct GraphData {
+    pub symbols: Vec<SymbolRecord>,
+    pub references: Vec<ReferenceRecord>,
+    pub resolutions: Vec<(String, String)>,
 }
 
 pub struct SearchRow {
@@ -645,6 +777,70 @@ fn load_optional_extension(conn: &Connection, name: &str, from: Option<&str>) ->
         return Ok(false);
     }
     Ok(true)
+}
+
+impl Repository for Db {
+    fn load_existing_hashes(&self) -> Result<BTreeMap<PathBuf, [u8; 32]>> {
+        Db::load_existing_hashes(self)
+    }
+
+    fn delete_file(&self, file_path: &str) -> Result<()> {
+        Db::delete_file(self, file_path)
+    }
+
+    fn replace_file_chunks(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        content_hash: [u8; 32],
+        chunks: &[ChunkRecord],
+        embeddings: &[Vec<f32>],
+    ) -> Result<()> {
+        Db::replace_file_chunks(self, file_path, file_size, content_hash, chunks, embeddings)
+    }
+
+    fn refresh_fts_index(&self) -> Result<()> {
+        Db::refresh_fts_index(self)
+    }
+
+    fn replace_file_graph(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        content_hash: [u8; 32],
+        language: &str,
+        graph: GraphData,
+    ) -> Result<()> {
+        Db::replace_file_graph(self, file_path, file_size, content_hash, language, graph)
+    }
+
+    fn list_files(&self) -> Result<Vec<String>> {
+        Db::list_files(self)
+    }
+
+    fn replace_history_edges(
+        &self,
+        file_commit_edges: &[(String, String)],
+        cochange_edges: &[(String, String, i64, f64)],
+    ) -> Result<()> {
+        Db::replace_history_edges(self, file_commit_edges, cochange_edges)
+    }
+
+    fn vss_loaded(&self) -> bool {
+        Db::vss_loaded(self)
+    }
+
+    fn fts_loaded(&self) -> bool {
+        Db::fts_loaded(self)
+    }
+
+    fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>> {
+        Db::search(self, query_embedding, limit)
+    }
+
+    fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsRow>> {
+        Db::search_fts(self, query, limit)
+    }
 }
 
 #[cfg(test)]

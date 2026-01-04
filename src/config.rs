@@ -1,10 +1,15 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use confique::Config as _;
 use confique::Layer as _;
+use serde::Deserialize;
 use secrecy::SecretString;
 use std::fs;
+use toml_edit::{DocumentMut, Item, Table, value};
+
+const DEFAULT_DATABASE_NAME: &str = "context.duckdb";
 
 #[derive(confique::Config, Debug, Clone)]
 pub struct AppConfig {
@@ -13,9 +18,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub chunking: Chunking,
     #[config(nested)]
-    pub database: Database,
-    #[config(nested)]
-    pub paths: Paths,
+    pub history: History,
+    pub projects: BTreeMap<String, Project>,
     #[config(nested)]
     pub search: SearchOptions,
 }
@@ -75,20 +79,37 @@ pub struct Chunking {
     pub large_file_threads: usize,
 }
 
-#[derive(confique::Config, Debug, Clone)]
-#[config(layer_attr(derive(clap::Args, Clone)))]
-pub struct Database {
-    #[config(default = "context.duckdb", env = "CONTEXT_DB_PATH")]
-    #[config(layer_attr(arg(long = "db")))]
-    pub path: PathBuf,
+#[derive(confique::Config, Debug, Clone, Deserialize)]
+pub struct Project {
+    pub repo: PathBuf,
+    pub data_dir: Option<PathBuf>,
+    pub database: Option<PathBuf>,
 }
 
 #[derive(confique::Config, Debug, Clone)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
-pub struct Paths {
-    #[config(env = "CONTEXT_REPO_PATH")]
-    #[config(layer_attr(arg(long = "repo")))]
-    pub repo: Option<PathBuf>,
+pub struct History {
+    #[config(default = 10240, env = "CONTEXT_HISTORY_DEPTH")]
+    #[config(layer_attr(arg(long = "history-depth")))]
+    pub depth: u32,
+    #[config(default = 1.0, env = "CONTEXT_HISTORY_COMMIT_SIZE_LIMIT_RATIO")]
+    #[config(layer_attr(arg(long = "history-commit-size-limit-ratio")))]
+    pub commit_size_limit_ratio: f32,
+    #[config(default = false, env = "CONTEXT_HISTORY_MULTI_PARENTS")]
+    #[config(layer_attr(arg(long = "history-multi-parents")))]
+    pub multi_parents: bool,
+    #[config(default = "(#\\d+)", env = "CONTEXT_HISTORY_ISSUE_REGEX")]
+    #[config(layer_attr(arg(long = "history-issue-regex")))]
+    pub issue_regex: String,
+    #[config(env = "CONTEXT_HISTORY_COMMIT_EXCLUDE_REGEX")]
+    #[config(layer_attr(arg(long = "history-commit-exclude-regex")))]
+    pub commit_exclude_regex: Option<String>,
+    #[config(env = "CONTEXT_HISTORY_AUTHOR_EXCLUDE_REGEX")]
+    #[config(layer_attr(arg(long = "history-author-exclude-regex")))]
+    pub author_exclude_regex: Option<String>,
+    #[config(default = "", env = "CONTEXT_HISTORY_PATHS")]
+    #[config(layer_attr(arg(long = "history-pathspec", value_delimiter = ',')))]
+    pub path_specs: String,
 }
 
 #[derive(confique::Config, Debug, Clone)]
@@ -122,7 +143,13 @@ pub enum Command {
     Index(IndexCli),
     Graph(GraphCli),
     Search(SearchCli),
-    Init(InitCli),
+    Config(ConfigCli),
+}
+
+#[derive(Args, Clone)]
+pub struct ProjectCli {
+    #[arg(long = "project")]
+    pub project: Option<String>,
 }
 
 #[derive(Args)]
@@ -132,9 +159,7 @@ pub struct IndexCli {
     #[command(flatten)]
     pub chunking: <Chunking as confique::Config>::Layer,
     #[command(flatten)]
-    pub database: <Database as confique::Config>::Layer,
-    #[command(flatten)]
-    pub paths: <Paths as confique::Config>::Layer,
+    pub project: ProjectCli,
 }
 
 #[derive(Args)]
@@ -142,9 +167,9 @@ pub struct GraphCli {
     #[command(flatten)]
     pub chunking: <Chunking as confique::Config>::Layer,
     #[command(flatten)]
-    pub database: <Database as confique::Config>::Layer,
+    pub history: <History as confique::Config>::Layer,
     #[command(flatten)]
-    pub paths: <Paths as confique::Config>::Layer,
+    pub project: ProjectCli,
 }
 
 #[derive(Args)]
@@ -152,7 +177,7 @@ pub struct SearchCli {
     #[command(flatten)]
     pub embedding: <Embedding as confique::Config>::Layer,
     #[command(flatten)]
-    pub database: <Database as confique::Config>::Layer,
+    pub project: ProjectCli,
     #[command(flatten)]
     pub search: <SearchOptions as confique::Config>::Layer,
     #[arg(value_name = "QUERY")]
@@ -168,26 +193,42 @@ pub struct InitCli {
     pub force: bool,
 }
 
+#[derive(Args)]
+pub struct ConfigCli {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    EnsureProject(EnsureProjectCli),
+    Init(InitCli),
+}
+
+#[derive(Args)]
+pub struct EnsureProjectCli {
+    #[arg(value_name = "REPO", default_value = ".")]
+    pub repo: PathBuf,
+    #[arg(long = "name")]
+    pub name: Option<String>,
+}
+
 pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
     let mut cli_layer = <AppConfig as confique::Config>::Layer::empty();
     match &cli.command {
         Command::Index(cmd) => {
             cli_layer.embedding = cmd.embedding.clone();
             cli_layer.chunking = cmd.chunking.clone();
-            cli_layer.database = cmd.database.clone();
-            cli_layer.paths = cmd.paths.clone();
         }
         Command::Graph(cmd) => {
             cli_layer.chunking = cmd.chunking.clone();
-            cli_layer.database = cmd.database.clone();
-            cli_layer.paths = cmd.paths.clone();
+            cli_layer.history = cmd.history.clone();
         }
         Command::Search(cmd) => {
             cli_layer.embedding = cmd.embedding.clone();
-            cli_layer.database = cmd.database.clone();
             cli_layer.search = cmd.search.clone();
         }
-        Command::Init(_) => {}
+        Command::Config(_) => {}
     }
 
     let mut builder = AppConfig::builder().preloaded(cli_layer).env();
@@ -247,19 +288,116 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
         }
     }
 
-    let mut config = builder
+    let config = builder
         .file("/etc/context/secrets.toml")
         .file("/etc/context/config.toml")
         .load()
         .map_err(|e| eyre::eyre!(e.to_string()))?;
 
-    if config.paths.repo.is_none() {
-        config.paths.repo = Some(default_repo_path());
-    }
-
     validate_config(&config)?;
 
     Ok(config)
+}
+
+pub struct ResolvedProject {
+    pub repo_path: PathBuf,
+    pub database_path: PathBuf,
+}
+
+pub fn resolve_project(
+    config: &AppConfig,
+    override_name: Option<&str>,
+) -> eyre::Result<ResolvedProject> {
+    let cwd = std::env::current_dir()?;
+    resolve_project_for_cwd(config, &cwd, override_name)
+}
+
+fn resolve_project_for_cwd(
+    config: &AppConfig,
+    cwd: &Path,
+    override_name: Option<&str>,
+) -> eyre::Result<ResolvedProject> {
+    if let Some(name) = override_name {
+        let project = config.projects.get(name).ok_or_else(|| {
+            eyre::eyre!("unknown project '{name}'; define it under [projects.{name}]")
+        })?;
+        return build_resolved_project(name, project, cwd);
+    }
+
+    if !config.projects.is_empty() {
+        if let Some(root) = find_git_root(cwd) {
+            if let Some((name, project)) = find_project_for_repo(&config.projects, &root) {
+                return build_resolved_project(name, project, cwd);
+            }
+        }
+
+        if config.projects.len() == 1 {
+            let (name, project) = config.projects.iter().next().unwrap();
+            return build_resolved_project(name, project, cwd);
+        }
+
+        return Err(eyre::eyre!(
+            "unable to infer project; use --project to select one"
+        ));
+    }
+
+    Err(eyre::eyre!(
+        "no projects configured; define at least one under [projects.<name>]"
+    ))
+}
+
+fn find_project_for_repo<'a>(
+    projects: &'a BTreeMap<String, Project>,
+    repo_root: &Path,
+) -> Option<(&'a str, &'a Project)> {
+    let repo_root = canonical_path(repo_root);
+    projects
+        .iter()
+        .find(|(_, project)| canonical_path(&project.repo) == repo_root)
+        .map(|(name, project)| (name.as_str(), project))
+}
+
+fn build_resolved_project(
+    name: &str,
+    project: &Project,
+    cwd: &Path,
+) -> eyre::Result<ResolvedProject> {
+    let repo_path = resolve_path(&project.repo, cwd);
+    let repo_path = canonical_or_existing(repo_path)?;
+
+    let data_dir = if let Some(data_dir) = &project.data_dir {
+        let resolved = resolve_path(data_dir, &repo_path);
+        canonical_or_existing(resolved)?
+    } else if prefer_os_data_root(&repo_path) {
+        let base = dirs::data_dir()
+            .ok_or_else(|| eyre::eyre!("unable to resolve XDG data directory"))?
+            .join("context")
+            .join(name);
+        canonical_or_existing(base)?
+    } else {
+        repo_path.join(".config").join("context")
+    };
+
+    fs::create_dir_all(&data_dir)?;
+
+    let database = project
+        .database
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE_NAME));
+
+    let database_path = if database.is_absolute() {
+        database
+    } else {
+        data_dir.join(database)
+    };
+
+    ensure_repo_data_gitignore(&repo_path, &data_dir, &database_path)?;
+
+    Ok(ResolvedProject {
+        repo_path,
+        database_path,
+    })
 }
 
 pub struct InitResult {
@@ -290,11 +428,21 @@ max_parallel = 4
 max_file_size = 5242880
 large_file_threads = 4
 
-[database]
-path = "context.duckdb"
+[history]
+depth = 10240
+commit_size_limit_ratio = 1.0
+multi_parents = false
+issue_regex = "(#\\d+)"
+# commit_exclude_regex = ""
+# author_exclude_regex = ""
+# path_specs = ""
 
-[paths]
-# repo = "/path/to/repo" # Optional; defaults to the git root of the current directory.
+# Project definitions live under [projects.<name>].
+# Example:
+# [projects.example]
+# repo = "/path/to/repo"
+# # data_dir = "/path/to/data"
+# # database = "context.duckdb"
 
 [search]
 limit = 10
@@ -329,6 +477,111 @@ pub fn init_config(init: &InitCli) -> eyre::Result<InitResult> {
     })
 }
 
+pub struct EnsureProjectResult {
+    pub config_path: PathBuf,
+    pub project_name: String,
+    pub created: bool,
+    pub updated: bool,
+}
+
+pub fn ensure_project(
+    cli: &EnsureProjectCli,
+    config_file: Option<&Path>,
+) -> eyre::Result<EnsureProjectResult> {
+    let cwd = std::env::current_dir()?;
+    let repo_path = resolve_path(&cli.repo, &cwd);
+    if !repo_path.exists() {
+        return Err(eyre::eyre!(
+            "repository path does not exist: {}",
+            repo_path.display()
+        ));
+    }
+    let repo_path = repo_path.canonicalize()?;
+    let project_name = match &cli.name {
+        Some(name) => name.clone(),
+        None => repo_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| eyre::eyre!("unable to infer project name from path"))?
+            .to_string(),
+    };
+
+    let config_path = resolve_config_write_path(config_file)?;
+    let existed = config_path.exists();
+    let mut document = if existed {
+        let contents = fs::read_to_string(&config_path)?;
+        contents
+            .parse::<DocumentMut>()
+            .map_err(|err| eyre::eyre!("failed to parse {}: {}", config_path.display(), err))?
+    } else {
+        DocumentMut::new()
+    };
+
+    let projects_item = document
+        .entry("projects")
+        .or_insert(Item::Table(Table::new()));
+    let projects_table = projects_item
+        .as_table_mut()
+        .ok_or_else(|| eyre::eyre!("expected [projects] to be a table"))?;
+
+    let repo_value = repo_path.to_string_lossy().to_string();
+    if let Some(existing_name) = find_project_name_for_repo(projects_table, &repo_value) {
+        return Ok(EnsureProjectResult {
+            config_path,
+            project_name: existing_name,
+            created: false,
+            updated: false,
+        });
+    }
+
+    if let Some(existing) = projects_table.get(&project_name) {
+        let existing_repo = existing
+            .as_table()
+            .and_then(|table| table.get("repo"))
+            .and_then(|item| item.as_str());
+        if existing_repo == Some(repo_value.as_str()) {
+            return Ok(EnsureProjectResult {
+                config_path,
+                project_name,
+                created: false,
+                updated: false,
+            });
+        }
+        return Err(eyre::eyre!(
+            "project '{project_name}' already exists with a different repo; use --name to pick another"
+        ));
+    }
+
+    let mut project_table = Table::new();
+    project_table["repo"] = value(repo_value);
+    projects_table[project_name.as_str()] = Item::Table(project_table);
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&config_path, document.to_string())?;
+
+    Ok(EnsureProjectResult {
+        config_path,
+        project_name,
+        created: !existed,
+        updated: true,
+    })
+}
+
+fn find_project_name_for_repo(projects: &Table, repo_value: &str) -> Option<String> {
+    for (name, item) in projects.iter() {
+        let existing_repo = item
+            .as_table()
+            .and_then(|table| table.get("repo"))
+            .and_then(|value| value.as_str());
+        if existing_repo == Some(repo_value) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 fn write_default_file(path: &Path, contents: &str, force: bool) -> eyre::Result<bool> {
     if path.exists() && !force {
         return Ok(false);
@@ -341,6 +594,37 @@ fn default_config_root() -> eyre::Result<PathBuf> {
     let base =
         dirs::config_dir().ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))?;
     Ok(base.join("context"))
+}
+
+fn resolve_config_write_path(config_file: Option<&Path>) -> eyre::Result<PathBuf> {
+    if let Some(path) = config_file {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = existing_user_config_path() {
+        return Ok(path);
+    }
+    default_config_root().map(|root| root.join("config.toml"))
+}
+
+fn existing_user_config_path() -> Option<PathBuf> {
+    let standard = dirs::config_dir().map(|dir| dir.join("context").join("config.toml"));
+    if let Some(path) = standard {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(".config").join("context").join("config.toml");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
 }
 
 fn validate_config(config: &AppConfig) -> eyre::Result<()> {
@@ -374,12 +658,148 @@ fn validate_config(config: &AppConfig) -> eyre::Result<()> {
     if !(0.0..=1.0).contains(&config.search.hybrid_weight) {
         return Err(eyre::eyre!("hybrid_weight must be in [0.0, 1.0]"));
     }
+    if config.history.depth == 0 {
+        return Err(eyre::eyre!("history depth must be > 0"));
+    }
+    if !(0.0..=1.0).contains(&config.history.commit_size_limit_ratio) {
+        return Err(eyre::eyre!(
+            "history commit_size_limit_ratio must be in [0.0, 1.0]"
+        ));
+    }
     Ok(())
 }
 
-fn default_repo_path() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    find_git_root(&cwd).unwrap_or(cwd)
+fn prefer_os_data_root(repo_root: &Path) -> bool {
+    if local_config_present(repo_root) {
+        return false;
+    }
+
+    if etc_config_present() {
+        return true;
+    }
+
+    user_config_present() || macos_alt_config_present()
+}
+
+fn local_config_present(repo_root: &Path) -> bool {
+    let local_root = repo_root.join(".config");
+    let candidates = [
+        local_root.join("context.toml"),
+        local_root.join("context.secrets.toml"),
+        local_root.join("context").join("config.toml"),
+        local_root.join("context").join("secrets.toml"),
+    ];
+    candidates.iter().any(|path| path.exists())
+}
+
+fn user_config_present() -> bool {
+    if let Some(dir) = dirs::config_dir() {
+        let base = dir.join("context");
+        return base.join("config.toml").exists() || base.join("secrets.toml").exists();
+    }
+    false
+}
+
+fn macos_alt_config_present() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            let base = home.join(".config").join("context");
+            return base.join("config.toml").exists() || base.join("secrets.toml").exists();
+        }
+    }
+    false
+}
+
+fn etc_config_present() -> bool {
+    Path::new("/etc/context/config.toml").exists()
+        || Path::new("/etc/context/secrets.toml").exists()
+}
+
+fn ensure_repo_data_gitignore(
+    repo_root: &Path,
+    data_root: &Path,
+    database_path: &Path,
+) -> eyre::Result<()> {
+    if !repo_root.join(".git").exists() {
+        return Ok(());
+    }
+    if !data_root.starts_with(repo_root) {
+        return Ok(());
+    }
+
+    let ignore_path = data_root.join(".gitignore");
+    let mut lines = Vec::new();
+    if let Some(file_name) = database_path.file_name().and_then(|f| f.to_str()) {
+        lines.push(file_name.to_string());
+        lines.push(format!("{file_name}.wal"));
+        lines.push(format!("{file_name}.shm"));
+        lines.push(format!("{file_name}-wal"));
+        lines.push(format!("{file_name}-shm"));
+    }
+    lines.push("secrets.toml".to_string());
+    lines.push("!.gitignore".to_string());
+
+    if ignore_path.exists() {
+        let existing = fs::read_to_string(&ignore_path).unwrap_or_default();
+        let mut additions = Vec::new();
+        for line in &lines {
+            if !existing
+                .lines()
+                .any(|existing_line| existing_line.trim() == line)
+            {
+                additions.push(line.as_str());
+            }
+        }
+        if additions.is_empty() {
+            return Ok(());
+        }
+        let mut updated = existing;
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&additions.join("\n"));
+        updated.push('\n');
+        fs::write(ignore_path, updated)?;
+    } else {
+        let mut contents = String::from("# context data\n");
+        contents.push_str(&lines.join("\n"));
+        contents.push('\n');
+        fs::write(ignore_path, contents)?;
+    }
+    Ok(())
+}
+
+fn resolve_path(path: &Path, base: &Path) -> PathBuf {
+    if let Some(expanded) = expand_tilde(path) {
+        return expanded;
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn expand_tilde(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    if !raw.starts_with("~/") {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    Some(home.join(raw.trim_start_matches("~/")))
+}
+
+fn canonical_or_existing(path: PathBuf) -> eyre::Result<PathBuf> {
+    if path.exists() {
+        Ok(path.canonicalize()?)
+    } else {
+        Ok(path)
+    }
+}
+
+fn canonical_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn find_git_root(start: &Path) -> Option<PathBuf> {
@@ -402,6 +822,15 @@ mod tests {
 
     #[test]
     fn validate_config_rejects_invalid_overlap() {
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "example".to_string(),
+            Project {
+                repo: PathBuf::from("."),
+                data_dir: None,
+                database: None,
+            },
+        );
         let config = AppConfig {
             embedding: Embedding {
                 url: "http://localhost".to_string(),
@@ -422,12 +851,16 @@ mod tests {
                 max_file_size: 1_024,
                 large_file_threads: 1,
             },
-            database: Database {
-                path: PathBuf::from("context.duckdb"),
+            history: History {
+                depth: 1,
+                commit_size_limit_ratio: 1.0,
+                multi_parents: false,
+                issue_regex: "(#\\d+)".to_string(),
+                commit_exclude_regex: None,
+                author_exclude_regex: None,
+                path_specs: String::new(),
             },
-            paths: Paths {
-                repo: Some(PathBuf::from(".")),
-            },
+            projects,
             search: SearchOptions {
                 limit: 1,
                 hybrid_weight: 0.6,
@@ -454,6 +887,72 @@ mod tests {
             result.secrets_path.exists(),
             "expected secrets.toml to exist"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_project_uses_repo_config_dir_when_local_config_exists() -> eyre::Result<()> {
+        let dir = TempDir::new()?;
+        let local_config_dir = dir.path().join(".config").join("context");
+        fs::create_dir_all(&local_config_dir)?;
+        fs::write(local_config_dir.join("config.toml"), "")?;
+        fs::create_dir_all(dir.path().join(".git"))?;
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "example".to_string(),
+            Project {
+                repo: dir.path().to_path_buf(),
+                data_dir: None,
+                database: None,
+            },
+        );
+
+        let config = AppConfig {
+            embedding: Embedding {
+                url: "http://localhost".to_string(),
+                api_key: None,
+                model: "model".to_string(),
+                dialect: "openai".to_string(),
+                timeout_seconds: 10,
+                embedding_dim: 2,
+                context_length: 8,
+                max_batch_size: 4,
+                tokens_per_minute: 0,
+            },
+            chunking: Chunking {
+                max_chunk_size: 10,
+                overlap: 0.2,
+                tokenizer: "characters".to_string(),
+                max_parallel: 1,
+                max_file_size: 1_024,
+                large_file_threads: 1,
+            },
+            history: History {
+                depth: 1,
+                commit_size_limit_ratio: 1.0,
+                multi_parents: false,
+                issue_regex: "(#\\d+)".to_string(),
+                commit_exclude_regex: None,
+                author_exclude_regex: None,
+                path_specs: String::new(),
+            },
+            projects,
+            search: SearchOptions {
+                limit: 1,
+                hybrid_weight: 0.6,
+            },
+        };
+
+        let resolved = resolve_project_for_cwd(&config, dir.path(), Some("example"))?;
+        assert!(
+            resolved.database_path.starts_with(&local_config_dir),
+            "expected db path to be under repo .config/context"
+        );
+        assert!(
+            local_config_dir.join(".gitignore").exists(),
+            "expected .gitignore to be created in repo data directory"
+        );
+
         Ok(())
     }
 }

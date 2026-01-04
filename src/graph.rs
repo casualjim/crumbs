@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use cupido::collector::config::{Collect, Config as CupidoConfig, get_collector};
 use eyre::{Result, eyre};
 use futures::StreamExt;
 use syntastica_queries::{
@@ -10,10 +11,12 @@ use syntastica_queries::{
 };
 use text_chunking::languages::{PeekableReader, detect, get_language};
 use text_chunking::{Chunk, Tokenizer, WalkOptions, walk_project};
+use tracing::{info, warn};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 use uuid::Uuid;
 
-use crate::db::{Db, ReferenceRecord, SymbolRecord};
+use crate::db::{GraphData, ReferenceRecord, SymbolRecord};
+use crate::repository::Repository;
 
 pub struct GraphConfig {
     pub repo_path: PathBuf,
@@ -23,23 +26,33 @@ pub struct GraphConfig {
     pub max_parallel: usize,
     pub max_file_size: Option<u64>,
     pub large_file_threads: usize,
+    pub history_depth: u32,
+    pub history_commit_size_limit_ratio: f32,
+    pub history_multi_parents: bool,
+    pub history_issue_regex: String,
+    pub history_commit_exclude_regex: Option<String>,
+    pub history_author_exclude_regex: Option<String>,
+    pub history_path_specs: Vec<String>,
 }
 
 pub struct GraphIndexer {
-    db: Db,
+    db: Box<dyn Repository>,
     config: GraphConfig,
 }
 
 impl GraphIndexer {
-    pub fn new(db: Db, config: GraphConfig) -> Self {
-        Self { db, config }
+    pub fn new<R: Repository + 'static>(db: R, config: GraphConfig) -> Self {
+        Self {
+            db: Box::new(db),
+            config,
+        }
     }
 
     pub async fn index(self) -> Result<()> {
         let existing_hashes = self.db.load_existing_hashes()?;
         let options = WalkOptions {
             max_chunk_size: self.config.max_chunk_size,
-            tokenizer: self.config.tokenizer,
+            tokenizer: self.config.tokenizer.clone(),
             overlap_percentage: self.config.overlap_percentage,
             max_parallel: self.config.max_parallel,
             max_file_size: self.config.max_file_size,
@@ -71,8 +84,7 @@ impl GraphIndexer {
                     if let Some(language) = detect_language(&file_path, &source).await?
                         && let Some(graph) = extract_graph(&language, &source)?
                     {
-                        replace_file_graph(
-                            &self.db,
+                        self.db.replace_file_graph(
                             &file_path,
                             project_chunk.file_size,
                             hash,
@@ -85,68 +97,119 @@ impl GraphIndexer {
             }
         }
 
+        index_history(self.db.as_ref(), &self.config)?;
+
         Ok(())
     }
 }
 
-struct GraphExtraction {
-    symbols: Vec<SymbolRecord>,
-    references: Vec<ReferenceRecord>,
-    resolutions: Vec<(String, String)>,
-}
-
-fn persist_graph(db: &Db, file_path: &str, language: &str, graph: GraphExtraction) -> Result<()> {
-    let mut symbols_by_name: HashMap<String, Vec<String>> = HashMap::new();
-
-    for mut symbol in graph.symbols {
-        symbol.file_path = file_path.to_string();
-        symbol.language = language.to_string();
-        symbols_by_name
-            .entry(symbol.name.clone())
-            .or_default()
-            .push(symbol.id.clone());
-        db.insert_symbol(&symbol)?;
+fn index_history(db: &dyn Repository, config: &GraphConfig) -> Result<()> {
+    if !repo_has_git_dir(&config.repo_path) {
+        warn!(
+            "history indexing skipped; no git repository at {}",
+            config.repo_path.display()
+        );
+        return Ok(());
     }
 
-    for mut reference in graph.references {
-        reference.file_path = file_path.to_string();
-        reference.language = language.to_string();
-        db.insert_reference(&reference)?;
+    let known_files = db.list_files()?;
+    if known_files.is_empty() {
+        return Ok(());
+    }
+    let known_set: HashSet<String> = known_files.into_iter().collect();
 
-        if let Some(symbol_ids) = symbols_by_name.get(&reference.name)
-            && symbol_ids.len() == 1
-        {
-            let symbol_id = &symbol_ids[0];
-            db.link_reference_symbol(&reference.id, symbol_id)?;
+    let mut conf = CupidoConfig::default();
+    conf.repo_path = config.repo_path.to_string_lossy().to_string();
+    conf.depth = config.history_depth;
+    conf.multi_parents = config.history_multi_parents;
+    conf.issue_regex = config.history_issue_regex.clone();
+    conf.commit_exclude_regex = config.history_commit_exclude_regex.clone();
+    conf.author_exclude_regex = config.history_author_exclude_regex.clone();
+    conf.path_specs = config.history_path_specs.clone();
+    conf.progress = false;
+
+    let collector = get_collector();
+    let graph = collector.walk(conf);
+
+    let file_count = known_set.len().max(1) as f32;
+    let max_files_per_commit = if config.history_commit_size_limit_ratio >= 1.0 {
+        usize::MAX
+    } else {
+        (file_count * config.history_commit_size_limit_ratio).ceil() as usize
+    }
+    .max(1);
+
+    let mut file_commit_edges: HashSet<(String, String)> = HashSet::new();
+    let mut cochange_map: HashMap<(String, String), (u64, f64)> = HashMap::new();
+
+    for commit_id in graph.commits() {
+        let files = match graph.commit_related_files(&commit_id) {
+            Ok(files) => files,
+            Err(_) => continue,
+        };
+        let total_files = files.len();
+        if total_files == 0 || total_files > max_files_per_commit {
+            continue;
+        }
+
+        let weight = 1.0 / total_files as f64;
+        let mut filtered: Vec<String> = files
+            .into_iter()
+            .filter(|file| known_set.contains(file))
+            .collect();
+        if filtered.is_empty() {
+            continue;
+        }
+
+        filtered.sort();
+        filtered.dedup();
+
+        for file in &filtered {
+            file_commit_edges.insert((file.clone(), commit_id.clone()));
+        }
+
+        if filtered.len() < 2 {
+            continue;
+        }
+
+        for i in 0..filtered.len() {
+            for j in (i + 1)..filtered.len() {
+                let (left, right) = (&filtered[i], &filtered[j]);
+                let key = if left <= right {
+                    (left.clone(), right.clone())
+                } else {
+                    (right.clone(), left.clone())
+                };
+                let entry = cochange_map.entry(key).or_insert((0, 0.0));
+                entry.0 += 1;
+                entry.1 += weight;
+            }
         }
     }
 
-    for (reference_id, symbol_id) in graph.resolutions {
-        db.link_reference_symbol(&reference_id, &symbol_id)?;
-    }
+    let mut commit_edges: Vec<(String, String)> = file_commit_edges.into_iter().collect();
+    commit_edges.sort();
 
+    let mut cochange_edges: Vec<(String, String, i64, f64)> = cochange_map
+        .into_iter()
+        .map(|((src, dst), (count, weight))| (src, dst, count as i64, weight))
+        .collect();
+    cochange_edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    db.replace_history_edges(&commit_edges, &cochange_edges)?;
+    info!(
+        "history indexing complete: commits={}, cochanges={}",
+        commit_edges.len(),
+        cochange_edges.len()
+    );
     Ok(())
 }
 
-fn replace_file_graph(
-    db: &Db,
-    file_path: &str,
-    file_size: u64,
-    content_hash: [u8; 32],
-    language: &str,
-    graph: GraphExtraction,
-) -> Result<()> {
-    db.with_transaction(|db| {
-        db.ensure_file(file_path, file_size)?;
-        db.clear_file_graph(file_path)?;
-        persist_graph(db, file_path, language, graph)?;
-        db.upsert_file(file_path, file_size, content_hash)?;
-        Ok(())
-    })?;
-    Ok(())
+fn repo_has_git_dir(path: &Path) -> bool {
+    path.join(".git").exists()
 }
 
-fn extract_graph(language: &str, source: &str) -> Result<Option<GraphExtraction>> {
+fn extract_graph(language: &str, source: &str) -> Result<Option<GraphData>> {
     let query_source = match language {
         "rust" => RUST_LOCALS_CRATES_IO,
         "python" => PYTHON_LOCALS_CRATES_IO,
@@ -231,7 +294,7 @@ fn extract_graph(language: &str, source: &str) -> Result<Option<GraphExtraction>
         }
     }
 
-    Ok(Some(GraphExtraction {
+    Ok(Some(GraphData {
         symbols,
         references,
         resolutions: Vec::new(),
@@ -264,6 +327,7 @@ mod tests {
     use tempfile::TempDir;
     use text_chunking::Tokenizer;
 
+    use crate::db::Db;
     use crate::test_support::write_fixture_repo;
 
     #[tokio::test]
@@ -282,6 +346,13 @@ mod tests {
             max_parallel: 4,
             max_file_size: Some(5 * 1024 * 1024),
             large_file_threads: 2,
+            history_depth: 10240,
+            history_commit_size_limit_ratio: 1.0,
+            history_multi_parents: false,
+            history_issue_regex: "(#\\d+)".to_string(),
+            history_commit_exclude_regex: None,
+            history_author_exclude_regex: None,
+            history_path_specs: Vec::new(),
         };
         let indexer = GraphIndexer::new(db, config);
         indexer.index().await?;

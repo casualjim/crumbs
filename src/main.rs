@@ -3,6 +3,7 @@ mod db;
 mod embedding;
 mod graph;
 mod indexer;
+mod repository;
 mod search;
 #[cfg(test)]
 mod test_support;
@@ -23,26 +24,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Init(cmd) => {
-            let result = config::init_config(cmd)?;
-            if result.wrote_config {
-                println!("Wrote config to {}", result.config_path.display());
-            } else {
-                println!("Config already exists at {}", result.config_path.display());
-            }
-            if result.wrote_secrets {
-                println!("Wrote secrets to {}", result.secrets_path.display());
-            } else {
-                println!("Secrets already exist at {}", result.secrets_path.display());
-            }
-        }
         Command::Index(_) => {
             let cfg = config::load_config(&cli)?;
             let tokenizer = parse_tokenizer(&cfg.chunking.tokenizer)?;
             let embedder = build_embedder(&cfg.embedding)?;
-            let db = Db::open(&cfg.database.path, Some(cfg.embedding.embedding_dim))?;
+            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let config = IndexerConfig {
-                repo_path: cfg.paths.repo.clone().expect("repo path resolved"),
+                repo_path: project.repo_path,
                 max_chunk_size: cfg.chunking.max_chunk_size,
                 overlap_percentage: cfg.chunking.overlap,
                 tokenizer,
@@ -56,15 +45,23 @@ async fn main() -> Result<()> {
         Command::Graph(_) => {
             let cfg = config::load_config(&cli)?;
             let tokenizer = parse_tokenizer(&cfg.chunking.tokenizer)?;
-            let db = Db::open(&cfg.database.path, Some(cfg.embedding.embedding_dim))?;
+            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let config = graph::GraphConfig {
-                repo_path: cfg.paths.repo.clone().expect("repo path resolved"),
+                repo_path: project.repo_path,
                 max_chunk_size: cfg.chunking.max_chunk_size,
                 overlap_percentage: cfg.chunking.overlap,
                 tokenizer,
                 max_parallel: cfg.chunking.max_parallel,
                 max_file_size: Some(cfg.chunking.max_file_size),
                 large_file_threads: cfg.chunking.large_file_threads,
+                history_depth: cfg.history.depth,
+                history_commit_size_limit_ratio: cfg.history.commit_size_limit_ratio,
+                history_multi_parents: cfg.history.multi_parents,
+                history_issue_regex: cfg.history.issue_regex.clone(),
+                history_commit_exclude_regex: cfg.history.commit_exclude_regex.clone(),
+                history_author_exclude_regex: cfg.history.author_exclude_regex.clone(),
+                history_path_specs: split_history_path_specs(&cfg.history.path_specs),
             };
             let indexer = graph::GraphIndexer::new(db, config);
             indexer.index().await?;
@@ -72,7 +69,8 @@ async fn main() -> Result<()> {
         Command::Search(cmd) => {
             let cfg = config::load_config(&cli)?;
             let embedder = build_embedder(&cfg.embedding)?;
-            let db = Db::open(&cfg.database.path, Some(cfg.embedding.embedding_dim))?;
+            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let results = search::search(
                 &db,
                 &embedder,
@@ -99,9 +97,55 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::Config(cmd) => match &cmd.command {
+            config::ConfigCommand::Init(init) => {
+                let result = config::init_config(init)?;
+                if result.wrote_config {
+                    println!("Wrote config to {}", result.config_path.display());
+                } else {
+                    println!("Config already exists at {}", result.config_path.display());
+                }
+                if result.wrote_secrets {
+                    println!("Wrote secrets to {}", result.secrets_path.display());
+                } else {
+                    println!("Secrets already exist at {}", result.secrets_path.display());
+                }
+            }
+            config::ConfigCommand::EnsureProject(ensure) => {
+                let result = config::ensure_project(ensure, cli.config_file.as_deref())?;
+                if result.created {
+                    println!(
+                        "Created config at {} and added project '{}'",
+                        result.config_path.display(),
+                        result.project_name
+                    );
+                } else if result.updated {
+                    println!(
+                        "Ensured project '{}' in {}",
+                        result.project_name,
+                        result.config_path.display()
+                    );
+                } else {
+                    println!(
+                        "Project '{}' already exists in {}",
+                        result.project_name,
+                        result.config_path.display()
+                    );
+                }
+            }
+        },
     }
 
     Ok(())
+}
+
+fn project_override(command: &Command) -> Option<&str> {
+    match command {
+        Command::Index(cmd) => cmd.project.project.as_deref(),
+        Command::Graph(cmd) => cmd.project.project.as_deref(),
+        Command::Search(cmd) => cmd.project.project.as_deref(),
+        Command::Config(_) => None,
+    }
 }
 
 fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {
@@ -134,4 +178,13 @@ fn parse_tokenizer(value: &str) -> Result<Tokenizer> {
         .parse::<Tokenizer>()
         .map_err(|err| eyre!("invalid tokenizer: {err}"))?;
     tokenizer.preload().map_err(|err| eyre!(err))
+}
+
+fn split_history_path_specs(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }

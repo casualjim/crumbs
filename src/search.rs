@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use eyre::{Result, eyre};
 use tracing::warn;
 
-use crate::db::{Db, FtsRow, SearchRow};
+use crate::db::{FtsRow, SearchRow};
 use crate::embedding::{EmbeddingInput, EmbeddingProvider};
+use crate::repository::Repository;
 
 pub struct SearchResult {
     pub file_path: String,
@@ -17,7 +18,7 @@ pub struct SearchResult {
 }
 
 pub async fn search(
-    db: &Db,
+    db: &dyn Repository,
     embedder: &dyn EmbeddingProvider,
     query: &str,
     limit: usize,

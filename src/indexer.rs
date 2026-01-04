@@ -6,8 +6,9 @@ use futures::StreamExt;
 use text_chunking::{Chunk, Tokenizer, WalkOptions, walk_project};
 use uuid::Uuid;
 
-use crate::db::{ChunkRecord, Db};
+use crate::db::ChunkRecord;
 use crate::embedding::{EmbeddingInput, EmbeddingProvider};
+use crate::repository::Repository;
 
 pub struct IndexerConfig {
     pub repo_path: PathBuf,
@@ -20,7 +21,7 @@ pub struct IndexerConfig {
 }
 
 pub struct Indexer {
-    db: Db,
+    db: Box<dyn Repository>,
     embedder: Box<dyn EmbeddingProvider>,
     config: IndexerConfig,
 }
@@ -42,9 +43,13 @@ impl PendingFile {
 }
 
 impl Indexer {
-    pub fn new<E: EmbeddingProvider + 'static>(db: Db, embedder: E, config: IndexerConfig) -> Self {
+    pub fn new<E: EmbeddingProvider + 'static, R: Repository + 'static>(
+        db: R,
+        embedder: E,
+        config: IndexerConfig,
+    ) -> Self {
         Self {
-            db,
+            db: Box::new(db),
             embedder: Box::new(embedder),
             config,
         }
@@ -175,6 +180,7 @@ mod tests {
     use tempfile::TempDir;
     use text_chunking::Tokenizer;
 
+    use crate::db::Db;
     use crate::search;
     use crate::test_support::write_fixture_repo;
 
