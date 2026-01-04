@@ -5,3 +5,4 @@ node_modules
 .codex/sessions
 .codex/*.jsonl
 .codex/auth.json
+.env.json

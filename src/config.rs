@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use confique::Config as _;
 use confique::Layer as _;
 use secrecy::SecretString;
+use std::fs;
 
 #[derive(confique::Config, Debug, Clone)]
 pub struct AppConfig {
@@ -96,6 +97,9 @@ pub struct SearchOptions {
     #[config(default = 10, env = "CONTEXT_SEARCH_LIMIT")]
     #[config(layer_attr(arg(long = "limit")))]
     pub limit: usize,
+    #[config(default = 0.6, env = "CONTEXT_HYBRID_WEIGHT")]
+    #[config(layer_attr(arg(long = "hybrid-weight")))]
+    pub hybrid_weight: f32,
 }
 
 #[derive(Parser)]
@@ -118,6 +122,7 @@ pub enum Command {
     Index(IndexCli),
     Graph(GraphCli),
     Search(SearchCli),
+    Init(InitCli),
 }
 
 #[derive(Args)]
@@ -154,6 +159,15 @@ pub struct SearchCli {
     pub query: String,
 }
 
+#[derive(Args)]
+pub struct InitCli {
+    #[arg(value_name = "DIRECTORY")]
+    pub directory: Option<PathBuf>,
+    /// Overwrite existing config files if present.
+    #[arg(long = "force")]
+    pub force: bool,
+}
+
 pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
     let mut cli_layer = <AppConfig as confique::Config>::Layer::empty();
     match &cli.command {
@@ -173,6 +187,7 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
             cli_layer.database = cmd.database.clone();
             cli_layer.search = cmd.search.clone();
         }
+        Command::Init(_) => {}
     }
 
     let mut builder = AppConfig::builder().preloaded(cli_layer).env();
@@ -242,7 +257,124 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
         config.paths.repo = Some(default_repo_path());
     }
 
+    validate_config(&config)?;
+
     Ok(config)
+}
+
+pub struct InitResult {
+    pub config_path: PathBuf,
+    pub secrets_path: PathBuf,
+    pub wrote_config: bool,
+    pub wrote_secrets: bool,
+}
+
+const DEFAULT_CONFIG_TOML: &str = r#"# context configuration
+
+[embedding]
+# Default embedder uses DeepInfra's OpenAI-compatible endpoint.
+url = "https://api.deepinfra.com/v1/openai"
+model = "Qwen/Qwen3-Embedding-0.6B"
+dialect = "deepinfra"
+timeout_seconds = 10
+embedding_dim = 1024
+context_length = 32768
+max_batch_size = 15
+tokens_per_minute = 1000000
+
+[chunking]
+max_chunk_size = 1500
+overlap = 0.2
+tokenizer = "characters"
+max_parallel = 4
+max_file_size = 5242880
+large_file_threads = 4
+
+[database]
+path = "context.duckdb"
+
+[paths]
+# repo = "/path/to/repo" # Optional; defaults to the git root of the current directory.
+
+[search]
+limit = 10
+hybrid_weight = 0.6
+"#;
+
+const DEFAULT_SECRETS_TOML: &str = r#"# Secrets for context
+# You can also set EMBEDDER_API_KEY in your environment instead.
+
+[embedding]
+# api_key = "sk-..."
+"#;
+
+pub fn init_config(init: &InitCli) -> eyre::Result<InitResult> {
+    let root = match init.directory.as_ref() {
+        Some(dir) => dir.join(".config").join("context"),
+        None => default_config_root()?,
+    };
+    fs::create_dir_all(&root)?;
+
+    let config_path = root.join("config.toml");
+    let secrets_path = root.join("secrets.toml");
+
+    let wrote_config = write_default_file(&config_path, DEFAULT_CONFIG_TOML, init.force)?;
+    let wrote_secrets = write_default_file(&secrets_path, DEFAULT_SECRETS_TOML, init.force)?;
+
+    Ok(InitResult {
+        config_path,
+        secrets_path,
+        wrote_config,
+        wrote_secrets,
+    })
+}
+
+fn write_default_file(path: &Path, contents: &str, force: bool) -> eyre::Result<bool> {
+    if path.exists() && !force {
+        return Ok(false);
+    }
+    fs::write(path, contents)?;
+    Ok(true)
+}
+
+fn default_config_root() -> eyre::Result<PathBuf> {
+    let base =
+        dirs::config_dir().ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))?;
+    Ok(base.join("context"))
+}
+
+fn validate_config(config: &AppConfig) -> eyre::Result<()> {
+    if config.embedding.embedding_dim == 0 {
+        return Err(eyre::eyre!("embedding_dim must be > 0"));
+    }
+    if config.embedding.context_length == 0 {
+        return Err(eyre::eyre!("embedder context_length must be > 0"));
+    }
+    if config.embedding.max_batch_size == 0 {
+        return Err(eyre::eyre!("embedder max_batch_size must be > 0"));
+    }
+    if config.chunking.max_chunk_size == 0 {
+        return Err(eyre::eyre!("max_chunk_size must be > 0"));
+    }
+    if !(0.0..1.0).contains(&config.chunking.overlap) {
+        return Err(eyre::eyre!("overlap must be in [0.0, 1.0)"));
+    }
+    if config.chunking.max_parallel == 0 {
+        return Err(eyre::eyre!("max_parallel must be > 0"));
+    }
+    if config.chunking.max_file_size == 0 {
+        return Err(eyre::eyre!("max_file_size must be > 0"));
+    }
+    if config.chunking.large_file_threads == 0 {
+        return Err(eyre::eyre!("large_file_threads must be > 0"));
+    }
+    if config.search.limit == 0 {
+        return Err(eyre::eyre!("search limit must be > 0"));
+    }
+    if !(0.0..=1.0).contains(&config.search.hybrid_weight) {
+        return Err(eyre::eyre!("hybrid_weight must be in [0.0, 1.0]"));
+    }
+    Ok(())
 }
 
 fn default_repo_path() -> PathBuf {
@@ -250,8 +382,8 @@ fn default_repo_path() -> PathBuf {
     find_git_root(&cwd).unwrap_or(cwd)
 }
 
-fn find_git_root(start: &PathBuf) -> Option<PathBuf> {
-    let mut current = start.clone();
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
     loop {
         if current.join(".git").exists() {
             return Some(current);
@@ -261,4 +393,67 @@ fn find_git_root(start: &PathBuf) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn validate_config_rejects_invalid_overlap() {
+        let config = AppConfig {
+            embedding: Embedding {
+                url: "http://localhost".to_string(),
+                api_key: None,
+                model: "model".to_string(),
+                dialect: "openai".to_string(),
+                timeout_seconds: 10,
+                embedding_dim: 2,
+                context_length: 8,
+                max_batch_size: 4,
+                tokens_per_minute: 0,
+            },
+            chunking: Chunking {
+                max_chunk_size: 10,
+                overlap: 1.5,
+                tokenizer: "characters".to_string(),
+                max_parallel: 1,
+                max_file_size: 1_024,
+                large_file_threads: 1,
+            },
+            database: Database {
+                path: PathBuf::from("context.duckdb"),
+            },
+            paths: Paths {
+                repo: Some(PathBuf::from(".")),
+            },
+            search: SearchOptions {
+                limit: 1,
+                hybrid_weight: 0.6,
+            },
+        };
+
+        assert!(
+            validate_config(&config).is_err(),
+            "expected invalid overlap to be rejected"
+        );
+    }
+
+    #[test]
+    fn init_config_creates_files() -> eyre::Result<()> {
+        let dir = TempDir::new()?;
+        let init = InitCli {
+            directory: Some(dir.path().to_path_buf()),
+            force: false,
+        };
+
+        let result = init_config(&init)?;
+        assert!(result.config_path.exists(), "expected config.toml to exist");
+        assert!(
+            result.secrets_path.exists(),
+            "expected secrets.toml to exist"
+        );
+        Ok(())
+    }
 }

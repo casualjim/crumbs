@@ -1,0 +1,15 @@
+[settings]
+experimental = true
+
+[tools]
+hk = "latest"
+pkl = "latest"
+rust = "1.92.0"
+
+[env]
+_.file = ".env.json"
+RUSTC_WRAPPER = ""
+CARGO_BUILD_RUSTC_WRAPPER = ""
+
+[tasks.test]
+run = "cargo test --all"

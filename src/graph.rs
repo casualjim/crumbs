@@ -5,274 +5,296 @@ use std::path::PathBuf;
 use eyre::{Result, eyre};
 use futures::StreamExt;
 use syntastica_queries::{
-  GO_LOCALS_CRATES_IO,
-  JAVASCRIPT_LOCALS_CRATES_IO,
-  PYTHON_LOCALS_CRATES_IO,
-  RUST_LOCALS_CRATES_IO,
-  TYPESCRIPT_LOCALS_CRATES_IO,
+    GO_LOCALS_CRATES_IO, JAVASCRIPT_LOCALS_CRATES_IO, PYTHON_LOCALS_CRATES_IO,
+    RUST_LOCALS_CRATES_IO, TYPESCRIPT_LOCALS_CRATES_IO,
 };
-use text_chunking::{Chunk, WalkOptions, walk_project, Tokenizer};
 use text_chunking::languages::{PeekableReader, detect, get_language};
+use text_chunking::{Chunk, Tokenizer, WalkOptions, walk_project};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 use uuid::Uuid;
 
 use crate::db::{Db, ReferenceRecord, SymbolRecord};
 
 pub struct GraphConfig {
-  pub repo_path: PathBuf,
-  pub max_chunk_size: usize,
-  pub overlap_percentage: f32,
-  pub tokenizer: Tokenizer,
-  pub max_parallel: usize,
-  pub max_file_size: Option<u64>,
-  pub large_file_threads: usize,
+    pub repo_path: PathBuf,
+    pub max_chunk_size: usize,
+    pub overlap_percentage: f32,
+    pub tokenizer: Tokenizer,
+    pub max_parallel: usize,
+    pub max_file_size: Option<u64>,
+    pub large_file_threads: usize,
 }
 
 pub struct GraphIndexer {
-  db: Db,
-  config: GraphConfig,
+    db: Db,
+    config: GraphConfig,
 }
 
 impl GraphIndexer {
-  pub fn new(db: Db, config: GraphConfig) -> Self {
-    Self { db, config }
-  }
-
-  pub async fn index(self) -> Result<()> {
-    let existing_hashes = self.db.load_existing_hashes()?;
-    let options = WalkOptions {
-      max_chunk_size: self.config.max_chunk_size,
-      tokenizer: self.config.tokenizer,
-      overlap_percentage: self.config.overlap_percentage,
-      max_parallel: self.config.max_parallel,
-      max_file_size: self.config.max_file_size,
-      large_file_threads: self.config.large_file_threads,
-      existing_hashes,
-      cancel_token: None,
-    };
-
-    let mut stream = walk_project(&self.config.repo_path, options);
-    while let Some(item) = stream.next().await {
-      let project_chunk = item?;
-      match project_chunk.chunk {
-        Chunk::Delete { file_path } => {
-          self.db.delete_file(&file_path)?;
-        }
-        Chunk::EndOfFile {
-          file_path,
-          content,
-          content_hash,
-          ..
-        } => {
-          let Some(source) = content else {
-            return Err(eyre!("missing content for {}", file_path));
-          };
-          let Some(hash) = content_hash else {
-            return Err(eyre!("missing content hash for {}", file_path));
-          };
-
-          self.db.clear_file_graph(&file_path)?;
-          self.db.upsert_file(&file_path, project_chunk.file_size, hash)?;
-
-          if let Some(language) = detect_language(&file_path, &source).await? {
-            if let Some(graph) = extract_graph(&language, &source)? {
-              persist_graph(&self.db, &file_path, &language, graph)?;
-            }
-          }
-        }
-        _ => {}
-      }
+    pub fn new(db: Db, config: GraphConfig) -> Self {
+        Self { db, config }
     }
 
-    Ok(())
-  }
+    pub async fn index(self) -> Result<()> {
+        let existing_hashes = self.db.load_existing_hashes()?;
+        let options = WalkOptions {
+            max_chunk_size: self.config.max_chunk_size,
+            tokenizer: self.config.tokenizer,
+            overlap_percentage: self.config.overlap_percentage,
+            max_parallel: self.config.max_parallel,
+            max_file_size: self.config.max_file_size,
+            large_file_threads: self.config.large_file_threads,
+            existing_hashes,
+            cancel_token: None,
+        };
+
+        let mut stream = walk_project(&self.config.repo_path, options);
+        while let Some(item) = stream.next().await {
+            let project_chunk = item?;
+            match project_chunk.chunk {
+                Chunk::Delete { file_path } => {
+                    self.db.delete_file(&file_path)?;
+                }
+                Chunk::EndOfFile {
+                    file_path,
+                    content,
+                    content_hash,
+                    ..
+                } => {
+                    let Some(source) = content else {
+                        return Err(eyre!("missing content for {}", file_path));
+                    };
+                    let Some(hash) = content_hash else {
+                        return Err(eyre!("missing content hash for {}", file_path));
+                    };
+
+                    if let Some(language) = detect_language(&file_path, &source).await?
+                        && let Some(graph) = extract_graph(&language, &source)?
+                    {
+                        replace_file_graph(
+                            &self.db,
+                            &file_path,
+                            project_chunk.file_size,
+                            hash,
+                            &language,
+                            graph,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
 }
 
 struct GraphExtraction {
-  symbols: Vec<SymbolRecord>,
-  references: Vec<ReferenceRecord>,
-  resolutions: Vec<(String, String)>,
+    symbols: Vec<SymbolRecord>,
+    references: Vec<ReferenceRecord>,
+    resolutions: Vec<(String, String)>,
 }
 
 fn persist_graph(db: &Db, file_path: &str, language: &str, graph: GraphExtraction) -> Result<()> {
-  let mut symbols_by_name: HashMap<String, Vec<String>> = HashMap::new();
+    let mut symbols_by_name: HashMap<String, Vec<String>> = HashMap::new();
 
-  for mut symbol in graph.symbols {
-    symbol.file_path = file_path.to_string();
-    symbol.language = language.to_string();
-    symbols_by_name
-      .entry(symbol.name.clone())
-      .or_default()
-      .push(symbol.id.clone());
-    db.insert_symbol(&symbol)?;
-  }
-
-  for mut reference in graph.references {
-    reference.file_path = file_path.to_string();
-    reference.language = language.to_string();
-    db.insert_reference(&reference)?;
-
-    if let Some(symbol_ids) = symbols_by_name.get(&reference.name) {
-      if let Some(symbol_id) = symbol_ids.first() {
-        db.link_reference_symbol(&reference.id, symbol_id)?;
-      }
+    for mut symbol in graph.symbols {
+        symbol.file_path = file_path.to_string();
+        symbol.language = language.to_string();
+        symbols_by_name
+            .entry(symbol.name.clone())
+            .or_default()
+            .push(symbol.id.clone());
+        db.insert_symbol(&symbol)?;
     }
-  }
 
-  for (reference_id, symbol_id) in graph.resolutions {
-    db.link_reference_symbol(&reference_id, &symbol_id)?;
-  }
+    for mut reference in graph.references {
+        reference.file_path = file_path.to_string();
+        reference.language = language.to_string();
+        db.insert_reference(&reference)?;
 
-  Ok(())
+        if let Some(symbol_ids) = symbols_by_name.get(&reference.name)
+            && symbol_ids.len() == 1
+        {
+            let symbol_id = &symbol_ids[0];
+            db.link_reference_symbol(&reference.id, symbol_id)?;
+        }
+    }
+
+    for (reference_id, symbol_id) in graph.resolutions {
+        db.link_reference_symbol(&reference_id, &symbol_id)?;
+    }
+
+    Ok(())
+}
+
+fn replace_file_graph(
+    db: &Db,
+    file_path: &str,
+    file_size: u64,
+    content_hash: [u8; 32],
+    language: &str,
+    graph: GraphExtraction,
+) -> Result<()> {
+    db.with_transaction(|db| {
+        db.ensure_file(file_path, file_size)?;
+        db.clear_file_graph(file_path)?;
+        persist_graph(db, file_path, language, graph)?;
+        db.upsert_file(file_path, file_size, content_hash)?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn extract_graph(language: &str, source: &str) -> Result<Option<GraphExtraction>> {
-  let query_source = match language {
-    "rust" => RUST_LOCALS_CRATES_IO,
-    "python" => PYTHON_LOCALS_CRATES_IO,
-    "go" => GO_LOCALS_CRATES_IO,
-    "javascript" => JAVASCRIPT_LOCALS_CRATES_IO,
-    "typescript" => TYPESCRIPT_LOCALS_CRATES_IO,
-    _ => return Ok(None),
-  };
+    let query_source = match language {
+        "rust" => RUST_LOCALS_CRATES_IO,
+        "python" => PYTHON_LOCALS_CRATES_IO,
+        "go" => GO_LOCALS_CRATES_IO,
+        "javascript" => JAVASCRIPT_LOCALS_CRATES_IO,
+        "typescript" => TYPESCRIPT_LOCALS_CRATES_IO,
+        _ => return Ok(None),
+    };
 
-  if query_source.trim().is_empty() {
-    return Ok(None);
-  }
-
-  let language_fn = match get_language(language) {
-    Some(lang) => lang,
-    None => return Ok(None),
-  };
-  let ts_language: tree_sitter::Language = language_fn.into();
-
-  let mut parser = Parser::new();
-  parser.set_language(&ts_language)?;
-  let tree = parser
-    .parse(source, None)
-    .ok_or_else(|| eyre!("failed to parse source for {}", language))?;
-
-  let query = Query::new(&ts_language, query_source)?;
-  let capture_names = query.capture_names();
-  let mut cursor = QueryCursor::new();
-
-  let mut symbols = Vec::new();
-  let mut references = Vec::new();
-  let mut seen = HashSet::new();
-
-  let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-  while let Some(m) = matches.next() {
-    for capture in m.captures {
-      let name = capture_names
-        .get(capture.index as usize)
-        .map(|name| name.as_ref())
-        .unwrap_or("");
-      if !(name.starts_with("local.definition") || name.starts_with("local.reference")) {
-        continue;
-      }
-
-      let node = capture.node;
-      let start_byte = node.start_byte();
-      let end_byte = node.end_byte();
-      let key = (start_byte, end_byte, name.to_string());
-      if !seen.insert(key) {
-        continue;
-      }
-
-      let text = source
-        .get(start_byte..end_byte)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-      if text.is_empty() {
-        continue;
-      }
-
-      if name.starts_with("local.definition") {
-        symbols.push(SymbolRecord {
-          id: Uuid::now_v7().to_string(),
-          file_path: String::new(),
-          name: text,
-          kind: "definition".to_string(),
-          start_byte,
-          end_byte,
-          language: String::new(),
-        });
-      } else {
-        references.push(ReferenceRecord {
-          id: Uuid::now_v7().to_string(),
-          file_path: String::new(),
-          name: text,
-          start_byte,
-          end_byte,
-          language: String::new(),
-        });
-      }
+    if query_source.trim().is_empty() {
+        return Ok(None);
     }
-  }
 
-  Ok(Some(GraphExtraction {
-    symbols,
-    references,
-    resolutions: Vec::new(),
-  }))
+    let language_fn = match get_language(language) {
+        Some(lang) => lang,
+        None => return Ok(None),
+    };
+    let ts_language: tree_sitter::Language = language_fn.into();
+
+    let mut parser = Parser::new();
+    parser.set_language(&ts_language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| eyre!("failed to parse source for {}", language))?;
+
+    let query = Query::new(&ts_language, query_source)?;
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+
+    let mut symbols = Vec::new();
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let name = capture_names
+                .get(capture.index as usize)
+                .map(|name| name.as_ref())
+                .unwrap_or("");
+            if !(name.starts_with("local.definition") || name.starts_with("local.reference")) {
+                continue;
+            }
+
+            let node = capture.node;
+            let start_byte = node.start_byte();
+            let end_byte = node.end_byte();
+            let key = (start_byte, end_byte, name.to_string());
+            if !seen.insert(key) {
+                continue;
+            }
+
+            let text = source
+                .get(start_byte..end_byte)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                continue;
+            }
+
+            if name.starts_with("local.definition") {
+                symbols.push(SymbolRecord {
+                    id: Uuid::now_v7().to_string(),
+                    file_path: String::new(),
+                    name: text,
+                    kind: "definition".to_string(),
+                    start_byte,
+                    end_byte,
+                    language: String::new(),
+                });
+            } else {
+                references.push(ReferenceRecord {
+                    id: Uuid::now_v7().to_string(),
+                    file_path: String::new(),
+                    name: text,
+                    start_byte,
+                    end_byte,
+                    language: String::new(),
+                });
+            }
+        }
+    }
+
+    Ok(Some(GraphExtraction {
+        symbols,
+        references,
+        resolutions: Vec::new(),
+    }))
 }
 
 async fn detect_language(file_path: &str, source: &str) -> Result<Option<String>> {
-  let cursor = Cursor::new(source.as_bytes().to_vec());
-  let peekable = PeekableReader::new(cursor, 51200);
-  let (detection, _reader) = detect(std::path::Path::new(file_path), peekable)
-    .await
-    .map_err(|(err, _reader)| err)?;
+    let cursor = Cursor::new(source.as_bytes().to_vec());
+    let peekable = PeekableReader::new(cursor, 51200);
+    let (detection, _reader) = detect(std::path::Path::new(file_path), peekable)
+        .await
+        .map_err(|(err, _reader)| err)?;
 
-  let Some(detection) = detection else {
-    return Ok(None);
-  };
+    let Some(detection) = detection else {
+        return Ok(None);
+    };
 
-  let raw = detection.language().to_ascii_lowercase();
-  let normalized = match raw.as_str() {
-    "typescriptreact" | "tsx" => "typescript".to_string(),
-    "javascriptreact" | "jsx" => "javascript".to_string(),
-    other => other.to_string(),
-  };
-  Ok(Some(normalized))
+    let raw = detection.language().to_ascii_lowercase();
+    let normalized = match raw.as_str() {
+        "typescriptreact" | "tsx" => "typescript".to_string(),
+        "javascriptreact" | "jsx" => "javascript".to_string(),
+        other => other.to_string(),
+    };
+    Ok(Some(normalized))
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
-  use tempfile::TempDir;
-  use text_chunking::Tokenizer;
+    use super::*;
+    use tempfile::TempDir;
+    use text_chunking::Tokenizer;
 
-  use crate::test_support::write_fixture_repo;
+    use crate::test_support::write_fixture_repo;
 
-  #[tokio::test]
-  async fn graph_build_populates_symbols_and_references() -> Result<()> {
-    let dir = TempDir::new()?;
-    write_fixture_repo(dir.path())?;
+    #[tokio::test]
+    async fn graph_build_populates_symbols_and_references() -> Result<()> {
+        let dir = TempDir::new()?;
+        write_fixture_repo(dir.path())?;
 
-    let db_path = dir.path().join("context.duckdb");
-    let db = Db::open(&db_path, Some(2))?;
+        let db_path = dir.path().join("context.duckdb");
+        let db = Db::open(&db_path, Some(2))?;
 
-    let config = GraphConfig {
-      repo_path: dir.path().to_path_buf(),
-      max_chunk_size: 1500,
-      overlap_percentage: 0.2,
-      tokenizer: Tokenizer::Characters,
-      max_parallel: 4,
-      max_file_size: Some(5 * 1024 * 1024),
-      large_file_threads: 2,
-    };
-    let indexer = GraphIndexer::new(db, config);
-    indexer.index().await?;
+        let config = GraphConfig {
+            repo_path: dir.path().to_path_buf(),
+            max_chunk_size: 1500,
+            overlap_percentage: 0.2,
+            tokenizer: Tokenizer::Characters,
+            max_parallel: 4,
+            max_file_size: Some(5 * 1024 * 1024),
+            large_file_threads: 2,
+        };
+        let indexer = GraphIndexer::new(db, config);
+        indexer.index().await?;
 
-    let conn = duckdb::Connection::open(&db_path)?;
-    let symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
-    let references: i64 =
-      conn.query_row("SELECT COUNT(*) FROM symbol_references", [], |row| row.get(0))?;
+        let conn = duckdb::Connection::open(&db_path)?;
+        let symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+        let references: i64 =
+            conn.query_row("SELECT COUNT(*) FROM symbol_references", [], |row| {
+                row.get(0)
+            })?;
 
-    assert!(symbols > 0, "expected symbols to be populated");
-    assert!(references > 0, "expected references to be populated");
-    Ok(())
-  }
+        assert!(symbols > 0, "expected symbols to be populated");
+        assert!(references > 0, "expected references to be populated");
+        Ok(())
+    }
 }
