@@ -41,9 +41,9 @@ async fn main() -> Result<()> {
         Command::Index(_) => {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
-            let tokenizer = parse_tokenizer(&cfg.chunking.tokenizer)?;
+            let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
 
-            let embedder = build_embedder(&cfg.embedding)?;
+            let embedder = build_embedder(&cfg.embedding, tokenizer.clone())?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let index_config = IndexerConfig {
                 repo_path: project.repo_path.clone(),
@@ -68,7 +68,8 @@ async fn main() -> Result<()> {
         }
         Command::Search(cmd) => {
             let cfg = config::load_config(&cli)?;
-            let embedder = build_embedder(&cfg.embedding)?;
+            let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+            let embedder = build_embedder(&cfg.embedding, tokenizer)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let results = search::search(
@@ -100,7 +101,8 @@ async fn main() -> Result<()> {
         Command::Prompt(cmd) => {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
-            let embedder = build_embedder(&cfg.embedding)?;
+            let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+            let embedder = build_embedder(&cfg.embedding, tokenizer)?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
 
             let ctx = assembly::AssemblyContext {
@@ -155,7 +157,8 @@ async fn main() -> Result<()> {
                 if cfg.embedding.api_key.is_none() {
                     return Err(eyre!("embedding api key missing"));
                 }
-                let _ = build_embedder(&cfg.embedding)?;
+                let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+                let _ = build_embedder(&cfg.embedding, tokenizer)?;
                 println!("Config OK");
             }
         },
@@ -174,7 +177,7 @@ fn project_override(command: &Command) -> Option<&str> {
     }
 }
 
-pub(crate) fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {
+pub(crate) fn build_embedder(cfg: &config::Embedding, tokenizer: Tokenizer) -> Result<EmbedClient> {
     let dialect = parse_dialect(cfg.dialect.as_str())?;
     let config = EmbedderConfig {
         api_key: cfg.api_key.clone(),
@@ -182,6 +185,7 @@ pub(crate) fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {
         timeout: Duration::from_secs(cfg.timeout_seconds),
         dialect,
         model: cfg.model.clone(),
+        tokenizer,
         embedding_dim: cfg.embedding_dim,
         context_length: cfg.context_length,
         max_batch_size: cfg.max_batch_size,
@@ -199,7 +203,7 @@ fn parse_dialect(value: &str) -> Result<ProviderDialect> {
     }
 }
 
-fn parse_tokenizer(value: &str) -> Result<Tokenizer> {
+pub(crate) fn parse_tokenizer(value: &str) -> Result<Tokenizer> {
     let tokenizer = value
         .parse::<Tokenizer>()
         .map_err(|err| eyre!("invalid tokenizer: {err}"))?;

@@ -11,8 +11,13 @@ use reqwest::Client as HttpClient;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use text_chunking::Tokenizer as ChunkTokenizer;
 use tokio::sync::Mutex;
 use tracing::{debug, error};
+use tracing::warn;
+
+use tiktoken_rs::{CoreBPE, cl100k_base, o200k_base, p50k_base, p50k_edit, r50k_base};
+use tokenizers::Tokenizer as HfTokenizer;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum ProviderDialect {
@@ -37,10 +42,62 @@ pub struct EmbedderConfig {
     pub timeout: Duration,
     pub dialect: ProviderDialect,
     pub model: String,
+    pub tokenizer: ChunkTokenizer,
     pub embedding_dim: usize,
     pub context_length: usize,
     pub max_batch_size: usize,
     pub tokens_per_minute: u32,
+}
+
+#[derive(Clone)]
+enum TokenCounter {
+    Characters,
+    Tiktoken(CoreBPE),
+    HuggingFace(Arc<HfTokenizer>),
+}
+
+impl TokenCounter {
+    fn count_tokens(&self, text: &str) -> Result<usize> {
+        match self {
+            TokenCounter::Characters => Ok(text.chars().count()),
+            TokenCounter::Tiktoken(encoder) => Ok(encoder.encode_ordinary(text).len()),
+            TokenCounter::HuggingFace(tokenizer) => tokenizer
+                .encode(text, false)
+                .map(|encoding| encoding.len())
+                .map_err(|err| eyre::eyre!("tokenizer encode failed: {err}")),
+        }
+    }
+}
+
+fn token_counter_from(tokenizer: &ChunkTokenizer) -> Result<TokenCounter> {
+    match tokenizer {
+        ChunkTokenizer::Characters => Ok(TokenCounter::Characters),
+        ChunkTokenizer::Tiktoken(encoding) => {
+            let encoder = match encoding.as_str() {
+                "cl100k_base" => cl100k_base(),
+                "p50k_base" => p50k_base(),
+                "p50k_edit" => p50k_edit(),
+                "r50k_base" => r50k_base(),
+                "o200k_base" => o200k_base(),
+                other => {
+                    return Err(eyre::eyre!("Unknown tiktoken encoding: {other}"));
+                }
+            }
+            .map_err(|err| eyre::eyre!("Failed to create tiktoken: {err}"))?;
+            Ok(TokenCounter::Tiktoken(encoder))
+        }
+        ChunkTokenizer::PreloadedTiktoken(encoder) => Ok(TokenCounter::Tiktoken(
+            Arc::try_unwrap(encoder.clone()).unwrap_or_else(|arc| (*arc).clone()),
+        )),
+        ChunkTokenizer::HuggingFace(model_id) => {
+            let tokenizer = HfTokenizer::from_pretrained(model_id, None)
+                .map_err(|err| eyre::eyre!("Failed to load HF tokenizer {model_id}: {err}"))?;
+            Ok(TokenCounter::HuggingFace(Arc::new(tokenizer)))
+        }
+        ChunkTokenizer::PreloadedHuggingFace(tokenizer) => {
+            Ok(TokenCounter::HuggingFace(tokenizer.clone()))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,18 +124,57 @@ pub struct Client {
     api_key: Option<SecretString>,
     base_url: String,
     model: String,
+    token_counter: TokenCounter,
     dimension: usize,
     context_length: usize,
     max_batch_size: usize,
     dialect: ProviderDialect,
-    rate_limit: Option<Arc<Mutex<RateLimitState>>>,
+    rate_limit: Option<Arc<Mutex<RateLimiter>>>,
 }
 
 #[derive(Debug)]
-struct RateLimitState {
-    window_start: Instant,
-    tokens_used: u32,
-    tokens_per_minute: u32,
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refill_rate: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, refill_rate: f64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_rate,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn try_consume(&mut self, tokens_needed: f64) -> Result<(), Duration> {
+        self.refill();
+        if self.tokens >= tokens_needed {
+            self.tokens -= tokens_needed;
+            Ok(())
+        } else {
+            let tokens_short = tokens_needed - self.tokens;
+            let wait_seconds = tokens_short / self.refill_rate;
+            Err(Duration::from_secs_f64(wait_seconds))
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let new_tokens = elapsed * self.refill_rate;
+        self.tokens = (self.tokens + new_tokens).min(self.capacity);
+        self.last_refill = now;
+    }
+}
+
+#[derive(Debug)]
+struct RateLimiter {
+    token_bucket: TokenBucket,
+    max_tokens_per_minute: u32,
 }
 
 impl Client {
@@ -92,13 +188,16 @@ impl Client {
         if config.max_batch_size == 0 {
             return Err(eyre::eyre!("max_batch_size must be > 0"));
         }
+        let token_counter = token_counter_from(&config.tokenizer)?;
         let rate_limit = if config.tokens_per_minute == 0 {
             None
         } else {
-            Some(Arc::new(Mutex::new(RateLimitState {
-                window_start: Instant::now(),
-                tokens_used: 0,
-                tokens_per_minute: config.tokens_per_minute,
+            let token_rate = config.tokens_per_minute as f64 / 60.0;
+            let token_capacity =
+                (token_rate * 10.0).min(config.tokens_per_minute as f64);
+            Some(Arc::new(Mutex::new(RateLimiter {
+                token_bucket: TokenBucket::new(token_capacity, token_rate),
+                max_tokens_per_minute: config.tokens_per_minute,
             })))
         };
 
@@ -121,12 +220,35 @@ impl Client {
             api_key: config.api_key,
             base_url: config.base_url,
             model: config.model,
+            token_counter,
             dimension: config.embedding_dim,
             context_length: config.context_length,
             max_batch_size: config.max_batch_size,
             dialect: config.dialect,
             rate_limit,
         })
+    }
+
+    fn estimate_token_count(&self, input: &[EmbeddingInput]) -> u32 {
+        let mut tokens: u32 = 0;
+        for inp in input {
+            let trimmed = inp.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let count = if let Some(count) = inp.token_count {
+                count
+            } else {
+                self.token_counter
+                    .count_tokens(trimmed)
+                    .unwrap_or_else(|err| {
+                        warn!("token count failed, falling back to char estimate: {err}");
+                        (trimmed.len() / 4).max(1)
+                    })
+            };
+            tokens = tokens.saturating_add(count as u32);
+        }
+        tokens
     }
 
     fn prepare_inputs(&self, input: &[EmbeddingInput]) -> Result<Vec<String>> {
@@ -147,7 +269,14 @@ impl Client {
             if trimmed.is_empty() {
                 return Err(eyre::eyre!("Input text cannot be empty"));
             }
-            let token_count = inp.token_count.unwrap_or_else(|| trimmed.chars().count());
+            let token_count = if let Some(count) = inp.token_count {
+                count
+            } else {
+                self.token_counter.count_tokens(trimmed).unwrap_or_else(|err| {
+                    warn!("token count failed, falling back to char estimate: {err}");
+                    trimmed.chars().count()
+                })
+            };
             if token_count > self.context_length {
                 return Err(eyre::eyre!(
                     "input length {} exceeds context_length {}",
@@ -188,41 +317,33 @@ impl Client {
         let Some(state) = &self.rate_limit else {
             return Ok(());
         };
-        let mut tokens: u32 = 0;
-        for inp in input {
-            let trimmed = inp.text.trim();
-            let count = inp.token_count.unwrap_or_else(|| trimmed.chars().count());
-            tokens = tokens.saturating_add(count as u32);
+        let tokens = self.estimate_token_count(input);
+
+        if tokens == 0 {
+            return Ok(());
         }
 
-        let mut guard = state.lock().await;
-        if tokens > guard.tokens_per_minute {
-            return Err(eyre::eyre!(
-                "input tokens {} exceed tokens_per_minute {}",
-                tokens,
-                guard.tokens_per_minute
-            ));
+        loop {
+            let wait_duration = {
+                let mut guard = state.lock().await;
+                if tokens > guard.max_tokens_per_minute {
+                    return Err(eyre::eyre!(
+                        "input tokens {} exceed tokens_per_minute {}",
+                        tokens,
+                        guard.max_tokens_per_minute
+                    ));
+                }
+                match guard.token_bucket.try_consume(tokens as f64) {
+                    Ok(()) => return Ok(()),
+                    Err(wait) => wait,
+                }
+            };
+            let wait_with_buffer = wait_duration + Duration::from_millis(10);
+            if wait_with_buffer > Duration::from_millis(100) {
+                debug!("Rate limit: waiting {:?}", wait_with_buffer);
+            }
+            tokio::time::sleep(wait_with_buffer).await;
         }
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(guard.window_start);
-        if elapsed >= Duration::from_secs(60) {
-            guard.window_start = now;
-            guard.tokens_used = 0;
-        }
-
-        if guard.tokens_used + tokens > guard.tokens_per_minute {
-            let wait = Duration::from_secs(60) - elapsed;
-            drop(guard);
-            tokio::time::sleep(wait).await;
-            let mut guard = state.lock().await;
-            guard.window_start = Instant::now();
-            guard.tokens_used = tokens;
-        } else {
-            guard.tokens_used += tokens;
-        }
-
-        Ok(())
     }
 }
 
@@ -313,6 +434,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             dialect: ProviderDialect::OpenAI,
             model: "test-model".to_string(),
+            tokenizer: ChunkTokenizer::Characters,
             embedding_dim,
             context_length,
             max_batch_size,
@@ -330,6 +452,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 dialect: ProviderDialect::OpenAI,
                 model: "test-model".to_string(),
+                tokenizer: ChunkTokenizer::Characters,
                 embedding_dim: 2,
                 context_length: 8,
                 max_batch_size: 1,
@@ -351,6 +474,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             dialect: ProviderDialect::OpenAI,
             model: "test-model".to_string(),
+            tokenizer: ChunkTokenizer::Characters,
             embedding_dim: 0,
             context_length: 8,
             max_batch_size: 1,

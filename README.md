@@ -9,7 +9,7 @@ indexing + retrieval foundation for that pipeline.
 
 ## What it does
 
-- Chunks files with configurable size/overlap/tokenizer.
+- Chunks files with configurable size/overlap and embedding tokenizer.
 - Stores embeddings for semantic retrieval.
 - Extracts symbol/reference graphs from Tree-sitter queries.
 - Adds git co-change history edges via `cupido`.
@@ -77,6 +77,7 @@ Minimal config example (projects are optional):
 [embedding]
 url = "https://api.deepinfra.com/v1/openai"
 model = "Qwen/Qwen3-Embedding-0.6B"
+tokenizer = "hf:Qwen/Qwen3-Embedding-0.6B"
 dialect = "deepinfra"
 timeout_seconds = 10
 embedding_dim = 1024
@@ -87,7 +88,6 @@ tokens_per_minute = 1000000
 [chunking]
 max_chunk_size = 1500
 overlap = 0.2
-tokenizer = "characters"
 max_parallel = 4
 max_file_size = 5242880
 large_file_threads = 4

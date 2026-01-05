@@ -986,6 +986,8 @@ dependencies = [
  "syntastica-queries",
  "tempfile",
  "text-chunking",
+ "tiktoken-rs",
+ "tokenizers",
  "tokio",
  "tokio-stream",
  "toml_edit 0.22.27",

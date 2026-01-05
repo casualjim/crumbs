@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub chunking: Chunking,
     #[config(nested)]
     pub history: History,
+    #[config(default = {})]
     pub projects: BTreeMap<String, Project>,
     #[config(nested)]
     pub search: SearchOptions,
@@ -39,6 +40,15 @@ pub struct Embedding {
     #[config(default = "Qwen/Qwen3-Embedding-0.6B", env = "EMBEDDER_MODEL")]
     #[config(layer_attr(arg(long = "embedder-model", help = "Embedding model name")))]
     pub model: String,
+    #[config(
+        default = "hf:Qwen/Qwen3-Embedding-0.6B",
+        env = "EMBEDDER_TOKENIZER"
+    )]
+    #[config(layer_attr(arg(
+        long = "embedder-tokenizer",
+        help = "Tokenizer for chunking (characters|tiktoken:<name>|hf:<model>)"
+    )))]
+    pub tokenizer: String,
     #[config(default = "deepinfra", env = "EMBEDDER_DIALECT")]
     #[config(layer_attr(arg(
         long = "embedder-dialect",
@@ -83,9 +93,6 @@ pub struct Chunking {
     #[config(default = 0.2, env = "CONTEXT_CHUNK_OVERLAP")]
     #[config(layer_attr(arg(long = "overlap", help = "Chunk overlap ratio (0.0-1.0)")))]
     pub overlap: f32,
-    #[config(default = "characters", env = "CONTEXT_TOKENIZER")]
-    #[config(layer_attr(arg(long = "tokenizer", help = "Tokenizer: characters|tiktoken|...")))]
-    pub tokenizer: String,
     #[config(default = 4, env = "CONTEXT_MAX_PARALLEL")]
     #[config(layer_attr(arg(long = "max-parallel", help = "Max files to chunk in parallel")))]
     pub max_parallel: usize,
@@ -477,6 +484,7 @@ const DEFAULT_CONFIG_TOML: &str = r#"# context configuration
 # Default embedder uses DeepInfra's OpenAI-compatible endpoint.
 url = "https://api.deepinfra.com/v1/openai"
 model = "Qwen/Qwen3-Embedding-0.6B"
+tokenizer = "hf:Qwen/Qwen3-Embedding-0.6B"
 dialect = "deepinfra"
 timeout_seconds = 10
 embedding_dim = 1024
@@ -487,7 +495,6 @@ tokens_per_minute = 1000000
 [chunking]
 max_chunk_size = 1500
 overlap = 0.2
-tokenizer = "characters"
 max_parallel = 4
 max_file_size = 5242880
 large_file_threads = 4
@@ -671,6 +678,9 @@ fn existing_user_config_path() -> Option<PathBuf> {
 fn validate_config(config: &AppConfig) -> eyre::Result<()> {
     if config.embedding.embedding_dim == 0 {
         return Err(eyre::eyre!("embedding_dim must be > 0"));
+    }
+    if config.embedding.tokenizer.trim().is_empty() {
+        return Err(eyre::eyre!("embedding tokenizer must be set"));
     }
     if config.embedding.context_length == 0 {
         return Err(eyre::eyre!("embedder context_length must be > 0"));
@@ -877,6 +887,7 @@ mod tests {
                 url: "http://localhost".to_string(),
                 api_key: None,
                 model: "model".to_string(),
+                tokenizer: "hf:Qwen/Qwen3-Embedding-0.6B".to_string(),
                 dialect: "openai".to_string(),
                 timeout_seconds: 10,
                 embedding_dim: 2,
@@ -887,7 +898,6 @@ mod tests {
             chunking: Chunking {
                 max_chunk_size: 10,
                 overlap: 1.5,
-                tokenizer: "characters".to_string(),
                 max_parallel: 1,
                 max_file_size: 1_024,
                 large_file_threads: 1,
@@ -956,6 +966,7 @@ mod tests {
                 url: "http://localhost".to_string(),
                 api_key: None,
                 model: "model".to_string(),
+                tokenizer: "hf:Qwen/Qwen3-Embedding-0.6B".to_string(),
                 dialect: "openai".to_string(),
                 timeout_seconds: 10,
                 embedding_dim: 2,
@@ -966,7 +977,6 @@ mod tests {
             chunking: Chunking {
                 max_chunk_size: 10,
                 overlap: 0.2,
-                tokenizer: "characters".to_string(),
                 max_parallel: 1,
                 max_file_size: 1_024,
                 large_file_threads: 1,

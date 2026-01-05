@@ -138,7 +138,9 @@ impl<'a> Indexer<'a> {
                         .or_insert_with(|| PendingFile::new(project_chunk.file_size));
                     entry.file_size = project_chunk.file_size;
                     let ordinal = entry.chunks.len();
-                    let embedding = embed_text(self.embedder.as_ref(), chunk.text.clone()).await?;
+                    let token_count = chunk.tokens.as_ref().map(|tokens| tokens.len());
+                    let embedding =
+                        embed_text(self.embedder.as_ref(), chunk.text.clone(), token_count).await?;
 
                     let record = ChunkRecord {
                         id: Uuid::now_v7().to_string(),
@@ -161,7 +163,9 @@ impl<'a> Indexer<'a> {
                         .or_insert_with(|| PendingFile::new(project_chunk.file_size));
                     entry.file_size = project_chunk.file_size;
                     let ordinal = entry.chunks.len();
-                    let embedding = embed_text(self.embedder.as_ref(), chunk.text.clone()).await?;
+                    let token_count = chunk.tokens.as_ref().map(|tokens| tokens.len());
+                    let embedding =
+                        embed_text(self.embedder.as_ref(), chunk.text.clone(), token_count).await?;
 
                     let record = ChunkRecord {
                         id: Uuid::now_v7().to_string(),
@@ -232,11 +236,12 @@ impl<'a> Indexer<'a> {
     }
 }
 
-async fn embed_text(client: &dyn EmbeddingProvider, text: String) -> Result<Vec<f32>> {
-    let input = EmbeddingInput {
-        text,
-        token_count: None,
-    };
+async fn embed_text(
+    client: &dyn EmbeddingProvider,
+    text: String,
+    token_count: Option<usize>,
+) -> Result<Vec<f32>> {
+    let input = EmbeddingInput { text, token_count };
     let output = client.embed(&[input]).await?;
     let mut embeddings = output.embeddings;
     if embeddings.is_empty() {
