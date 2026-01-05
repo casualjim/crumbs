@@ -27,27 +27,32 @@ indexing + retrieval foundation for that pipeline.
 
 1) Create config and secrets files:
 ```
-context config init
+context init
 ```
 
-2) Add your repo as a project entry:
-```
-context config ensure-project .
-```
-
-3) Set your embedder API key (or put it in `secrets.toml`):
+2) Set your embedder API key (or put it in `secrets.toml`):
 ```
 export EMBEDDER_API_KEY="..."
 ```
 
-4) Build the index:
+3) Build the index:
 ```
 context index
 ```
 
-5) Run a search:
+4) Run a search:
 ```
 context search "add numbers"
+```
+
+Optional: create a repo-local config in the current repo:
+```
+context init --local
+```
+
+Optional: assemble prompt-ready context:
+```
+context prompt "refactor the search pipeline"
 ```
 
 ## Configuration
@@ -67,7 +72,7 @@ Config is loaded in this order (later files override earlier):
 - System config:
   - `/etc/context/{config,secrets}.toml`
 
-Minimal config example:
+Minimal config example (projects are optional):
 ```
 [embedding]
 url = "https://api.deepinfra.com/v1/openai"

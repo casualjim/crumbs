@@ -182,10 +182,14 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    #[command(about = "Create default config and secrets files")]
+    Init(InitCli),
     #[command(about = "Build or refresh the repo index")]
     Index(IndexCli),
     #[command(about = "Search the index with a natural language query")]
     Search(SearchCli),
+    #[command(about = "Assemble prompt-ready context for a task")]
+    Prompt(PromptCli),
     #[command(about = "Manage configuration files")]
     Config(ConfigCli),
 }
@@ -223,13 +227,24 @@ pub struct SearchCli {
 #[derive(Args)]
 pub struct InitCli {
     #[arg(
-        value_name = "DIRECTORY",
-        help = "Optional repo directory for per-repo config"
+        long = "local",
+        help = "Write config under <repo>/.config/context instead of the user config dir"
     )]
-    pub directory: Option<PathBuf>,
-    /// Overwrite existing config files if present.
+    pub local: bool,
     #[arg(long = "force", help = "Overwrite existing config files")]
     pub force: bool,
+}
+
+#[derive(Args)]
+pub struct PromptCli {
+    #[command(flatten)]
+    pub embedding: <Embedding as confique::Config>::Layer,
+    #[command(flatten)]
+    pub project: ProjectCli,
+    #[command(flatten)]
+    pub search: <SearchOptions as confique::Config>::Layer,
+    #[arg(value_name = "TASK", help = "Task or question to build context for")]
+    pub task: String,
 }
 
 #[derive(Args)]
@@ -240,32 +255,41 @@ pub struct ConfigCli {
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
-    #[command(about = "Create default config and secrets files")]
-    Init(InitCli),
-    #[command(about = "Ensure a project entry exists in config")]
-    EnsureProject(EnsureProjectCli),
+    #[command(about = "Show the resolved config")]
+    Show,
+    #[command(about = "Set a config value")]
+    Set(ConfigSetCli),
+    #[command(about = "Validate config and embedding setup")]
+    Doctor,
 }
 
 #[derive(Args)]
-pub struct EnsureProjectCli {
-    #[arg(value_name = "REPO", default_value = ".", help = "Repo path to add")]
-    pub repo: PathBuf,
+pub struct ConfigSetCli {
+    #[arg(value_name = "KEY", help = "Config key (e.g. embedding.model)")]
+    pub key: String,
+    #[arg(value_name = "VALUE", help = "Value to set")]
+    pub value: String,
     #[arg(
-        long = "name",
-        help = "Explicit project name (defaults to repo directory name)"
+        long = "local",
+        help = "Write to <repo>/.config/context/config.toml instead of user config"
     )]
-    pub name: Option<String>,
+    pub local: bool,
 }
 
 pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
     let mut cli_layer = <AppConfig as confique::Config>::Layer::empty();
     match &cli.command {
+        Command::Init(_) => {}
         Command::Index(cmd) => {
             cli_layer.embedding = cmd.embedding.clone();
             cli_layer.chunking = cmd.chunking.clone();
             cli_layer.history = cmd.history.clone();
         }
         Command::Search(cmd) => {
+            cli_layer.embedding = cmd.embedding.clone();
+            cli_layer.search = cmd.search.clone();
+        }
+        Command::Prompt(cmd) => {
             cli_layer.embedding = cmd.embedding.clone();
             cli_layer.search = cmd.search.clone();
         }
@@ -277,9 +301,10 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
         builder = builder.file(path);
     }
 
-    // Optional local config relative to cwd.
+    // Optional local config relative to repo root or cwd.
     if let Ok(cwd) = std::env::current_dir() {
-        let local_root = cwd.join(".config");
+        let base = find_git_root(&cwd).unwrap_or(cwd);
+        let local_root = base.join(".config");
         let local_root_config = local_root.join("context.toml");
         if local_root_config.exists() {
             builder = builder.file(local_root_config);
@@ -365,26 +390,24 @@ fn resolve_project_for_cwd(
         return build_resolved_project(name, project, cwd);
     }
 
-    if !config.projects.is_empty() {
-        if let Some(root) = find_git_root(cwd)
-            && let Some((name, project)) = find_project_for_repo(&config.projects, &root)
-        {
-            return build_resolved_project(name, project, cwd);
-        }
+    let repo_root = find_git_root(cwd)
+        .ok_or_else(|| eyre::eyre!("no git repository found in current directory"))?;
 
-        if config.projects.len() == 1 {
-            let (name, project) = config.projects.iter().next().unwrap();
-            return build_resolved_project(name, project, cwd);
-        }
-
-        return Err(eyre::eyre!(
-            "unable to infer project; use --project to select one"
-        ));
+    if let Some((name, project)) = find_project_for_repo(&config.projects, &repo_root) {
+        return build_resolved_project(name, project, cwd);
     }
 
-    Err(eyre::eyre!(
-        "no projects configured; define at least one under [projects.<name>]"
-    ))
+    let implicit_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo")
+        .to_string();
+    let implicit_project = Project {
+        repo: repo_root.clone(),
+        data_dir: None,
+        database: None,
+    };
+    build_resolved_project(&implicit_name, &implicit_project, cwd)
 }
 
 fn find_project_for_repo<'a>(
@@ -498,9 +521,12 @@ const DEFAULT_SECRETS_TOML: &str = r#"# Secrets for context
 "#;
 
 pub fn init_config(init: &InitCli) -> eyre::Result<InitResult> {
-    let root = match init.directory.as_ref() {
-        Some(dir) => dir.join(".config").join("context"),
-        None => default_config_root()?,
+    let root = if init.local {
+        let cwd = std::env::current_dir()?;
+        let repo_root = find_git_root(&cwd).unwrap_or(cwd);
+        repo_root.join(".config").join("context")
+    } else {
+        default_config_root()?
     };
     fs::create_dir_all(&root)?;
 
@@ -517,37 +543,21 @@ pub fn init_config(init: &InitCli) -> eyre::Result<InitResult> {
         wrote_secrets,
     })
 }
-
-pub struct EnsureProjectResult {
+pub struct ConfigSetResult {
     pub config_path: PathBuf,
-    pub project_name: String,
+    pub key: String,
     pub created: bool,
-    pub updated: bool,
 }
 
-pub fn ensure_project(
-    cli: &EnsureProjectCli,
+pub fn set_config_value(
+    cli: &ConfigSetCli,
     config_file: Option<&Path>,
-) -> eyre::Result<EnsureProjectResult> {
-    let cwd = std::env::current_dir()?;
-    let repo_path = resolve_path(&cli.repo, &cwd);
-    if !repo_path.exists() {
-        return Err(eyre::eyre!(
-            "repository path does not exist: {}",
-            repo_path.display()
-        ));
-    }
-    let repo_path = repo_path.canonicalize()?;
-    let project_name = match &cli.name {
-        Some(name) => name.clone(),
-        None => repo_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| eyre::eyre!("unable to infer project name from path"))?
-            .to_string(),
+) -> eyre::Result<ConfigSetResult> {
+    let config_path = if cli.local {
+        local_config_root()?.join("config.toml")
+    } else {
+        resolve_config_write_path(config_file)?
     };
-
-    let config_path = resolve_config_write_path(config_file)?;
     let existed = config_path.exists();
     let mut document = if existed {
         let contents = fs::read_to_string(&config_path)?;
@@ -558,69 +568,19 @@ pub fn ensure_project(
         DocumentMut::new()
     };
 
-    let projects_item = document
-        .entry("projects")
-        .or_insert(Item::Table(Table::new()));
-    let projects_table = projects_item
-        .as_table_mut()
-        .ok_or_else(|| eyre::eyre!("expected [projects] to be a table"))?;
-
-    let repo_value = repo_path.to_string_lossy().to_string();
-    if let Some(existing_name) = find_project_name_for_repo(projects_table, &repo_value) {
-        return Ok(EnsureProjectResult {
-            config_path,
-            project_name: existing_name,
-            created: false,
-            updated: false,
-        });
-    }
-
-    if let Some(existing) = projects_table.get(&project_name) {
-        let existing_repo = existing
-            .as_table()
-            .and_then(|table| table.get("repo"))
-            .and_then(|item| item.as_str());
-        if existing_repo == Some(repo_value.as_str()) {
-            return Ok(EnsureProjectResult {
-                config_path,
-                project_name,
-                created: false,
-                updated: false,
-            });
-        }
-        return Err(eyre::eyre!(
-            "project '{project_name}' already exists with a different repo; use --name to pick another"
-        ));
-    }
-
-    let mut project_table = Table::new();
-    project_table["repo"] = value(repo_value);
-    projects_table[project_name.as_str()] = Item::Table(project_table);
+    let value_item = parse_toml_value(&cli.value);
+    set_document_value(&mut document, &cli.key, value_item)?;
 
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(&config_path, document.to_string())?;
 
-    Ok(EnsureProjectResult {
+    Ok(ConfigSetResult {
         config_path,
-        project_name,
+        key: cli.key.clone(),
         created: !existed,
-        updated: true,
     })
-}
-
-fn find_project_name_for_repo(projects: &Table, repo_value: &str) -> Option<String> {
-    for (name, item) in projects.iter() {
-        let existing_repo = item
-            .as_table()
-            .and_then(|table| table.get("repo"))
-            .and_then(|value| value.as_str());
-        if existing_repo == Some(repo_value) {
-            return Some(name.to_string());
-        }
-    }
-    None
 }
 
 fn write_default_file(path: &Path, contents: &str, force: bool) -> eyre::Result<bool> {
@@ -635,6 +595,46 @@ fn default_config_root() -> eyre::Result<PathBuf> {
     let base =
         dirs::config_dir().ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))?;
     Ok(base.join("context"))
+}
+
+fn local_config_root() -> eyre::Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = find_git_root(&cwd).unwrap_or(cwd);
+    Ok(repo_root.join(".config").join("context"))
+}
+
+fn parse_toml_value(raw: &str) -> Item {
+    if raw.eq_ignore_ascii_case("true") {
+        return value(true);
+    }
+    if raw.eq_ignore_ascii_case("false") {
+        return value(false);
+    }
+    if let Ok(parsed) = raw.parse::<i64>() {
+        return value(parsed);
+    }
+    if let Ok(parsed) = raw.parse::<f64>() {
+        return value(parsed);
+    }
+    value(raw)
+}
+
+fn set_document_value(document: &mut DocumentMut, key: &str, item: Item) -> eyre::Result<()> {
+    let mut parts = key.split('.').collect::<Vec<_>>();
+    let leaf = parts
+        .pop()
+        .ok_or_else(|| eyre::eyre!("config key cannot be empty"))?;
+
+    let mut table = document.as_table_mut();
+    for part in parts {
+        let entry = table.entry(part).or_insert(Item::Table(Table::new()));
+        table = entry
+            .as_table_mut()
+            .ok_or_else(|| eyre::eyre!("config path '{}' is not a table", part))?;
+    }
+
+    table[leaf] = item;
+    Ok(())
 }
 
 fn resolve_config_write_path(config_file: Option<&Path>) -> eyre::Result<PathBuf> {
@@ -917,12 +917,15 @@ mod tests {
     #[test]
     fn init_config_creates_files() -> eyre::Result<()> {
         let dir = TempDir::new()?;
+        let original = std::env::current_dir()?;
+        std::env::set_current_dir(dir.path())?;
         let init = InitCli {
-            directory: Some(dir.path().to_path_buf()),
+            local: true,
             force: false,
         };
 
         let result = init_config(&init)?;
+        std::env::set_current_dir(original)?;
         assert!(result.config_path.exists(), "expected config.toml to exist");
         assert!(
             result.secrets_path.exists(),

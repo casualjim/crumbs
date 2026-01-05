@@ -25,6 +25,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Command::Init(init) => {
+            let result = config::init_config(init)?;
+            if result.wrote_config {
+                println!("Wrote config to {}", result.config_path.display());
+            } else {
+                println!("Config already exists at {}", result.config_path.display());
+            }
+            if result.wrote_secrets {
+                println!("Wrote secrets to {}", result.secrets_path.display());
+            } else {
+                println!("Secrets already exist at {}", result.secrets_path.display());
+            }
+        }
         Command::Index(_) => {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
@@ -84,41 +97,66 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Config(cmd) => match &cmd.command {
-            config::ConfigCommand::Init(init) => {
-                let result = config::init_config(init)?;
-                if result.wrote_config {
-                    println!("Wrote config to {}", result.config_path.display());
-                } else {
-                    println!("Config already exists at {}", result.config_path.display());
-                }
-                if result.wrote_secrets {
-                    println!("Wrote secrets to {}", result.secrets_path.display());
-                } else {
-                    println!("Secrets already exist at {}", result.secrets_path.display());
-                }
+        Command::Prompt(cmd) => {
+            let cfg = config::load_config(&cli)?;
+            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
+            let embedder = build_embedder(&cfg.embedding)?;
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
+
+            let ctx = assembly::AssemblyContext {
+                repo_path: &project.repo_path,
+                db: &db,
+                embedder: Some(&embedder),
+                config: &cfg,
+            };
+
+            let pipeline = assembly::pipeline::default_pipeline(&cfg);
+            let mut arena = assembly::Arena::new();
+            let input = arena.insert(assembly::pipeline::QueryInput {
+                text: cmd.task.clone(),
+            });
+            let handle = pipeline.run(&ctx, &mut arena, input).await?;
+            let assembled = arena.get(handle);
+
+            println!("<context>");
+            for block in &assembled.blocks {
+                let source = match block.source {
+                    assembly::pipeline::CandidateSource::Primary => "primary",
+                    assembly::pipeline::CandidateSource::Expanded => "expanded",
+                };
+                println!(
+                    "<file path=\"{}\" start_byte=\"{}\" end_byte=\"{}\" source=\"{}\">",
+                    block.file_path, block.start_byte, block.end_byte, source
+                );
+                println!("{}", block.text);
+                println!("</file>");
             }
-            config::ConfigCommand::EnsureProject(ensure) => {
-                let result = config::ensure_project(ensure, cli.config_file.as_deref())?;
+            println!("</context>");
+        }
+        Command::Config(cmd) => match &cmd.command {
+            config::ConfigCommand::Show => {
+                let cfg = config::load_config(&cli)?;
+                println!("{cfg:#?}");
+            }
+            config::ConfigCommand::Set(set) => {
+                let result = config::set_config_value(set, cli.config_file.as_deref())?;
                 if result.created {
                     println!(
-                        "Created config at {} and added project '{}'",
+                        "Created config at {} and set {}",
                         result.config_path.display(),
-                        result.project_name
-                    );
-                } else if result.updated {
-                    println!(
-                        "Ensured project '{}' in {}",
-                        result.project_name,
-                        result.config_path.display()
+                        result.key
                     );
                 } else {
-                    println!(
-                        "Project '{}' already exists in {}",
-                        result.project_name,
-                        result.config_path.display()
-                    );
+                    println!("Updated {} in {}", result.key, result.config_path.display());
                 }
+            }
+            config::ConfigCommand::Doctor => {
+                let cfg = config::load_config(&cli)?;
+                if cfg.embedding.api_key.is_none() {
+                    return Err(eyre!("embedding api key missing"));
+                }
+                let _ = build_embedder(&cfg.embedding)?;
+                println!("Config OK");
             }
         },
     }
@@ -128,8 +166,10 @@ async fn main() -> Result<()> {
 
 fn project_override(command: &Command) -> Option<&str> {
     match command {
+        Command::Init(_) => None,
         Command::Index(cmd) => cmd.project.project.as_deref(),
         Command::Search(cmd) => cmd.project.project.as_deref(),
+        Command::Prompt(cmd) => cmd.project.project.as_deref(),
         Command::Config(_) => None,
     }
 }

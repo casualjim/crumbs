@@ -6,3 +6,4 @@ node_modules
 .codex/*.jsonl
 .codex/auth.json
 .env.json
+.vscode
