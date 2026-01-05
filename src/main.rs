@@ -1,3 +1,4 @@
+mod assembly;
 mod config;
 mod db;
 mod embedding;
@@ -26,44 +27,30 @@ async fn main() -> Result<()> {
     match &cli.command {
         Command::Index(_) => {
             let cfg = config::load_config(&cli)?;
+            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let tokenizer = parse_tokenizer(&cfg.chunking.tokenizer)?;
+
             let embedder = build_embedder(&cfg.embedding)?;
-            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
-            let config = IndexerConfig {
-                repo_path: project.repo_path,
+            let index_config = IndexerConfig {
+                repo_path: project.repo_path.clone(),
                 max_chunk_size: cfg.chunking.max_chunk_size,
                 overlap_percentage: cfg.chunking.overlap,
-                tokenizer,
+                tokenizer: tokenizer.clone(),
                 max_parallel: cfg.chunking.max_parallel,
                 max_file_size: Some(cfg.chunking.max_file_size),
                 large_file_threads: cfg.chunking.large_file_threads,
+                history: graph::HistoryConfig {
+                    depth: cfg.history.depth,
+                    commit_size_limit_ratio: cfg.history.commit_size_limit_ratio,
+                    multi_parents: cfg.history.multi_parents,
+                    issue_regex: cfg.history.issue_regex.clone(),
+                    commit_exclude_regex: cfg.history.commit_exclude_regex.clone(),
+                    author_exclude_regex: cfg.history.author_exclude_regex.clone(),
+                    path_specs: split_history_path_specs(&cfg.history.path_specs),
+                },
             };
-            let indexer = Indexer::new(db, embedder, config);
-            indexer.index().await?;
-        }
-        Command::Graph(_) => {
-            let cfg = config::load_config(&cli)?;
-            let tokenizer = parse_tokenizer(&cfg.chunking.tokenizer)?;
-            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
-            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
-            let config = graph::GraphConfig {
-                repo_path: project.repo_path,
-                max_chunk_size: cfg.chunking.max_chunk_size,
-                overlap_percentage: cfg.chunking.overlap,
-                tokenizer,
-                max_parallel: cfg.chunking.max_parallel,
-                max_file_size: Some(cfg.chunking.max_file_size),
-                large_file_threads: cfg.chunking.large_file_threads,
-                history_depth: cfg.history.depth,
-                history_commit_size_limit_ratio: cfg.history.commit_size_limit_ratio,
-                history_multi_parents: cfg.history.multi_parents,
-                history_issue_regex: cfg.history.issue_regex.clone(),
-                history_commit_exclude_regex: cfg.history.commit_exclude_regex.clone(),
-                history_author_exclude_regex: cfg.history.author_exclude_regex.clone(),
-                history_path_specs: split_history_path_specs(&cfg.history.path_specs),
-            };
-            let indexer = graph::GraphIndexer::new(db, config);
+            let indexer = Indexer::new(&db, embedder, index_config);
             indexer.index().await?;
         }
         Command::Search(cmd) => {
@@ -142,13 +129,12 @@ async fn main() -> Result<()> {
 fn project_override(command: &Command) -> Option<&str> {
     match command {
         Command::Index(cmd) => cmd.project.project.as_deref(),
-        Command::Graph(cmd) => cmd.project.project.as_deref(),
         Command::Search(cmd) => cmd.project.project.as_deref(),
         Command::Config(_) => None,
     }
 }
 
-fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {
+pub(crate) fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {
     let dialect = parse_dialect(cfg.dialect.as_str())?;
     let config = EmbedderConfig {
         api_key: cfg.api_key.clone(),

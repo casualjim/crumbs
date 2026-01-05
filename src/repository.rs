@@ -35,4 +35,10 @@ pub trait Repository {
     fn fts_loaded(&self) -> bool;
     fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>>;
     fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsRow>>;
+    fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>>;
+    fn chunks_for_files(
+        &self,
+        file_paths: &[String],
+        limit_per_file: usize,
+    ) -> Result<Vec<SearchRow>>;
 }

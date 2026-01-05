@@ -38,34 +38,10 @@
 - Commit messages follow Conventional Commits (examples: `feat: ...`, `fix: ...`, `chore: ...`, `refactor: ...`, `test: ...`).
 - PRs should include: a clear description, rationale, and any user-facing behavior changes.
 - Ensure CI passes (`fmt`, `clippy`, `test`) before merging.
-- CRITICAL: Do not create commits unless the user explicitly asks. Always confirm before staging or committing changes.
+- **CRITICAL**: Do not create commits unless the user explicitly asks. Always confirm before staging or committing changes.
+- **CRITICAL**: No fakes. Call the embedding API directly (no mocks or simulated responses).
 
 ## Release Notes (Maintainers)
 
 Releases are cut automatically after CI passes on pushes to `main`. The `Cut Release` workflow runs `git-cliff` to update `CHANGELOG.md` and then uses `cargo-release` to bump the patch version and tag `vX.Y.Z`. Pushing the tag triggers `cargo-dist` to publish GitHub Release artifacts. A repo secret named `RELEASE_TOKEN` is required so the tag push can trigger the `Release` workflow. There is no release PR flow.
 
-## Landing the Plane (Session Completion)
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd sync
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds

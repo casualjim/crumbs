@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use confique::Config as _;
 use confique::Layer as _;
-use serde::Deserialize;
 use secrecy::SecretString;
+use serde::Deserialize;
 use std::fs;
 use toml_edit::{DocumentMut, Item, Table, value};
 
@@ -28,31 +28,49 @@ pub struct AppConfig {
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Embedding {
     #[config(default = "https://api.deepinfra.com/v1/openai", env = "EMBEDDER_URL")]
-    #[config(layer_attr(arg(long = "embedder-url")))]
+    #[config(layer_attr(arg(long = "embedder-url", help = "Embedding API base URL")))]
     pub url: String,
     #[config(env = "EMBEDDER_API_KEY")]
-    #[config(layer_attr(arg(long = "embedder-api-key")))]
+    #[config(layer_attr(arg(
+        long = "embedder-api-key",
+        help = "Embedding API key (or set in secrets)"
+    )))]
     pub api_key: Option<SecretString>,
     #[config(default = "Qwen/Qwen3-Embedding-0.6B", env = "EMBEDDER_MODEL")]
-    #[config(layer_attr(arg(long = "embedder-model")))]
+    #[config(layer_attr(arg(long = "embedder-model", help = "Embedding model name")))]
     pub model: String,
     #[config(default = "deepinfra", env = "EMBEDDER_DIALECT")]
-    #[config(layer_attr(arg(long = "embedder-dialect")))]
+    #[config(layer_attr(arg(
+        long = "embedder-dialect",
+        help = "Provider dialect: openai|deepinfra"
+    )))]
     pub dialect: String,
     #[config(default = 10, env = "EMBEDDER_TIMEOUT_SECONDS")]
-    #[config(layer_attr(arg(long = "embedder-timeout-seconds")))]
+    #[config(layer_attr(arg(
+        long = "embedder-timeout-seconds",
+        help = "Request timeout in seconds"
+    )))]
     pub timeout_seconds: u64,
     #[config(default = 1024, env = "EMBEDDING_DIM")]
-    #[config(layer_attr(arg(long = "embedding-dim")))]
+    #[config(layer_attr(arg(long = "embedding-dim", help = "Embedding vector dimension")))]
     pub embedding_dim: usize,
     #[config(default = 32_768, env = "EMBEDDER_CONTEXT_LENGTH")]
-    #[config(layer_attr(arg(long = "embedder-context-length")))]
+    #[config(layer_attr(arg(
+        long = "embedder-context-length",
+        help = "Max tokens per embedding request"
+    )))]
     pub context_length: usize,
     #[config(default = 15, env = "EMBEDDER_MAX_BATCH_SIZE")]
-    #[config(layer_attr(arg(long = "embedder-max-batch-size")))]
+    #[config(layer_attr(arg(
+        long = "embedder-max-batch-size",
+        help = "Max inputs per embedding batch"
+    )))]
     pub max_batch_size: usize,
     #[config(default = 1_000_000, env = "EMBEDDER_TOKENS_PER_MINUTE")]
-    #[config(layer_attr(arg(long = "embedder-tokens-per-minute")))]
+    #[config(layer_attr(arg(
+        long = "embedder-tokens-per-minute",
+        help = "Rate limit for embedding tokens per minute (0 disables)"
+    )))]
     pub tokens_per_minute: u32,
 }
 
@@ -60,22 +78,25 @@ pub struct Embedding {
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Chunking {
     #[config(default = 1500, env = "CONTEXT_MAX_CHUNK_SIZE")]
-    #[config(layer_attr(arg(long = "max-chunk-size")))]
+    #[config(layer_attr(arg(long = "max-chunk-size", help = "Max characters/tokens per chunk")))]
     pub max_chunk_size: usize,
     #[config(default = 0.2, env = "CONTEXT_CHUNK_OVERLAP")]
-    #[config(layer_attr(arg(long = "overlap")))]
+    #[config(layer_attr(arg(long = "overlap", help = "Chunk overlap ratio (0.0-1.0)")))]
     pub overlap: f32,
     #[config(default = "characters", env = "CONTEXT_TOKENIZER")]
-    #[config(layer_attr(arg(long = "tokenizer")))]
+    #[config(layer_attr(arg(long = "tokenizer", help = "Tokenizer: characters|tiktoken|...")))]
     pub tokenizer: String,
     #[config(default = 4, env = "CONTEXT_MAX_PARALLEL")]
-    #[config(layer_attr(arg(long = "max-parallel")))]
+    #[config(layer_attr(arg(long = "max-parallel", help = "Max files to chunk in parallel")))]
     pub max_parallel: usize,
     #[config(default = 5_242_880, env = "CONTEXT_MAX_FILE_SIZE")]
-    #[config(layer_attr(arg(long = "max-file-size")))]
+    #[config(layer_attr(arg(long = "max-file-size", help = "Max file size (bytes) to index")))]
     pub max_file_size: u64,
     #[config(default = 4, env = "CONTEXT_LARGE_FILE_THREADS")]
-    #[config(layer_attr(arg(long = "large-file-threads")))]
+    #[config(layer_attr(arg(
+        long = "large-file-threads",
+        help = "Threads to use for large file chunking"
+    )))]
     pub large_file_threads: usize,
 }
 
@@ -90,25 +111,41 @@ pub struct Project {
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct History {
     #[config(default = 10240, env = "CONTEXT_HISTORY_DEPTH")]
-    #[config(layer_attr(arg(long = "history-depth")))]
+    #[config(layer_attr(arg(long = "history-depth", help = "Max commit history depth")))]
     pub depth: u32,
     #[config(default = 1.0, env = "CONTEXT_HISTORY_COMMIT_SIZE_LIMIT_RATIO")]
-    #[config(layer_attr(arg(long = "history-commit-size-limit-ratio")))]
+    #[config(layer_attr(arg(
+        long = "history-commit-size-limit-ratio",
+        help = "Ignore commits touching too many files (ratio)"
+    )))]
     pub commit_size_limit_ratio: f32,
     #[config(default = false, env = "CONTEXT_HISTORY_MULTI_PARENTS")]
-    #[config(layer_attr(arg(long = "history-multi-parents")))]
+    #[config(layer_attr(arg(long = "history-multi-parents", help = "Include merge commits")))]
     pub multi_parents: bool,
     #[config(default = "(#\\d+)", env = "CONTEXT_HISTORY_ISSUE_REGEX")]
-    #[config(layer_attr(arg(long = "history-issue-regex")))]
+    #[config(layer_attr(arg(
+        long = "history-issue-regex",
+        help = "Issue/PR regex for commit messages"
+    )))]
     pub issue_regex: String,
     #[config(env = "CONTEXT_HISTORY_COMMIT_EXCLUDE_REGEX")]
-    #[config(layer_attr(arg(long = "history-commit-exclude-regex")))]
+    #[config(layer_attr(arg(
+        long = "history-commit-exclude-regex",
+        help = "Exclude commits matching regex"
+    )))]
     pub commit_exclude_regex: Option<String>,
     #[config(env = "CONTEXT_HISTORY_AUTHOR_EXCLUDE_REGEX")]
-    #[config(layer_attr(arg(long = "history-author-exclude-regex")))]
+    #[config(layer_attr(arg(
+        long = "history-author-exclude-regex",
+        help = "Exclude authors matching regex"
+    )))]
     pub author_exclude_regex: Option<String>,
     #[config(default = "", env = "CONTEXT_HISTORY_PATHS")]
-    #[config(layer_attr(arg(long = "history-pathspec", value_delimiter = ',')))]
+    #[config(layer_attr(arg(
+        long = "history-pathspec",
+        value_delimiter = ',',
+        help = "Comma-separated pathspecs to include"
+    )))]
     pub path_specs: String,
 }
 
@@ -116,10 +153,13 @@ pub struct History {
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct SearchOptions {
     #[config(default = 10, env = "CONTEXT_SEARCH_LIMIT")]
-    #[config(layer_attr(arg(long = "limit")))]
+    #[config(layer_attr(arg(long = "limit", help = "Max results to return")))]
     pub limit: usize,
     #[config(default = 0.6, env = "CONTEXT_HYBRID_WEIGHT")]
-    #[config(layer_attr(arg(long = "hybrid-weight")))]
+    #[config(layer_attr(arg(
+        long = "hybrid-weight",
+        help = "Weight for hybrid scoring (0=FTS, 1=vector)"
+    )))]
     pub hybrid_weight: f32,
 }
 
@@ -127,7 +167,9 @@ pub struct SearchOptions {
 #[command(
     name = "context",
     version,
-    about = "Codebase indexer and semantic search"
+    about = "Codebase indexer and context retrieval for LLM prompts",
+    long_about = "Index a Git repo into a local database (chunks, embeddings, graphs, git history) \
+and retrieve high-signal code context for LLM prompts."
 )]
 pub struct Cli {
     /// Optional path to a config file to load in addition to the standard locations.
@@ -140,15 +182,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    #[command(about = "Build or refresh the repo index")]
     Index(IndexCli),
-    Graph(GraphCli),
+    #[command(about = "Search the index with a natural language query")]
     Search(SearchCli),
+    #[command(about = "Manage configuration files")]
     Config(ConfigCli),
 }
 
 #[derive(Args, Clone)]
 pub struct ProjectCli {
-    #[arg(long = "project")]
+    #[arg(long = "project", help = "Named project entry to use from config")]
     pub project: Option<String>,
 }
 
@@ -156,14 +200,6 @@ pub struct ProjectCli {
 pub struct IndexCli {
     #[command(flatten)]
     pub embedding: <Embedding as confique::Config>::Layer,
-    #[command(flatten)]
-    pub chunking: <Chunking as confique::Config>::Layer,
-    #[command(flatten)]
-    pub project: ProjectCli,
-}
-
-#[derive(Args)]
-pub struct GraphCli {
     #[command(flatten)]
     pub chunking: <Chunking as confique::Config>::Layer,
     #[command(flatten)]
@@ -180,16 +216,19 @@ pub struct SearchCli {
     pub project: ProjectCli,
     #[command(flatten)]
     pub search: <SearchOptions as confique::Config>::Layer,
-    #[arg(value_name = "QUERY")]
+    #[arg(value_name = "QUERY", help = "Natural language search query")]
     pub query: String,
 }
 
 #[derive(Args)]
 pub struct InitCli {
-    #[arg(value_name = "DIRECTORY")]
+    #[arg(
+        value_name = "DIRECTORY",
+        help = "Optional repo directory for per-repo config"
+    )]
     pub directory: Option<PathBuf>,
     /// Overwrite existing config files if present.
-    #[arg(long = "force")]
+    #[arg(long = "force", help = "Overwrite existing config files")]
     pub force: bool,
 }
 
@@ -201,15 +240,20 @@ pub struct ConfigCli {
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
-    EnsureProject(EnsureProjectCli),
+    #[command(about = "Create default config and secrets files")]
     Init(InitCli),
+    #[command(about = "Ensure a project entry exists in config")]
+    EnsureProject(EnsureProjectCli),
 }
 
 #[derive(Args)]
 pub struct EnsureProjectCli {
-    #[arg(value_name = "REPO", default_value = ".")]
+    #[arg(value_name = "REPO", default_value = ".", help = "Repo path to add")]
     pub repo: PathBuf,
-    #[arg(long = "name")]
+    #[arg(
+        long = "name",
+        help = "Explicit project name (defaults to repo directory name)"
+    )]
     pub name: Option<String>,
 }
 
@@ -218,9 +262,6 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
     match &cli.command {
         Command::Index(cmd) => {
             cli_layer.embedding = cmd.embedding.clone();
-            cli_layer.chunking = cmd.chunking.clone();
-        }
-        Command::Graph(cmd) => {
             cli_layer.chunking = cmd.chunking.clone();
             cli_layer.history = cmd.history.clone();
         }
@@ -325,10 +366,10 @@ fn resolve_project_for_cwd(
     }
 
     if !config.projects.is_empty() {
-        if let Some(root) = find_git_root(cwd) {
-            if let Some((name, project)) = find_project_for_repo(&config.projects, &root) {
-                return build_resolved_project(name, project, cwd);
-            }
+        if let Some(root) = find_git_root(cwd)
+            && let Some((name, project)) = find_project_for_repo(&config.projects, &root)
+        {
+            return build_resolved_project(name, project, cwd);
         }
 
         if config.projects.len() == 1 {
@@ -608,10 +649,10 @@ fn resolve_config_write_path(config_file: Option<&Path>) -> eyre::Result<PathBuf
 
 fn existing_user_config_path() -> Option<PathBuf> {
     let standard = dirs::config_dir().map(|dir| dir.join("context").join("config.toml"));
-    if let Some(path) = standard {
-        if path.exists() {
-            return Some(path);
-        }
+    if let Some(path) = standard
+        && path.exists()
+    {
+        return Some(path);
     }
 
     #[cfg(target_os = "macos")]

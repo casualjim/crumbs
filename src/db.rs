@@ -81,14 +81,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn vss_loaded(&self) -> bool {
-        self.vss_loaded
-    }
-
-    pub fn fts_loaded(&self) -> bool {
-        self.fts_loaded
-    }
-
     fn create_schema(&mut self) -> Result<()> {
         let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS files (
@@ -117,6 +109,7 @@ impl Db {
           text TEXT NOT NULL,
           kind TEXT NOT NULL,
           ordinal INTEGER NOT NULL,
+          tokens INTEGER[],
           embedding FLOAT[{dim}] NOT NULL
         );
         CREATE TABLE IF NOT EXISTS file_chunk_edges (
@@ -169,6 +162,7 @@ impl Db {
         );
 
         self.conn.execute_batch(&create_sql)?;
+        self.ensure_chunk_tokens_column()?;
 
         if self.vss_loaded {
             let _ = self
@@ -211,37 +205,29 @@ impl Db {
         Ok(())
     }
 
-    pub fn load_existing_hashes(&self) -> Result<BTreeMap<PathBuf, [u8; 32]>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, content_hash FROM files WHERE content_hash IS NOT NULL")?;
+    fn ensure_chunk_tokens_column(&self) -> Result<()> {
+        if self.column_exists("chunks", "tokens")? {
+            return Ok(());
+        }
+        self.conn
+            .execute("ALTER TABLE chunks ADD COLUMN tokens INTEGER[]", [])?;
+        Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let pragma = format!("PRAGMA table_info('{table}')");
+        let mut stmt = self.conn.prepare(&pragma)?;
         let mut rows = stmt.query([])?;
-        let mut hashes = BTreeMap::new();
         while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let hash: Vec<u8> = row.get(1)?;
-            if hash.len() != 32 {
-                continue;
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
             }
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&hash);
-            hashes.insert(PathBuf::from(path), buf);
         }
-        Ok(hashes)
+        Ok(false)
     }
 
-    pub fn list_files(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
-        let mut rows = stmt.query([])?;
-        let mut files = Vec::new();
-        while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            files.push(path);
-        }
-        Ok(files)
-    }
-
-    pub fn clear_file_chunks(&self, file_path: &str) -> Result<()> {
+    fn clear_file_chunks(&self, file_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_chunk_edges WHERE file_path = ?",
             params![file_path],
@@ -251,7 +237,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn clear_file_graph(&self, file_path: &str) -> Result<()> {
+    fn clear_file_graph(&self, file_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM reference_symbol_edges WHERE symbol_id IN \
        (SELECT id FROM symbols WHERE file_path = ?)",
@@ -281,7 +267,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn clear_file_history(&self, file_path: &str) -> Result<()> {
+    fn clear_file_history(&self, file_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_commit_edges WHERE file_path = ?",
             params![file_path],
@@ -293,21 +279,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_file(&self, file_path: &str) -> Result<()> {
-        self.clear_file_graph(file_path)?;
-        self.clear_file_chunks(file_path)?;
-        self.clear_file_history(file_path)?;
-        self.conn
-            .execute("DELETE FROM files WHERE path = ?", params![file_path])?;
-        Ok(())
-    }
-
-    pub fn upsert_file(
-        &self,
-        file_path: &str,
-        file_size: u64,
-        content_hash: [u8; 32],
-    ) -> Result<()> {
+    fn upsert_file(&self, file_path: &str, file_size: u64, content_hash: [u8; 32]) -> Result<()> {
         self.conn.execute(
             "INSERT INTO files (path, content_hash, size, updated_at)
        VALUES (?, ?, ?, now())
@@ -320,7 +292,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn ensure_file(&self, file_path: &str, file_size: u64) -> Result<()> {
+    fn ensure_file(&self, file_path: &str, file_size: u64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO files (path, size, updated_at)
        VALUES (?, ?, now())
@@ -332,7 +304,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn insert_chunk(&self, record: &ChunkRecord, embedding: &[f32]) -> Result<()> {
+    fn insert_chunk(&self, record: &ChunkRecord, embedding: &[f32]) -> Result<()> {
         self.ensure_file_exists(&record.file_path)?;
         if record.start_byte > record.end_byte {
             return Err(eyre!(
@@ -352,13 +324,13 @@ impl Db {
         let array_value_sql = array_value_placeholder(self.embedding_dim);
         let sql = format!(
             "INSERT INTO chunks \
-      (id, file_path, start_byte, end_byte, text, kind, ordinal, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, {array}::FLOAT[{dim}])",
+      (id, file_path, start_byte, end_byte, text, kind, ordinal, tokens, embedding) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, {array}::FLOAT[{dim}])",
             array = array_value_sql,
             dim = self.embedding_dim
         );
 
-        let mut params_vec = Vec::with_capacity(7 + embedding.len());
+        let mut params_vec = Vec::with_capacity(8 + embedding.len());
         params_vec.push(Value::Text(record.id.clone()));
         params_vec.push(Value::Text(record.file_path.clone()));
         params_vec.push(Value::BigInt(record.start_byte as i64));
@@ -366,6 +338,16 @@ impl Db {
         params_vec.push(Value::Text(record.text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Int(record.ordinal as i32));
+        let tokens_value = match &record.tokens {
+            Some(tokens) => Value::List(
+                tokens
+                    .iter()
+                    .map(|token| Value::Int(*token as i32))
+                    .collect(),
+            ),
+            None => Value::Null,
+        };
+        params_vec.push(tokens_value);
         params_vec.extend(embedding.iter().copied().map(Value::Float));
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -379,7 +361,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn insert_symbol(&self, record: &SymbolRecord) -> Result<()> {
+    fn insert_symbol(&self, record: &SymbolRecord) -> Result<()> {
         self.ensure_file_exists(&record.file_path)?;
         self.conn.execute(
             "INSERT INTO symbols (id, file_path, name, kind, start_byte, end_byte, language) \
@@ -401,7 +383,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn insert_reference(&self, record: &ReferenceRecord) -> Result<()> {
+    fn insert_reference(&self, record: &ReferenceRecord) -> Result<()> {
         self.ensure_file_exists(&record.file_path)?;
         self.conn.execute(
             "INSERT INTO symbol_references (id, file_path, name, start_byte, end_byte, language) \
@@ -422,100 +404,13 @@ impl Db {
         Ok(())
     }
 
-    pub fn link_reference_symbol(&self, reference_id: &str, symbol_id: &str) -> Result<()> {
+    fn link_reference_symbol(&self, reference_id: &str, symbol_id: &str) -> Result<()> {
         self.ensure_reference_exists(reference_id)?;
         self.ensure_symbol_exists(symbol_id)?;
         self.conn.execute(
             "INSERT INTO reference_symbol_edges (reference_id, symbol_id) VALUES (?, ?)",
             params![reference_id, symbol_id],
         )?;
-        Ok(())
-    }
-
-    pub fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>> {
-        if !self.vss_loaded {
-            return Err(eyre!(
-                "vss extension not available; install/load it to enable vector search"
-            ));
-        }
-        if query_embedding.len() != self.embedding_dim {
-            return Err(eyre!(
-                "embedding dimension mismatch: expected {}, got {}",
-                self.embedding_dim,
-                query_embedding.len()
-            ));
-        }
-
-        let array_value_sql = array_value_placeholder(self.embedding_dim);
-        let sql = format!(
-            "SELECT id, file_path, start_byte, end_byte, text, \
-       array_cosine_distance(embedding, {array}::FLOAT[{dim}]) AS distance \
-       FROM chunks ORDER BY distance ASC LIMIT ?",
-            array = array_value_sql,
-            dim = self.embedding_dim
-        );
-
-        let mut params_vec = Vec::with_capacity(query_embedding.len() + 1);
-        params_vec.extend(query_embedding.iter().copied().map(Value::Float));
-        params_vec.push(Value::BigInt(limit as i64));
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params_vec))?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            results.push(SearchRow {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                start_byte: row.get(2)?,
-                end_byte: row.get(3)?,
-                text: row.get(4)?,
-                distance: row.get(5)?,
-            });
-        }
-        Ok(results)
-    }
-
-    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsRow>> {
-        if !self.fts_loaded {
-            return Err(eyre!(
-                "fts extension not available; install/load it to enable full-text search"
-            ));
-        }
-
-        let sql = "SELECT id, file_path, start_byte, end_byte, text, score \
-      FROM ( \
-        SELECT id, file_path, start_byte, end_byte, text, \
-          fts_main_chunks.match_bm25(id, ?) AS score \
-        FROM chunks \
-      ) sq \
-      WHERE score IS NOT NULL \
-      ORDER BY score DESC \
-      LIMIT ?";
-
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query(params![query, limit as i64])?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            results.push(FtsRow {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                start_byte: row.get(2)?,
-                end_byte: row.get(3)?,
-                text: row.get(4)?,
-                score: row.get(5)?,
-            });
-        }
-        Ok(results)
-    }
-
-    pub fn refresh_fts_index(&self) -> Result<()> {
-        if !self.fts_loaded {
-            warn!("fts extension not available; skipping full-text index refresh");
-            return Ok(());
-        }
-        let _ = self.conn.execute_batch("PRAGMA drop_fts_index('chunks');");
-        self.conn
-            .execute_batch("PRAGMA create_fts_index('chunks', 'id', 'text');")?;
         Ok(())
     }
 
@@ -564,7 +459,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn with_transaction<F, T>(&self, f: F) -> Result<T>
+    fn with_transaction<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Db) -> Result<T>,
     {
@@ -583,61 +478,6 @@ impl Db {
                 Err(err)
             }
         }
-    }
-
-    pub fn replace_file_chunks(
-        &self,
-        file_path: &str,
-        file_size: u64,
-        content_hash: [u8; 32],
-        chunks: &[ChunkRecord],
-        embeddings: &[Vec<f32>],
-    ) -> Result<()> {
-        if chunks.len() != embeddings.len() {
-            return Err(eyre!(
-                "chunk/embedding count mismatch: {} chunks vs {} embeddings",
-                chunks.len(),
-                embeddings.len()
-            ));
-        }
-        for record in chunks {
-            if record.file_path != file_path {
-                return Err(eyre!(
-                    "chunk file_path mismatch: expected {}, got {}",
-                    file_path,
-                    record.file_path
-                ));
-            }
-        }
-
-        self.with_transaction(|db| {
-            db.ensure_file(file_path, file_size)?;
-            db.clear_file_chunks(file_path)?;
-            for (record, embedding) in chunks.iter().zip(embeddings.iter()) {
-                db.insert_chunk(record, embedding)?;
-            }
-            db.upsert_file(file_path, file_size, content_hash)?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    pub fn replace_file_graph(
-        &self,
-        file_path: &str,
-        file_size: u64,
-        content_hash: [u8; 32],
-        language: &str,
-        graph: GraphData,
-    ) -> Result<()> {
-        self.with_transaction(|db| {
-            db.ensure_file(file_path, file_size)?;
-            db.clear_file_graph(file_path)?;
-            db.persist_graph(file_path, language, graph)?;
-            db.upsert_file(file_path, file_size, content_hash)?;
-            Ok(())
-        })?;
-        Ok(())
     }
 
     fn persist_graph(&self, file_path: &str, language: &str, graph: GraphData) -> Result<()> {
@@ -672,35 +512,6 @@ impl Db {
 
         Ok(())
     }
-
-    pub fn replace_history_edges(
-        &self,
-        file_commit_edges: &[(String, String)],
-        cochange_edges: &[(String, String, i64, f64)],
-    ) -> Result<()> {
-        self.with_transaction(|db| {
-            db.conn.execute("DELETE FROM file_commit_edges", [])?;
-            db.conn.execute("DELETE FROM file_cochange_edges", [])?;
-
-            for (file_path, commit_id) in file_commit_edges {
-                db.conn.execute(
-                    "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?)",
-                    params![file_path, commit_id],
-                )?;
-            }
-
-            for (src, dst, commit_count, weight) in cochange_edges {
-                db.conn.execute(
-                    "INSERT INTO file_cochange_edges \
-                     (src_path, dst_path, commit_count, weight) VALUES (?, ?, ?, ?)",
-                    params![src, dst, commit_count, weight],
-                )?;
-            }
-
-            Ok(())
-        })?;
-        Ok(())
-    }
 }
 
 pub struct ChunkRecord {
@@ -711,6 +522,7 @@ pub struct ChunkRecord {
     pub text: String,
     pub kind: String,
     pub ordinal: usize,
+    pub tokens: Option<Vec<u32>>,
 }
 
 pub struct SymbolRecord {
@@ -781,11 +593,31 @@ fn load_optional_extension(conn: &Connection, name: &str, from: Option<&str>) ->
 
 impl Repository for Db {
     fn load_existing_hashes(&self) -> Result<BTreeMap<PathBuf, [u8; 32]>> {
-        Db::load_existing_hashes(self)
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash FROM files WHERE content_hash IS NOT NULL")?;
+        let mut rows = stmt.query([])?;
+        let mut hashes = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let hash: Vec<u8> = row.get(1)?;
+            if hash.len() != 32 {
+                continue;
+            }
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&hash);
+            hashes.insert(PathBuf::from(path), buf);
+        }
+        Ok(hashes)
     }
 
     fn delete_file(&self, file_path: &str) -> Result<()> {
-        Db::delete_file(self, file_path)
+        self.clear_file_graph(file_path)?;
+        self.clear_file_chunks(file_path)?;
+        self.clear_file_history(file_path)?;
+        self.conn
+            .execute("DELETE FROM files WHERE path = ?", params![file_path])?;
+        Ok(())
     }
 
     fn replace_file_chunks(
@@ -796,11 +628,44 @@ impl Repository for Db {
         chunks: &[ChunkRecord],
         embeddings: &[Vec<f32>],
     ) -> Result<()> {
-        Db::replace_file_chunks(self, file_path, file_size, content_hash, chunks, embeddings)
+        if chunks.len() != embeddings.len() {
+            return Err(eyre!(
+                "chunk/embedding count mismatch: {} chunks vs {} embeddings",
+                chunks.len(),
+                embeddings.len()
+            ));
+        }
+        for record in chunks {
+            if record.file_path != file_path {
+                return Err(eyre!(
+                    "chunk file_path mismatch: expected {}, got {}",
+                    file_path,
+                    record.file_path
+                ));
+            }
+        }
+
+        self.with_transaction(|db| {
+            db.ensure_file(file_path, file_size)?;
+            db.clear_file_chunks(file_path)?;
+            for (record, embedding) in chunks.iter().zip(embeddings.iter()) {
+                db.insert_chunk(record, embedding)?;
+            }
+            db.upsert_file(file_path, file_size, content_hash)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     fn refresh_fts_index(&self) -> Result<()> {
-        Db::refresh_fts_index(self)
+        if !self.fts_loaded {
+            warn!("fts extension not available; skipping full-text index refresh");
+            return Ok(());
+        }
+        let _ = self.conn.execute_batch("PRAGMA drop_fts_index('chunks');");
+        self.conn
+            .execute_batch("PRAGMA create_fts_index('chunks', 'id', 'text');")?;
+        Ok(())
     }
 
     fn replace_file_graph(
@@ -811,11 +676,25 @@ impl Repository for Db {
         language: &str,
         graph: GraphData,
     ) -> Result<()> {
-        Db::replace_file_graph(self, file_path, file_size, content_hash, language, graph)
+        self.with_transaction(|db| {
+            db.ensure_file(file_path, file_size)?;
+            db.clear_file_graph(file_path)?;
+            db.persist_graph(file_path, language, graph)?;
+            db.upsert_file(file_path, file_size, content_hash)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     fn list_files(&self) -> Result<Vec<String>> {
-        Db::list_files(self)
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let mut rows = stmt.query([])?;
+        let mut files = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            files.push(path);
+        }
+        Ok(files)
     }
 
     fn replace_history_edges(
@@ -823,23 +702,182 @@ impl Repository for Db {
         file_commit_edges: &[(String, String)],
         cochange_edges: &[(String, String, i64, f64)],
     ) -> Result<()> {
-        Db::replace_history_edges(self, file_commit_edges, cochange_edges)
+        self.with_transaction(|db| {
+            db.conn.execute("DELETE FROM file_commit_edges", [])?;
+            db.conn.execute("DELETE FROM file_cochange_edges", [])?;
+
+            for (file_path, commit_id) in file_commit_edges {
+                db.conn.execute(
+                    "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?)",
+                    params![file_path, commit_id],
+                )?;
+            }
+
+            for (src, dst, commit_count, weight) in cochange_edges {
+                db.conn.execute(
+                    "INSERT INTO file_cochange_edges \
+                     (src_path, dst_path, commit_count, weight) VALUES (?, ?, ?, ?)",
+                    params![src, dst, commit_count, weight],
+                )?;
+            }
+
+            Ok(())
+        })?;
+        Ok(())
     }
 
     fn vss_loaded(&self) -> bool {
-        Db::vss_loaded(self)
+        self.vss_loaded
     }
 
     fn fts_loaded(&self) -> bool {
-        Db::fts_loaded(self)
+        self.fts_loaded
     }
 
     fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>> {
-        Db::search(self, query_embedding, limit)
+        if !self.vss_loaded {
+            return Err(eyre!(
+                "vss extension not available; install/load it to enable vector search"
+            ));
+        }
+        if query_embedding.len() != self.embedding_dim {
+            return Err(eyre!(
+                "embedding dimension mismatch: expected {}, got {}",
+                self.embedding_dim,
+                query_embedding.len()
+            ));
+        }
+
+        let array_value_sql = array_value_placeholder(self.embedding_dim);
+        let sql = format!(
+            "SELECT id, file_path, start_byte, end_byte, text, \
+       array_cosine_distance(embedding, {array}::FLOAT[{dim}]) AS distance \
+       FROM chunks ORDER BY distance ASC LIMIT ?",
+            array = array_value_sql,
+            dim = self.embedding_dim
+        );
+
+        let mut params_vec = Vec::with_capacity(query_embedding.len() + 1);
+        params_vec.extend(query_embedding.iter().copied().map(Value::Float));
+        params_vec.push(Value::BigInt(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(params_vec))?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            results.push(SearchRow {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                start_byte: row.get(2)?,
+                end_byte: row.get(3)?,
+                text: row.get(4)?,
+                distance: row.get(5)?,
+            });
+        }
+        Ok(results)
     }
 
     fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsRow>> {
-        Db::search_fts(self, query, limit)
+        if !self.fts_loaded {
+            return Err(eyre!(
+                "fts extension not available; install/load it to enable full-text search"
+            ));
+        }
+
+        let sql = "SELECT id, file_path, start_byte, end_byte, text, score \
+      FROM ( \
+        SELECT id, file_path, start_byte, end_byte, text, \
+          fts_main_chunks.match_bm25(id, ?) AS score \
+        FROM chunks \
+      ) sq \
+      WHERE score IS NOT NULL \
+      ORDER BY score DESC \
+      LIMIT ?";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params![query, limit as i64])?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            results.push(FtsRow {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                start_byte: row.get(2)?,
+                end_byte: row.get(3)?,
+                text: row.get(4)?,
+                score: row.get(5)?,
+            });
+        }
+        Ok(results)
+    }
+
+    fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>> {
+        if seeds.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let array_sql = array_value_placeholder(seeds.len());
+        let sql = format!(
+            "SELECT other_path FROM ( \
+        SELECT dst_path AS other_path, weight \
+          FROM file_cochange_edges \
+         WHERE src_path IN ({array}) \
+        UNION ALL \
+        SELECT src_path AS other_path, weight \
+          FROM file_cochange_edges \
+         WHERE dst_path IN ({array}) \
+      ) sq \
+      GROUP BY other_path \
+      ORDER BY SUM(weight) DESC \
+      LIMIT ?",
+            array = array_sql
+        );
+
+        let mut params_vec = Vec::with_capacity(seeds.len() * 2 + 1);
+        params_vec.extend(seeds.iter().cloned().map(Value::Text));
+        params_vec.extend(seeds.iter().cloned().map(Value::Text));
+        params_vec.push(Value::BigInt(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(params_vec))?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            results.push(path);
+        }
+        Ok(results)
+    }
+
+    fn chunks_for_files(
+        &self,
+        file_paths: &[String],
+        limit_per_file: usize,
+    ) -> Result<Vec<SearchRow>> {
+        if file_paths.is_empty() || limit_per_file == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, start_byte, end_byte, text, 0.0 AS distance \
+       FROM chunks WHERE file_path = ? \
+       ORDER BY ordinal ASC LIMIT ?",
+        )?;
+
+        let mut results = Vec::new();
+        for file_path in file_paths {
+            let mut rows = stmt.query(params![file_path, limit_per_file as i64])?;
+            while let Some(row) = rows.next()? {
+                results.push(SearchRow {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    start_byte: row.get(2)?,
+                    end_byte: row.get(3)?,
+                    text: row.get(4)?,
+                    distance: row.get(5)?,
+                });
+            }
+        }
+
+        Ok(results)
     }
 }
 
@@ -874,6 +912,7 @@ mod tests {
             text: "hello".to_string(),
             kind: "text".to_string(),
             ordinal: 0,
+            tokens: None,
         };
         let result = db.insert_chunk(&record, &[0.1, 0.2]);
 
@@ -901,6 +940,7 @@ mod tests {
             text: "broken".to_string(),
             kind: "text".to_string(),
             ordinal: 0,
+            tokens: None,
         };
         let result = db.insert_chunk(&record, &[0.1, 0.2]);
 

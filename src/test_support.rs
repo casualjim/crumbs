@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use eyre::Result;
+use confique::Layer;
+use eyre::{Result, eyre};
+
+use crate::config;
 
 pub(crate) fn write_fixture_repo(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("src"))?;
@@ -37,4 +40,26 @@ module.exports = { add, run };\n",
     )?;
 
     Ok(())
+}
+
+pub(crate) fn load_test_embedder() -> Result<(crate::embedding::Client, usize)> {
+    let cli = config::Cli {
+        config_file: None,
+        command: config::Command::Index(config::IndexCli {
+            embedding: <config::Embedding as confique::Config>::Layer::empty(),
+            chunking: <config::Chunking as confique::Config>::Layer::empty(),
+            history: <config::History as confique::Config>::Layer::empty(),
+            project: config::ProjectCli { project: None },
+        }),
+    };
+
+    let cfg = config::load_config(&cli)?;
+    if cfg.embedding.api_key.is_none() {
+        return Err(eyre!(
+            "embedding api key missing; configure EMBEDDER_API_KEY or secrets config"
+        ));
+    }
+
+    let embedder = crate::build_embedder(&cfg.embedding)?;
+    Ok((embedder, cfg.embedding.embedding_dim))
 }

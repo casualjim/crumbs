@@ -1,113 +1,38 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use cupido::collector::config::{Collect, Config as CupidoConfig, get_collector};
-use eyre::{Result, eyre};
-use futures::StreamExt;
+use eyre::Result;
 use syntastica_queries::{
     GO_LOCALS_CRATES_IO, JAVASCRIPT_LOCALS_CRATES_IO, PYTHON_LOCALS_CRATES_IO,
     RUST_LOCALS_CRATES_IO, TYPESCRIPT_LOCALS_CRATES_IO,
 };
-use text_chunking::languages::{PeekableReader, detect, get_language};
-use text_chunking::{Chunk, Tokenizer, WalkOptions, walk_project};
 use tracing::{info, warn};
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Query, QueryCursor, StreamingIterator};
 use uuid::Uuid;
 
 use crate::db::{GraphData, ReferenceRecord, SymbolRecord};
 use crate::repository::Repository;
 
-pub struct GraphConfig {
-    pub repo_path: PathBuf,
-    pub max_chunk_size: usize,
-    pub overlap_percentage: f32,
-    pub tokenizer: Tokenizer,
-    pub max_parallel: usize,
-    pub max_file_size: Option<u64>,
-    pub large_file_threads: usize,
-    pub history_depth: u32,
-    pub history_commit_size_limit_ratio: f32,
-    pub history_multi_parents: bool,
-    pub history_issue_regex: String,
-    pub history_commit_exclude_regex: Option<String>,
-    pub history_author_exclude_regex: Option<String>,
-    pub history_path_specs: Vec<String>,
+pub struct HistoryConfig {
+    pub depth: u32,
+    pub commit_size_limit_ratio: f32,
+    pub multi_parents: bool,
+    pub issue_regex: String,
+    pub commit_exclude_regex: Option<String>,
+    pub author_exclude_regex: Option<String>,
+    pub path_specs: Vec<String>,
 }
 
-pub struct GraphIndexer {
-    db: Box<dyn Repository>,
-    config: GraphConfig,
-}
-
-impl GraphIndexer {
-    pub fn new<R: Repository + 'static>(db: R, config: GraphConfig) -> Self {
-        Self {
-            db: Box::new(db),
-            config,
-        }
-    }
-
-    pub async fn index(self) -> Result<()> {
-        let existing_hashes = self.db.load_existing_hashes()?;
-        let options = WalkOptions {
-            max_chunk_size: self.config.max_chunk_size,
-            tokenizer: self.config.tokenizer.clone(),
-            overlap_percentage: self.config.overlap_percentage,
-            max_parallel: self.config.max_parallel,
-            max_file_size: self.config.max_file_size,
-            large_file_threads: self.config.large_file_threads,
-            existing_hashes,
-            cancel_token: None,
-        };
-
-        let mut stream = walk_project(&self.config.repo_path, options);
-        while let Some(item) = stream.next().await {
-            let project_chunk = item?;
-            match project_chunk.chunk {
-                Chunk::Delete { file_path } => {
-                    self.db.delete_file(&file_path)?;
-                }
-                Chunk::EndOfFile {
-                    file_path,
-                    content,
-                    content_hash,
-                    ..
-                } => {
-                    let Some(source) = content else {
-                        return Err(eyre!("missing content for {}", file_path));
-                    };
-                    let Some(hash) = content_hash else {
-                        return Err(eyre!("missing content hash for {}", file_path));
-                    };
-
-                    if let Some(language) = detect_language(&file_path, &source).await?
-                        && let Some(graph) = extract_graph(&language, &source)?
-                    {
-                        self.db.replace_file_graph(
-                            &file_path,
-                            project_chunk.file_size,
-                            hash,
-                            &language,
-                            graph,
-                        )?;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        index_history(self.db.as_ref(), &self.config)?;
-
-        Ok(())
-    }
-}
-
-fn index_history(db: &dyn Repository, config: &GraphConfig) -> Result<()> {
-    if !repo_has_git_dir(&config.repo_path) {
+pub(crate) fn index_history(
+    db: &dyn Repository,
+    repo_path: &Path,
+    config: &HistoryConfig,
+) -> Result<()> {
+    if !repo_path.join(".git").exists() {
         warn!(
             "history indexing skipped; no git repository at {}",
-            config.repo_path.display()
+            repo_path.display()
         );
         return Ok(());
     }
@@ -119,23 +44,23 @@ fn index_history(db: &dyn Repository, config: &GraphConfig) -> Result<()> {
     let known_set: HashSet<String> = known_files.into_iter().collect();
 
     let mut conf = CupidoConfig::default();
-    conf.repo_path = config.repo_path.to_string_lossy().to_string();
-    conf.depth = config.history_depth;
-    conf.multi_parents = config.history_multi_parents;
-    conf.issue_regex = config.history_issue_regex.clone();
-    conf.commit_exclude_regex = config.history_commit_exclude_regex.clone();
-    conf.author_exclude_regex = config.history_author_exclude_regex.clone();
-    conf.path_specs = config.history_path_specs.clone();
+    conf.repo_path = repo_path.to_string_lossy().to_string();
+    conf.depth = config.depth;
+    conf.multi_parents = config.multi_parents;
+    conf.issue_regex = config.issue_regex.clone();
+    conf.commit_exclude_regex = config.commit_exclude_regex.clone();
+    conf.author_exclude_regex = config.author_exclude_regex.clone();
+    conf.path_specs = config.path_specs.clone();
     conf.progress = false;
 
     let collector = get_collector();
     let graph = collector.walk(conf);
 
     let file_count = known_set.len().max(1) as f32;
-    let max_files_per_commit = if config.history_commit_size_limit_ratio >= 1.0 {
+    let max_files_per_commit = if config.commit_size_limit_ratio >= 1.0 {
         usize::MAX
     } else {
-        (file_count * config.history_commit_size_limit_ratio).ceil() as usize
+        (file_count * config.commit_size_limit_ratio).ceil() as usize
     }
     .max(1);
 
@@ -205,35 +130,28 @@ fn index_history(db: &dyn Repository, config: &GraphConfig) -> Result<()> {
     Ok(())
 }
 
-fn repo_has_git_dir(path: &Path) -> bool {
-    path.join(".git").exists()
-}
-
-fn extract_graph(language: &str, source: &str) -> Result<Option<GraphData>> {
-    let query_source = match language {
-        "rust" => RUST_LOCALS_CRATES_IO,
-        "python" => PYTHON_LOCALS_CRATES_IO,
-        "go" => GO_LOCALS_CRATES_IO,
-        "javascript" => JAVASCRIPT_LOCALS_CRATES_IO,
-        "typescript" => TYPESCRIPT_LOCALS_CRATES_IO,
-        _ => return Ok(None),
+pub(crate) fn extract_graph_from_tree(
+    language: &str,
+    ts_language: tree_sitter::Language,
+    tree: &tree_sitter::Tree,
+    source: &str,
+) -> Result<Option<GraphData>> {
+    let Some(query_source) = graph_query_for_language(language) else {
+        return Ok(None);
     };
 
+    extract_graph_from_tree_inner(ts_language, tree, source, query_source)
+}
+
+fn extract_graph_from_tree_inner(
+    ts_language: tree_sitter::Language,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    query_source: &'static str,
+) -> Result<Option<GraphData>> {
     if query_source.trim().is_empty() {
         return Ok(None);
     }
-
-    let language_fn = match get_language(language) {
-        Some(lang) => lang,
-        None => return Ok(None),
-    };
-    let ts_language: tree_sitter::Language = language_fn.into();
-
-    let mut parser = Parser::new();
-    parser.set_language(&ts_language)?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| eyre!("failed to parse source for {}", language))?;
 
     let query = Query::new(&ts_language, query_source)?;
     let capture_names = query.capture_names();
@@ -301,44 +219,37 @@ fn extract_graph(language: &str, source: &str) -> Result<Option<GraphData>> {
     }))
 }
 
-async fn detect_language(file_path: &str, source: &str) -> Result<Option<String>> {
-    let cursor = Cursor::new(source.as_bytes().to_vec());
-    let peekable = PeekableReader::new(cursor, 51200);
-    let (detection, _reader) = detect(std::path::Path::new(file_path), peekable)
-        .await
-        .map_err(|(err, _reader)| err)?;
-
-    let Some(detection) = detection else {
-        return Ok(None);
-    };
-
-    let raw = detection.language().to_ascii_lowercase();
-    let normalized = match raw.as_str() {
-        "typescriptreact" | "tsx" => "typescript".to_string(),
-        "javascriptreact" | "jsx" => "javascript".to_string(),
-        other => other.to_string(),
-    };
-    Ok(Some(normalized))
+fn graph_query_for_language(language: &str) -> Option<&'static str> {
+    match language {
+        "rust" => Some(RUST_LOCALS_CRATES_IO),
+        "python" => Some(PYTHON_LOCALS_CRATES_IO),
+        "go" => Some(GO_LOCALS_CRATES_IO),
+        "javascript" => Some(JAVASCRIPT_LOCALS_CRATES_IO),
+        "typescript" => Some(TYPESCRIPT_LOCALS_CRATES_IO),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::HistoryConfig;
     use tempfile::TempDir;
     use text_chunking::Tokenizer;
 
     use crate::db::Db;
-    use crate::test_support::write_fixture_repo;
+    use crate::indexer::{Indexer, IndexerConfig};
+    use crate::test_support::{load_test_embedder, write_fixture_repo};
 
     #[tokio::test]
-    async fn graph_build_populates_symbols_and_references() -> Result<()> {
+    async fn graph_build_populates_symbols_and_references() -> eyre::Result<()> {
+        let (embedder, embedding_dim) = load_test_embedder()?;
         let dir = TempDir::new()?;
         write_fixture_repo(dir.path())?;
 
         let db_path = dir.path().join("context.duckdb");
-        let db = Db::open(&db_path, Some(2))?;
+        let db = Db::open(&db_path, Some(embedding_dim))?;
 
-        let config = GraphConfig {
+        let config = IndexerConfig {
             repo_path: dir.path().to_path_buf(),
             max_chunk_size: 1500,
             overlap_percentage: 0.2,
@@ -346,15 +257,17 @@ mod tests {
             max_parallel: 4,
             max_file_size: Some(5 * 1024 * 1024),
             large_file_threads: 2,
-            history_depth: 10240,
-            history_commit_size_limit_ratio: 1.0,
-            history_multi_parents: false,
-            history_issue_regex: "(#\\d+)".to_string(),
-            history_commit_exclude_regex: None,
-            history_author_exclude_regex: None,
-            history_path_specs: Vec::new(),
+            history: HistoryConfig {
+                depth: 10240,
+                commit_size_limit_ratio: 1.0,
+                multi_parents: false,
+                issue_regex: "(#\\d+)".to_string(),
+                commit_exclude_regex: None,
+                author_exclude_regex: None,
+                path_specs: Vec::new(),
+            },
         };
-        let indexer = GraphIndexer::new(db, config);
+        let indexer = Indexer::new(&db, embedder, config);
         indexer.index().await?;
 
         let conn = duckdb::Connection::open(&db_path)?;
