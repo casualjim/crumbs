@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use text_chunking::Tokenizer as ChunkTokenizer;
 use tokio::sync::Mutex;
-use tracing::{debug, error};
 use tracing::warn;
+use tracing::{debug, error};
 
 use tiktoken_rs::{CoreBPE, cl100k_base, o200k_base, p50k_base, p50k_edit, r50k_base};
 use tokenizers::Tokenizer as HfTokenizer;
@@ -193,8 +193,7 @@ impl Client {
             None
         } else {
             let token_rate = config.tokens_per_minute as f64 / 60.0;
-            let token_capacity =
-                (token_rate * 10.0).min(config.tokens_per_minute as f64);
+            let token_capacity = (token_rate * 10.0).min(config.tokens_per_minute as f64);
             Some(Arc::new(Mutex::new(RateLimiter {
                 token_bucket: TokenBucket::new(token_capacity, token_rate),
                 max_tokens_per_minute: config.tokens_per_minute,
@@ -272,10 +271,12 @@ impl Client {
             let token_count = if let Some(count) = inp.token_count {
                 count
             } else {
-                self.token_counter.count_tokens(trimmed).unwrap_or_else(|err| {
-                    warn!("token count failed, falling back to char estimate: {err}");
-                    trimmed.chars().count()
-                })
+                self.token_counter
+                    .count_tokens(trimmed)
+                    .unwrap_or_else(|err| {
+                        warn!("token count failed, falling back to char estimate: {err}");
+                        trimmed.chars().count()
+                    })
             };
             if token_count > self.context_length {
                 return Err(eyre::eyre!(
