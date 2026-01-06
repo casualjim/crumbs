@@ -18,7 +18,7 @@ secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syntastica-queries = "0.6.1"
-text-chunking = { version = "0.1.5", registry = "forgejo" }
+text-chunking = { version = "0.1.6", registry = "forgejo" }
 tiktoken-rs = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"

@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::Cursor;
 use std::path::Path;
 
-use eyre::{Result, WrapErr};
-use text_chunking::languages::{self, PeekableReader, detect};
+use eyre::Result;
+use text_chunking::languages;
 
 use crate::assembly::pipeline::{CandidateSource, ContextBlock};
 use crate::repository::Repository;
@@ -28,63 +27,24 @@ pub struct EnrichedBlock {
 }
 
 pub struct PromptPayload {
-    pub repo_name: String,
+    pub overview: RepositoryOverview,
     pub task: String,
     pub blocks: Vec<EnrichedBlock>,
 }
 
-struct FileContext {
-    bytes: Vec<u8>,
-    line_index: LineIndex,
-    language: Option<String>,
+#[derive(Clone)]
+pub struct RepositoryOverview {
+    pub name: String,
+    pub structure: Vec<String>,
+    pub tech_stack: Vec<String>,
 }
 
-struct LineIndex {
-    line_starts: Vec<usize>,
-}
-
-impl LineIndex {
-    fn new(bytes: &[u8]) -> Self {
-        let mut line_starts = Vec::with_capacity(bytes.len() / 24 + 1);
-        line_starts.push(0);
-        for (idx, byte) in bytes.iter().enumerate() {
-            if *byte == b'\n' {
-                line_starts.push(idx + 1);
-            }
-        }
-        Self { line_starts }
+fn line_from_i64(value: i64) -> usize {
+    if value <= 0 {
+        1
+    } else {
+        value as usize
     }
-
-    fn line_for_byte(&self, byte: usize) -> usize {
-        if self.line_starts.is_empty() {
-            return 1;
-        }
-        match self.line_starts.binary_search(&byte) {
-            Ok(index) => index + 1,
-            Err(index) => index.max(1),
-        }
-    }
-}
-
-fn clamp_byte(byte: i64, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    let clamped = if byte < 0 { 0 } else { byte as usize };
-    clamped.min(len - 1)
-}
-
-async fn detect_language(path: &Path, bytes: &[u8]) -> Option<String> {
-    let cursor = Cursor::new(bytes.to_vec());
-    let peekable = PeekableReader::new(cursor, 51200);
-    let (detection, _) = detect(path, peekable).await.ok()?;
-    detection.map(|detection| detection.language().to_string())
-}
-
-fn fallback_language(path: &Path) -> Option<String> {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
 }
 
 fn normalized_fence_language(language: &str) -> String {
@@ -103,55 +63,31 @@ fn normalized_fence_language(language: &str) -> String {
     }
 }
 
-async fn load_file_context(repo_root: &Path, file_path: &str) -> Result<FileContext> {
-    let full_path = repo_root.join(file_path);
-    let bytes = tokio::fs::read(&full_path)
-        .await
-        .wrap_err_with(|| format!("failed to read {}", full_path.display()))?;
-    let line_index = LineIndex::new(&bytes);
-    let language = detect_language(&full_path, &bytes)
-        .await
-        .or_else(|| fallback_language(&full_path));
-    Ok(FileContext {
-        bytes,
-        line_index,
-        language,
-    })
-}
-
 pub async fn enrich_blocks(
-    repo_root: &Path,
+    _repo_root: &Path,
     db: &dyn Repository,
     blocks: &[ContextBlock],
 ) -> Result<Vec<EnrichedBlock>> {
-    let mut contexts: BTreeMap<String, FileContext> = BTreeMap::new();
+    let mut language_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut enriched = Vec::with_capacity(blocks.len());
 
     for block in blocks {
-        let ctx = if let Some(ctx) = contexts.get(&block.file_path) {
-            ctx
-        } else {
-            let loaded = load_file_context(repo_root, &block.file_path).await?;
-            contexts.insert(block.file_path.clone(), loaded);
-            contexts.get(&block.file_path).expect("inserted context")
-        };
-
-        let start_byte = clamp_byte(block.start_byte, ctx.bytes.len());
-        let end_byte = if block.end_byte > 0 {
-            clamp_byte(block.end_byte - 1, ctx.bytes.len())
-        } else {
-            start_byte
-        };
-
-        let start_line = ctx.line_index.line_for_byte(start_byte);
-        let end_line = ctx.line_index.line_for_byte(end_byte);
+        let start_line = line_from_i64(block.start_line);
+        let end_line = line_from_i64(block.end_line);
 
         let mut symbol_names = BTreeSet::new();
         for symbol in db.symbols_in_range(&block.file_path, block.start_byte, block.end_byte)? {
             symbol_names.insert(symbol.name);
         }
 
-        let language = ctx.language.clone().unwrap_or_else(|| "text".to_string());
+        let language = if let Some(cached) = language_cache.get(&block.file_path) {
+            cached.clone()
+        } else {
+            let detected = db.file_primary_language(&block.file_path)?;
+            language_cache.insert(block.file_path.clone(), detected.clone());
+            detected
+        }
+        .unwrap_or_else(|| "text".to_string());
 
         enriched.push(EnrichedBlock {
             file_path: block.file_path.clone(),
@@ -179,7 +115,23 @@ fn render_xml(payload: &PromptPayload) -> String {
     let mut out = String::new();
     writeln!(out, "<context>").ok();
     writeln!(out, "  <repository_overview>").ok();
-    writeln!(out, "    <name>{}</name>", payload.repo_name).ok();
+    writeln!(out, "    <name>{}</name>", payload.overview.name).ok();
+    if !payload.overview.structure.is_empty() {
+        write_cdata(
+            &mut out,
+            "    <structure><![CDATA[",
+            &payload.overview.structure.join("\n"),
+            "]]></structure>",
+        );
+    }
+    if !payload.overview.tech_stack.is_empty() {
+        writeln!(
+            out,
+            "    <tech_stack>{}</tech_stack>",
+            xml_escape(&payload.overview.tech_stack.join(", "))
+        )
+        .ok();
+    }
     writeln!(out, "  </repository_overview>").ok();
     writeln!(out, "  <code_context>").ok();
 
@@ -244,7 +196,22 @@ fn write_xml_group(out: &mut String, label: &str, blocks: &[EnrichedBlock]) {
 
 fn render_markdown(payload: &PromptPayload) -> String {
     let mut out = String::new();
-    writeln!(out, "## Repository: {}", payload.repo_name).ok();
+    writeln!(out, "## Repository: {}", payload.overview.name).ok();
+    if !payload.overview.tech_stack.is_empty() {
+        writeln!(
+            out,
+            "Tech stack: {}",
+            payload.overview.tech_stack.join(", ")
+        )
+        .ok();
+    }
+    if !payload.overview.structure.is_empty() {
+        writeln!(out, "\n### Structure\n```").ok();
+        for line in &payload.overview.structure {
+            writeln!(out, "{line}").ok();
+        }
+        writeln!(out, "```").ok();
+    }
     writeln!(
         out,
         "\n## Retrieved Context ({} blocks)",
@@ -324,18 +291,118 @@ fn write_cdata(out: &mut String, prefix: &str, text: &str, suffix: &str) {
     out.push('\n');
 }
 
+pub fn build_repository_overview(repo_root: &Path) -> RepositoryOverview {
+    let name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo")
+        .to_string();
+    let structure = build_structure(repo_root, 2, 200);
+    let tech_stack = detect_tech_stack(repo_root);
+    RepositoryOverview {
+        name,
+        structure,
+        tech_stack,
+    }
+}
+
+fn build_structure(root: &Path, max_depth: usize, max_entries: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut count = 0usize;
+    build_structure_inner(root, 0, max_depth, max_entries, &mut count, &mut lines);
+    lines
+}
+
+fn build_structure_inner(
+    current: &Path,
+    depth: usize,
+    max_depth: usize,
+    max_entries: usize,
+    count: &mut usize,
+    lines: &mut Vec<String>,
+) {
+    if depth > max_depth || *count >= max_entries {
+        return;
+    }
+
+    let mut entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        if *count >= max_entries {
+            break;
+        }
+        let path = entry.path();
+        let name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        if should_skip_name(name) {
+            continue;
+        }
+        let indent = "  ".repeat(depth);
+        if path.is_dir() {
+            lines.push(format!("{indent}{name}/"));
+            *count += 1;
+            build_structure_inner(&path, depth + 1, max_depth, max_entries, count, lines);
+        } else if depth == 0 {
+            lines.push(format!("{indent}{name}"));
+            *count += 1;
+        }
+    }
+}
+
+fn should_skip_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with('.') {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "target"
+            | "node_modules"
+            | ".config"
+            | ".idea"
+            | ".vscode"
+            | "dist"
+            | "build"
+            | ".venv"
+            | "venv"
+    )
+}
+
+fn detect_tech_stack(root: &Path) -> Vec<String> {
+    let mut stack = Vec::new();
+    push_unique(&mut stack, "Rust", root.join("Cargo.toml").exists());
+    push_unique(&mut stack, "Node.js", root.join("package.json").exists());
+    push_unique(
+        &mut stack,
+        "Python",
+        root.join("pyproject.toml").exists() || root.join("requirements.txt").exists(),
+    );
+    push_unique(&mut stack, "Go", root.join("go.mod").exists());
+    push_unique(&mut stack, "Ruby", root.join("Gemfile").exists());
+    push_unique(
+        &mut stack,
+        "Java",
+        root.join("pom.xml").exists() || root.join("build.gradle").exists(),
+    );
+    push_unique(&mut stack, "PHP", root.join("composer.json").exists());
+    stack
+}
+
+fn push_unique(stack: &mut Vec<String>, label: &str, present: bool) {
+    if present && !stack.iter().any(|item| item == label) {
+        stack.push(label.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn line_index_maps_bytes_to_lines() {
-        let bytes = b"first\nsecond\nthird";
-        let index = LineIndex::new(bytes);
-        assert_eq!(index.line_for_byte(0), 1);
-        assert_eq!(index.line_for_byte(6), 2);
-        assert_eq!(index.line_for_byte(bytes.len() - 1), 3);
-    }
 
     #[test]
     fn xml_escape_rewrites_special_chars() {

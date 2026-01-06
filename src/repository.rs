@@ -13,6 +13,7 @@ pub trait Repository {
         file_path: &str,
         file_size: u64,
         content_hash: [u8; 32],
+        primary_language: Option<String>,
         chunks: &[ChunkRecord],
         embeddings: &[Vec<f32>],
     ) -> Result<()>;
@@ -23,9 +24,11 @@ pub trait Repository {
         file_size: u64,
         content_hash: [u8; 32],
         language: &str,
+        primary_language: Option<String>,
         graph: GraphData,
     ) -> Result<()>;
     fn list_files(&self) -> Result<Vec<String>>;
+    fn file_primary_language(&self, file_path: &str) -> Result<Option<String>>;
     fn replace_history_edges(
         &self,
         file_commit_edges: &[(String, String)],

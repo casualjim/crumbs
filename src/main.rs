@@ -165,14 +165,9 @@ async fn main() -> Result<()> {
                 &assembled.blocks,
             )
             .await?;
-            let repo_name = project
-                .repo_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("repo")
-                .to_string();
+            let overview = assembly::output::build_repository_overview(&project.repo_path);
             let payload = assembly::output::PromptPayload {
-                repo_name,
+                overview,
                 task: cmd.task.clone(),
                 blocks: enriched,
             };

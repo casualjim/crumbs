@@ -46,6 +46,9 @@ pub struct CandidateChunk {
     pub file_path: String,
     pub start_byte: i64,
     pub end_byte: i64,
+    pub chunk_hash: [u8; 32],
+    pub start_line: i64,
+    pub end_line: i64,
     pub text: String,
     pub score: f64,
     pub source: CandidateSource,
@@ -60,9 +63,13 @@ pub enum CandidateSource {
 /// A context block carried forward for assembly.
 #[derive(Clone)]
 pub struct ContextBlock {
+    pub id: String,
     pub file_path: String,
     pub start_byte: i64,
     pub end_byte: i64,
+    pub chunk_hash: [u8; 32],
+    pub start_line: i64,
+    pub end_line: i64,
     pub text: String,
     pub score: f64,
     pub source: CandidateSource,
@@ -189,13 +196,13 @@ impl RetrieveCandidates for DefaultRetrieve {
         let chunks = results
             .into_iter()
             .map(|result| CandidateChunk {
-                id: format!(
-                    "{}:{}-{}",
-                    result.file_path, result.start_byte, result.end_byte
-                ),
+                id: result.id,
                 file_path: result.file_path,
                 start_byte: result.start_byte,
                 end_byte: result.end_byte,
+                chunk_hash: result.chunk_hash,
+                start_line: result.start_line,
+                end_line: result.end_line,
                 text: result.text,
                 score: result.score,
                 source: CandidateSource::Primary,
@@ -258,9 +265,13 @@ impl RefineAst for DefaultRefineAst {
             .chunks
             .iter()
             .map(|chunk| ContextBlock {
+                id: chunk.id.clone(),
                 file_path: chunk.file_path.clone(),
                 start_byte: chunk.start_byte,
                 end_byte: chunk.end_byte,
+                chunk_hash: chunk.chunk_hash,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
                 text: chunk.text.clone(),
                 score: chunk.score,
                 source: chunk.source,
@@ -273,9 +284,13 @@ impl RefineAst for DefaultRefineAst {
                 .chunks_for_files(&expanded.expanded_files, self.per_file_limit)?;
             for row in extra {
                 blocks.push(ContextBlock {
+                    id: row.id,
                     file_path: row.file_path,
                     start_byte: row.start_byte,
                     end_byte: row.end_byte,
+                    chunk_hash: row.chunk_hash,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
                     text: row.text,
                     score: 0.0,
                     source: CandidateSource::Expanded,
@@ -329,8 +344,7 @@ impl BudgetAndMerge for DefaultBudgetAndMerge {
         let mut tokens = 0usize;
 
         for block in &ordered {
-            let key = (block.file_path.clone(), block.start_byte, block.end_byte);
-            if !seen.insert(key) {
+            if !seen.insert(block.id.clone()) {
                 continue;
             }
             if let Some(counter) = token_counter.as_ref() {

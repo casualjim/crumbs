@@ -87,6 +87,7 @@ impl Db {
           path TEXT PRIMARY KEY,
           content_hash BLOB,
           size BIGINT,
+          primary_language TEXT,
           updated_at TIMESTAMP DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS file_commit_edges (
@@ -106,6 +107,9 @@ impl Db {
           file_path TEXT NOT NULL REFERENCES files(path),
           start_byte BIGINT NOT NULL,
           end_byte BIGINT NOT NULL,
+          chunk_hash BLOB NOT NULL,
+          start_line INTEGER NOT NULL,
+          end_line INTEGER NOT NULL,
           text TEXT NOT NULL,
           kind TEXT NOT NULL,
           ordinal INTEGER NOT NULL,
@@ -279,27 +283,45 @@ impl Db {
         Ok(())
     }
 
-    fn upsert_file(&self, file_path: &str, file_size: u64, content_hash: [u8; 32]) -> Result<()> {
+    fn upsert_file(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        content_hash: [u8; 32],
+        primary_language: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO files (path, content_hash, size, updated_at)
-       VALUES (?, ?, ?, now())
+            "INSERT INTO files (path, content_hash, size, primary_language, updated_at)
+       VALUES (?, ?, ?, ?, now())
        ON CONFLICT(path) DO UPDATE SET
          content_hash = excluded.content_hash,
          size = excluded.size,
+         primary_language = excluded.primary_language,
          updated_at = now()",
-            params![file_path, content_hash.to_vec(), file_size as i64],
+            params![
+                file_path,
+                content_hash.to_vec(),
+                file_size as i64,
+                primary_language
+            ],
         )?;
         Ok(())
     }
 
-    fn ensure_file(&self, file_path: &str, file_size: u64) -> Result<()> {
+    fn ensure_file(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        primary_language: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO files (path, size, updated_at)
-       VALUES (?, ?, now())
+            "INSERT INTO files (path, size, primary_language, updated_at)
+       VALUES (?, ?, ?, now())
        ON CONFLICT(path) DO UPDATE SET
          size = excluded.size,
+         primary_language = excluded.primary_language,
          updated_at = now()",
-            params![file_path, file_size as i64],
+            params![file_path, file_size as i64, primary_language],
         )?;
         Ok(())
     }
@@ -324,17 +346,20 @@ impl Db {
         let array_value_sql = array_value_placeholder(self.embedding_dim);
         let sql = format!(
             "INSERT INTO chunks \
-      (id, file_path, start_byte, end_byte, text, kind, ordinal, tokens, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, {array}::FLOAT[{dim}])",
+      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {array}::FLOAT[{dim}])",
             array = array_value_sql,
             dim = self.embedding_dim
         );
 
-        let mut params_vec = Vec::with_capacity(8 + embedding.len());
+        let mut params_vec = Vec::with_capacity(11 + embedding.len());
         params_vec.push(Value::Text(record.id.clone()));
         params_vec.push(Value::Text(record.file_path.clone()));
         params_vec.push(Value::BigInt(record.start_byte as i64));
         params_vec.push(Value::BigInt(record.end_byte as i64));
+        params_vec.push(Value::Blob(record.chunk_hash.to_vec()));
+        params_vec.push(Value::BigInt(record.start_line as i64));
+        params_vec.push(Value::BigInt(record.end_line as i64));
         params_vec.push(Value::Text(record.text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Int(record.ordinal as i32));
@@ -519,6 +544,9 @@ pub struct ChunkRecord {
     pub file_path: String,
     pub start_byte: usize,
     pub end_byte: usize,
+    pub chunk_hash: [u8; 32],
+    pub start_line: usize,
+    pub end_line: usize,
     pub text: String,
     pub kind: String,
     pub ordinal: usize,
@@ -555,6 +583,9 @@ pub struct SearchRow {
     pub file_path: String,
     pub start_byte: i64,
     pub end_byte: i64,
+    pub chunk_hash: [u8; 32],
+    pub start_line: i64,
+    pub end_line: i64,
     pub text: String,
     pub distance: f64,
 }
@@ -564,6 +595,9 @@ pub struct FtsRow {
     pub file_path: String,
     pub start_byte: i64,
     pub end_byte: i64,
+    pub chunk_hash: [u8; 32],
+    pub start_line: i64,
+    pub end_line: i64,
     pub text: String,
     pub score: f64,
 }
@@ -625,6 +659,7 @@ impl Repository for Db {
         file_path: &str,
         file_size: u64,
         content_hash: [u8; 32],
+        primary_language: Option<String>,
         chunks: &[ChunkRecord],
         embeddings: &[Vec<f32>],
     ) -> Result<()> {
@@ -645,13 +680,14 @@ impl Repository for Db {
             }
         }
 
+        let primary_language = primary_language.as_deref();
         self.with_transaction(|db| {
-            db.ensure_file(file_path, file_size)?;
+            db.ensure_file(file_path, file_size, primary_language)?;
             db.clear_file_chunks(file_path)?;
             for (record, embedding) in chunks.iter().zip(embeddings.iter()) {
                 db.insert_chunk(record, embedding)?;
             }
-            db.upsert_file(file_path, file_size, content_hash)?;
+            db.upsert_file(file_path, file_size, content_hash, primary_language)?;
             Ok(())
         })?;
         Ok(())
@@ -674,13 +710,15 @@ impl Repository for Db {
         file_size: u64,
         content_hash: [u8; 32],
         language: &str,
+        primary_language: Option<String>,
         graph: GraphData,
     ) -> Result<()> {
+        let primary_language = primary_language.as_deref();
         self.with_transaction(|db| {
-            db.ensure_file(file_path, file_size)?;
+            db.ensure_file(file_path, file_size, primary_language)?;
             db.clear_file_graph(file_path)?;
             db.persist_graph(file_path, language, graph)?;
-            db.upsert_file(file_path, file_size, content_hash)?;
+            db.upsert_file(file_path, file_size, content_hash, primary_language)?;
             Ok(())
         })?;
         Ok(())
@@ -695,6 +733,19 @@ impl Repository for Db {
             files.push(path);
         }
         Ok(files)
+    }
+
+    fn file_primary_language(&self, file_path: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT primary_language FROM files WHERE path = ?")?;
+        let mut rows = stmt.query(params![file_path])?;
+        if let Some(row) = rows.next()? {
+            let lang: Option<String> = row.get(0)?;
+            Ok(lang)
+        } else {
+            Ok(None)
+        }
     }
 
     fn replace_history_edges(
@@ -750,7 +801,7 @@ impl Repository for Db {
 
         let array_value_sql = array_value_placeholder(self.embedding_dim);
         let sql = format!(
-            "SELECT id, file_path, start_byte, end_byte, text, \
+            "SELECT id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, \
        array_cosine_distance(embedding, {array}::FLOAT[{dim}]) AS distance \
        FROM chunks ORDER BY distance ASC LIMIT ?",
             array = array_value_sql,
@@ -765,13 +816,25 @@ impl Repository for Db {
         let mut rows = stmt.query(params_from_iter(params_vec))?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
+            let chunk_hash: Vec<u8> = row.get(4)?;
+            if chunk_hash.len() != 32 {
+                return Err(eyre!(
+                    "invalid chunk_hash length for {}",
+                    row.get::<_, String>(1)?
+                ));
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&chunk_hash);
             results.push(SearchRow {
                 id: row.get(0)?,
                 file_path: row.get(1)?,
                 start_byte: row.get(2)?,
                 end_byte: row.get(3)?,
-                text: row.get(4)?,
-                distance: row.get(5)?,
+                chunk_hash: hash,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                text: row.get(7)?,
+                distance: row.get(8)?,
             });
         }
         Ok(results)
@@ -784,9 +847,9 @@ impl Repository for Db {
             ));
         }
 
-        let sql = "SELECT id, file_path, start_byte, end_byte, text, score \
+        let sql = "SELECT id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, score \
       FROM ( \
-        SELECT id, file_path, start_byte, end_byte, text, \
+        SELECT id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, \
           fts_main_chunks.match_bm25(id, ?) AS score \
         FROM chunks \
       ) sq \
@@ -798,13 +861,25 @@ impl Repository for Db {
         let mut rows = stmt.query(params![query, limit as i64])?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
+            let chunk_hash: Vec<u8> = row.get(4)?;
+            if chunk_hash.len() != 32 {
+                return Err(eyre!(
+                    "invalid chunk_hash length for {}",
+                    row.get::<_, String>(1)?
+                ));
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&chunk_hash);
             results.push(FtsRow {
                 id: row.get(0)?,
                 file_path: row.get(1)?,
                 start_byte: row.get(2)?,
                 end_byte: row.get(3)?,
-                text: row.get(4)?,
-                score: row.get(5)?,
+                chunk_hash: hash,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                text: row.get(7)?,
+                score: row.get(8)?,
             });
         }
         Ok(results)
@@ -857,7 +932,7 @@ impl Repository for Db {
         }
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, start_byte, end_byte, text, 0.0 AS distance \
+            "SELECT id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, 0.0 AS distance \
        FROM chunks WHERE file_path = ? \
        ORDER BY ordinal ASC LIMIT ?",
         )?;
@@ -866,13 +941,25 @@ impl Repository for Db {
         for file_path in file_paths {
             let mut rows = stmt.query(params![file_path, limit_per_file as i64])?;
             while let Some(row) = rows.next()? {
+                let chunk_hash: Vec<u8> = row.get(4)?;
+                if chunk_hash.len() != 32 {
+                    return Err(eyre!(
+                        "invalid chunk_hash length for {}",
+                        row.get::<_, String>(1)?
+                    ));
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&chunk_hash);
                 results.push(SearchRow {
                     id: row.get(0)?,
                     file_path: row.get(1)?,
                     start_byte: row.get(2)?,
                     end_byte: row.get(3)?,
-                    text: row.get(4)?,
-                    distance: row.get(5)?,
+                    chunk_hash: hash,
+                    start_line: row.get(5)?,
+                    end_line: row.get(6)?,
+                    text: row.get(7)?,
+                    distance: row.get(8)?,
                 });
             }
         }
@@ -939,6 +1026,9 @@ mod tests {
             file_path: "missing.rs".to_string(),
             start_byte: 0,
             end_byte: 5,
+            chunk_hash: [0u8; 32],
+            start_line: 1,
+            end_line: 1,
             text: "hello".to_string(),
             kind: "text".to_string(),
             ordinal: 0,
@@ -960,13 +1050,16 @@ mod tests {
         let db = Db::open(&db_path, Some(2))?;
         let hash = [0u8; 32];
 
-        db.upsert_file("existing.rs", 12, hash)?;
+        db.upsert_file("existing.rs", 12, hash, None)?;
 
         let record = ChunkRecord {
             id: "chunk-2".to_string(),
             file_path: "existing.rs".to_string(),
             start_byte: 10,
             end_byte: 5,
+            chunk_hash: [0u8; 32],
+            start_line: 1,
+            end_line: 1,
             text: "broken".to_string(),
             kind: "text".to_string(),
             ordinal: 0,
@@ -1050,8 +1143,8 @@ mod tests {
         let db = Db::open(&db_path, Some(2))?;
         let hash = [0u8; 32];
 
-        db.upsert_file("a.rs", 12, hash)?;
-        db.upsert_file("b.rs", 12, hash)?;
+        db.upsert_file("a.rs", 12, hash, None)?;
+        db.upsert_file("b.rs", 12, hash, None)?;
 
         let symbol = SymbolRecord {
             id: "sym-1".to_string(),

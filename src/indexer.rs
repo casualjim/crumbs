@@ -147,6 +147,9 @@ impl<'a> Indexer<'a> {
                         file_path,
                         start_byte: chunk.start_byte,
                         end_byte: chunk.end_byte,
+                        chunk_hash: chunk.chunk_hash,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
                         text: chunk.text,
                         kind: "semantic".to_string(),
                         ordinal,
@@ -172,6 +175,9 @@ impl<'a> Indexer<'a> {
                         file_path,
                         start_byte: chunk.start_byte,
                         end_byte: chunk.end_byte,
+                        chunk_hash: chunk.chunk_hash,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
                         text: chunk.text,
                         kind: "text".to_string(),
                         ordinal,
@@ -184,11 +190,16 @@ impl<'a> Indexer<'a> {
                 Chunk::EndOfFile {
                     file_path,
                     content_hash,
+                    file_metadata,
                     ..
                 } => {
                     let Some(hash) = content_hash else {
                         return Err(eyre!("missing content hash for {}", file_path));
                     };
+                    let primary_language = file_metadata
+                        .and_then(|metadata| metadata.primary_language)
+                        .map(|lang| lang.trim().to_string())
+                        .filter(|lang| !lang.is_empty());
 
                     let entry = pending
                         .remove(&file_path)
@@ -205,6 +216,7 @@ impl<'a> Indexer<'a> {
                             entry.file_size,
                             hash,
                             &observed.language,
+                            primary_language.clone(),
                             observed.graph,
                         )?;
                     }
@@ -213,6 +225,7 @@ impl<'a> Indexer<'a> {
                         &file_path,
                         entry.file_size,
                         hash,
+                        primary_language.clone(),
                         &entry.chunks,
                         &entry.embeddings,
                     )?;

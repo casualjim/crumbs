@@ -12,9 +12,13 @@ use crate::repository::Repository;
 
 #[derive(Clone)]
 pub struct SearchResult {
+    pub id: String,
     pub file_path: String,
     pub start_byte: i64,
     pub end_byte: i64,
+    pub chunk_hash: [u8; 32],
+    pub start_line: i64,
+    pub end_line: i64,
     pub text: String,
     pub score: f64,
     pub vector_score: Option<f64>,
@@ -111,7 +115,7 @@ pub async fn search(
             if !config.matches_path(&result.file_path) {
                 continue;
             }
-            let id = format!("{}:{}-{}", result.file_path, result.start_byte, result.end_byte);
+            let id = result.id.clone();
             match combined.get_mut(&id) {
                 Some(existing) => {
                     if result.score > existing.score {
@@ -198,9 +202,13 @@ async fn search_single(
 }
 
 struct PartialResult {
+    id: String,
     file_path: String,
     start_byte: i64,
     end_byte: i64,
+    chunk_hash: [u8; 32],
+    start_line: i64,
+    end_line: i64,
     text: String,
     vector_score: Option<f64>,
     fts_score: Option<f64>,
@@ -220,9 +228,13 @@ fn merge_results(
             by_id
                 .entry(row.id.clone())
                 .or_insert_with(|| PartialResult {
+                    id: row.id,
                     file_path: row.file_path,
                     start_byte: row.start_byte,
                     end_byte: row.end_byte,
+                    chunk_hash: row.chunk_hash,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
                     text: row.text,
                     vector_score: Some(score),
                     fts_score: None,
@@ -242,9 +254,13 @@ fn merge_results(
             by_id
                 .entry(row.id.clone())
                 .or_insert_with(|| PartialResult {
+                    id: row.id,
                     file_path: row.file_path,
                     start_byte: row.start_byte,
                     end_byte: row.end_byte,
+                    chunk_hash: row.chunk_hash,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
                     text: row.text,
                     vector_score: None,
                     fts_score: Some(normalized),
@@ -263,9 +279,13 @@ fn merge_results(
             (None, None) => 0.0,
         };
         combined.push(SearchResult {
+            id: entry.id,
             file_path: entry.file_path,
             start_byte: entry.start_byte,
             end_byte: entry.end_byte,
+            chunk_hash: entry.chunk_hash,
+            start_line: entry.start_line,
+            end_line: entry.end_line,
             text: entry.text,
             score,
             vector_score: entry.vector_score,
