@@ -9,6 +9,9 @@ use crate::db::{FtsRow, SearchRow};
 use crate::embedding::{EmbeddingInput, EmbeddingProvider};
 use crate::reranker::RerankingProvider;
 use crate::repository::Repository;
+use text_chunking::Tokenizer as ChunkTokenizer;
+use tiktoken_rs::{cl100k_base, o200k_base, p50k_base, p50k_edit, r50k_base};
+use tokenizers::Tokenizer as HfTokenizer;
 
 #[derive(Clone)]
 pub struct SearchResult {
@@ -29,6 +32,7 @@ pub struct SearchResult {
 pub struct SearchConfig {
     pub limit: usize,
     pub hybrid_weight: f32,
+    pub min_score: f64,
     pub path_prefixes: Vec<String>,
     pub file_exts: Vec<String>,
     pub decompose: bool,
@@ -40,6 +44,7 @@ impl SearchConfig {
         Self {
             limit,
             hybrid_weight,
+            min_score: 0.25,
             path_prefixes: Vec::new(),
             file_exts: Vec::new(),
             decompose: false,
@@ -90,6 +95,7 @@ pub async fn search(
     db: &dyn Repository,
     embedder: &dyn EmbeddingProvider,
     reranker: Option<&dyn RerankingProvider>,
+    tokenizer: &ChunkTokenizer,
     query: &str,
     config: SearchConfig,
 ) -> Result<Vec<SearchResult>> {
@@ -103,14 +109,9 @@ pub async fn search(
     let mut combined: HashMap<String, SearchResult> = HashMap::new();
 
     for query in queries {
-        let results = search_single(
-            db,
-            embedder,
-            &query,
-            config.limit,
-            config.hybrid_weight,
-        )
-        .await?;
+        let results =
+            search_single(db, embedder, tokenizer, &query, config.limit, config.hybrid_weight)
+                .await?;
         for result in results {
             if !config.matches_path(&result.file_path) {
                 continue;
@@ -161,20 +162,23 @@ pub async fn search(
             warn!("Reranking requested but no reranker configured");
         }
     }
+    combined.retain(|item| item.score >= config.min_score);
     Ok(combined)
 }
 
 async fn search_single(
     db: &dyn Repository,
     embedder: &dyn EmbeddingProvider,
+    tokenizer: &ChunkTokenizer,
     query: &str,
     limit: usize,
     hybrid_weight: f32,
 ) -> Result<Vec<SearchResult>> {
     let vector_results = if db.vss_loaded() {
+        let token_count = count_tokens(tokenizer, query)?;
         let input = EmbeddingInput {
             text: query.to_string(),
-            token_count: None,
+            token_count,
         };
         let output = embedder.embed(&[input]).await?;
         let mut embeddings = output.embeddings;
@@ -199,6 +203,39 @@ async fn search_single(
     };
 
     merge_results(vector_results, fts_results, limit, hybrid_weight)
+}
+
+fn count_tokens(tokenizer: &ChunkTokenizer, text: &str) -> Result<usize> {
+    match tokenizer {
+        ChunkTokenizer::Characters => Ok(text.chars().count()),
+        ChunkTokenizer::Tiktoken(encoding) => {
+            let encoder = match encoding.as_str() {
+                "cl100k_base" => cl100k_base(),
+                "p50k_base" => p50k_base(),
+                "p50k_edit" => p50k_edit(),
+                "r50k_base" => r50k_base(),
+                "o200k_base" => o200k_base(),
+                other => {
+                    return Err(eyre::eyre!("Unknown tiktoken encoding: {other}"));
+                }
+            }
+            .map_err(|err| eyre::eyre!("Failed to create tiktoken: {err}"))?;
+            Ok(encoder.encode_ordinary(text).len())
+        }
+        ChunkTokenizer::PreloadedTiktoken(encoder) => Ok(encoder.encode_ordinary(text).len()),
+        ChunkTokenizer::HuggingFace(model_id) => {
+            let tokenizer = HfTokenizer::from_pretrained(model_id, None)
+                .map_err(|err| eyre::eyre!("Failed to load HF tokenizer {model_id}: {err}"))?;
+            tokenizer
+                .encode(text, false)
+                .map(|encoding| encoding.len())
+                .map_err(|err| eyre::eyre!("tokenizer encode failed: {err}"))
+        }
+        ChunkTokenizer::PreloadedHuggingFace(tokenizer) => tokenizer
+            .encode(text, false)
+            .map(|encoding| encoding.len())
+            .map_err(|err| eyre::eyre!("tokenizer encode failed: {err}")),
+    }
 }
 
 struct PartialResult {

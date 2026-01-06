@@ -102,6 +102,12 @@ impl Db {
           weight DOUBLE NOT NULL,
           PRIMARY KEY (src_path, dst_path)
         );
+        CREATE TABLE IF NOT EXISTS file_dependency_edges (
+          src_path TEXT NOT NULL REFERENCES files(path),
+          dst_path TEXT NOT NULL REFERENCES files(path),
+          reference_count BIGINT NOT NULL,
+          PRIMARY KEY (src_path, dst_path)
+        );
         CREATE TABLE IF NOT EXISTS chunks (
           id TEXT PRIMARY KEY,
           file_path TEXT NOT NULL REFERENCES files(path),
@@ -159,6 +165,8 @@ impl Db {
         CREATE INDEX IF NOT EXISTS file_commit_edges_commit_idx ON file_commit_edges (commit_id);
         CREATE INDEX IF NOT EXISTS file_cochange_edges_src_idx ON file_cochange_edges (src_path);
         CREATE INDEX IF NOT EXISTS file_cochange_edges_dst_idx ON file_cochange_edges (dst_path);
+        CREATE INDEX IF NOT EXISTS file_dependency_edges_src_idx ON file_dependency_edges (src_path);
+        CREATE INDEX IF NOT EXISTS file_dependency_edges_dst_idx ON file_dependency_edges (dst_path);
         CREATE INDEX IF NOT EXISTS file_chunk_edges_file_idx ON file_chunk_edges (file_path);
         CREATE INDEX IF NOT EXISTS symbols_file_path_idx ON symbols (file_path);
         CREATE INDEX IF NOT EXISTS references_file_path_idx ON symbol_references (file_path);",
@@ -201,7 +209,11 @@ impl Db {
           file_cochange_edges
             SOURCE KEY (src_path) REFERENCES files (path)
             DESTINATION KEY (dst_path) REFERENCES files (path)
-            LABEL cochanges
+            LABEL cochanges,
+          file_dependency_edges
+            SOURCE KEY (src_path) REFERENCES files (path)
+            DESTINATION KEY (dst_path) REFERENCES files (path)
+            LABEL depends_on
         );";
             let _ = self.conn.execute_batch(graph_sql);
         }
@@ -267,6 +279,10 @@ impl Db {
         self.conn.execute(
             "DELETE FROM symbols WHERE file_path = ?",
             params![file_path],
+        )?;
+        self.conn.execute(
+            "DELETE FROM file_dependency_edges WHERE src_path = ? OR dst_path = ?",
+            params![file_path, file_path],
         )?;
         Ok(())
     }
@@ -344,15 +360,24 @@ impl Db {
         }
 
         let array_value_sql = array_value_placeholder(self.embedding_dim);
+        let (tokens_sql, tokens_params_len) = match record
+            .tokens
+            .as_ref()
+            .filter(|tokens| !tokens.is_empty())
+        {
+            Some(tokens) => (format!("{}::INTEGER[]", array_value_placeholder(tokens.len())), tokens.len()),
+            None => ("NULL".to_string(), 0),
+        };
         let sql = format!(
             "INSERT INTO chunks \
       (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {array}::FLOAT[{dim}])",
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, {array}::FLOAT[{dim}])",
+            tokens_sql = tokens_sql,
             array = array_value_sql,
             dim = self.embedding_dim
         );
 
-        let mut params_vec = Vec::with_capacity(11 + embedding.len());
+        let mut params_vec = Vec::with_capacity(10 + tokens_params_len + embedding.len());
         params_vec.push(Value::Text(record.id.clone()));
         params_vec.push(Value::Text(record.file_path.clone()));
         params_vec.push(Value::BigInt(record.start_byte as i64));
@@ -363,16 +388,9 @@ impl Db {
         params_vec.push(Value::Text(record.text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Int(record.ordinal as i32));
-        let tokens_value = match &record.tokens {
-            Some(tokens) => Value::List(
-                tokens
-                    .iter()
-                    .map(|token| Value::Int(*token as i32))
-                    .collect(),
-            ),
-            None => Value::Null,
-        };
-        params_vec.push(tokens_value);
+        if let Some(tokens) = record.tokens.as_ref().filter(|tokens| !tokens.is_empty()) {
+            params_vec.extend(tokens.iter().map(|token| Value::Int(*token as i32)));
+        }
         params_vec.extend(embedding.iter().copied().map(Value::Float));
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -918,6 +936,93 @@ impl Repository for Db {
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;
             results.push(path);
+        }
+        Ok(results)
+    }
+
+    fn cochange_partners(&self, file_path: &str, limit: usize) -> Result<Vec<(String, f64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let sql = "SELECT other_path, SUM(weight) AS total_weight FROM ( \
+        SELECT dst_path AS other_path, weight \
+          FROM file_cochange_edges \
+         WHERE src_path = ? \
+        UNION ALL \
+        SELECT src_path AS other_path, weight \
+          FROM file_cochange_edges \
+         WHERE dst_path = ? \
+      ) sq \
+      GROUP BY other_path \
+      ORDER BY total_weight DESC \
+      LIMIT ?";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params![file_path, file_path, limit as i64])?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let weight: f64 = row.get(1)?;
+            results.push((path, weight));
+        }
+        Ok(results)
+    }
+
+    fn file_commit_count(&self, file_path: &str) -> Result<i64> {
+        let count: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_commit_edges WHERE file_path = ?",
+                params![file_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(count.unwrap_or(0))
+    }
+
+    fn refresh_file_dependency_edges(&self) -> Result<()> {
+        let sql = "WITH unique_symbols AS ( \
+        SELECT name, MIN(file_path) AS file_path \
+          FROM symbols \
+         WHERE kind = 'definition' \
+         GROUP BY name \
+        HAVING COUNT(DISTINCT file_path) = 1 \
+      ), edges AS ( \
+        SELECT r.file_path AS src_path, u.file_path AS dst_path \
+          FROM symbol_references r \
+          JOIN unique_symbols u ON r.name = u.name \
+         WHERE r.file_path <> u.file_path \
+      ) \
+      INSERT INTO file_dependency_edges (src_path, dst_path, reference_count) \
+      SELECT src_path, dst_path, COUNT(*) AS reference_count \
+        FROM edges \
+       GROUP BY src_path, dst_path";
+
+        self.with_transaction(|db| {
+            db.conn.execute("DELETE FROM file_dependency_edges", [])?;
+            db.conn.execute(sql, [])?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn file_dependency_pagerank(&self, limit: usize) -> Result<Vec<(String, f64)>> {
+        if limit == 0 || !self.duckpgq_loaded {
+            return Ok(Vec::new());
+        }
+
+        self.refresh_file_dependency_edges()?;
+
+        let sql = "SELECT * FROM pagerank('code_graph', 'files', 'depends_on') \
+      ORDER BY 2 DESC LIMIT ?";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params![limit as i64])?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let score: f64 = row.get(1)?;
+            results.push((path, score));
         }
         Ok(results)
     }

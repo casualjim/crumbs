@@ -4,8 +4,10 @@ mod db;
 mod embedding;
 mod graph;
 mod indexer;
-mod reranker;
+mod logging;
+mod reqwestx;
 mod repository;
+mod reranker;
 mod search;
 #[cfg(test)]
 mod test_support;
@@ -24,6 +26,7 @@ use crate::reranker::{Client as RerankerClient, RerankerConfig, RerankingProvide
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _logging_guard = logging::init()?;
     let cli = Cli::parse();
 
     match &cli.command {
@@ -55,6 +58,9 @@ async fn main() -> Result<()> {
                 max_parallel: cfg.chunking.max_parallel,
                 max_file_size: Some(cfg.chunking.max_file_size),
                 large_file_threads: cfg.chunking.large_file_threads,
+                stream_batch_size: cfg.embedding.stream_batch_size,
+                max_batch_size: cfg.embedding.max_batch_size,
+                max_tokens: cfg.embedding.context_length,
                 history: graph::HistoryConfig {
                     depth: cfg.history.depth,
                     commit_size_limit_ratio: cfg.history.commit_size_limit_ratio,
@@ -89,7 +95,8 @@ async fn main() -> Result<()> {
             search_config.decompose = cfg.search.decompose;
             search_config.rerank = cfg.search.rerank;
             let results =
-                search::search(&db, &embedder, reranker_ref, &cmd.query, search_config).await?;
+                search::search(&db, &embedder, reranker_ref, &tokenizer, &cmd.query, search_config)
+                    .await?;
             for (idx, result) in results.iter().enumerate() {
                 let mut score_line = format!("score={:.4}", result.score);
                 if let Some(vector) = result.vector_score {
@@ -159,13 +166,9 @@ async fn main() -> Result<()> {
             let handle = pipeline.run(&ctx, &mut arena, input).await?;
             let assembled = arena.get(handle);
 
-            let enriched = assembly::output::enrich_blocks(
-                &project.repo_path,
-                &db,
-                &assembled.blocks,
-            )
-            .await?;
-            let overview = assembly::output::build_repository_overview(&project.repo_path);
+            let enriched =
+                assembly::output::enrich_blocks(&project.repo_path, &db, &assembled.blocks).await?;
+            let overview = assembly::output::build_repository_overview(&project.repo_path, &db);
             let payload = assembly::output::PromptPayload {
                 overview,
                 task: cmd.task.clone(),
@@ -230,8 +233,8 @@ pub(crate) fn build_embedder(cfg: &config::Embedding, tokenizer: Tokenizer) -> R
         model: cfg.model.clone(),
         tokenizer,
         embedding_dim: cfg.embedding_dim,
-        context_length: cfg.context_length,
-        max_batch_size: cfg.max_batch_size,
+        requests_per_minute: cfg.requests_per_minute,
+        max_concurrent_requests: cfg.max_concurrent_requests,
         tokens_per_minute: cfg.tokens_per_minute,
     };
 

@@ -1,0 +1,8 @@
+# context data
+context.duckdb
+context.duckdb.wal
+context.duckdb.shm
+context.duckdb-wal
+context.duckdb-shm
+secrets.toml
+!.gitignore

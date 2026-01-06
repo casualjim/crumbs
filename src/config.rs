@@ -33,57 +33,97 @@ pub struct AppConfig {
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Embedding {
     #[config(default = "https://api.deepinfra.com/v1/openai", env = "EMBEDDER_URL")]
-    #[config(layer_attr(arg(long = "embedder-url", help = "Embedding API base URL")))]
+    #[config(layer_attr(arg(
+        id = "embedder_url",
+        long = "embedder-url",
+        help = "Embedding API base URL"
+    )))]
     pub url: String,
     #[config(env = "EMBEDDER_API_KEY")]
     #[config(layer_attr(arg(
+        id = "embedder_api_key",
         long = "embedder-api-key",
         help = "Embedding API key (or set in secrets)"
     )))]
     pub api_key: Option<SecretString>,
     #[config(default = "Qwen/Qwen3-Embedding-0.6B", env = "EMBEDDER_MODEL")]
-    #[config(layer_attr(arg(long = "embedder-model", help = "Embedding model name")))]
+    #[config(layer_attr(arg(
+        id = "embedder_model",
+        long = "embedder-model",
+        help = "Embedding model name"
+    )))]
     pub model: String,
     #[config(
         default = "hf:Qwen/Qwen3-Embedding-0.6B",
         env = "EMBEDDER_TOKENIZER"
     )]
     #[config(layer_attr(arg(
+        id = "embedder_tokenizer",
         long = "embedder-tokenizer",
         help = "Tokenizer for chunking (characters|tiktoken:<name>|hf:<model>)"
     )))]
     pub tokenizer: String,
     #[config(default = "deepinfra", env = "EMBEDDER_DIALECT")]
     #[config(layer_attr(arg(
+        id = "embedder_dialect",
         long = "embedder-dialect",
         help = "Provider dialect: openai|deepinfra"
     )))]
     pub dialect: String,
     #[config(default = 10, env = "EMBEDDER_TIMEOUT_SECONDS")]
     #[config(layer_attr(arg(
+        id = "embedder_timeout_seconds",
         long = "embedder-timeout-seconds",
         help = "Request timeout in seconds"
     )))]
     pub timeout_seconds: u64,
     #[config(default = 1024, env = "EMBEDDING_DIM")]
-    #[config(layer_attr(arg(long = "embedding-dim", help = "Embedding vector dimension")))]
+    #[config(layer_attr(arg(
+        id = "embedder_embedding_dim",
+        long = "embedding-dim",
+        help = "Embedding vector dimension"
+    )))]
     pub embedding_dim: usize,
     #[config(default = 32_768, env = "EMBEDDER_CONTEXT_LENGTH")]
     #[config(layer_attr(arg(
+        id = "embedder_context_length",
         long = "embedder-context-length",
         help = "Max tokens per embedding request"
     )))]
     pub context_length: usize,
+    #[config(default = 256, env = "EMBEDDER_STREAM_BATCH_SIZE")]
+    #[config(layer_attr(arg(
+        id = "embedder_stream_batch_size",
+        long = "embedder-stream-batch-size",
+        help = "Max chunks per stream batch before token-aware splitting"
+    )))]
+    pub stream_batch_size: usize,
     #[config(default = 15, env = "EMBEDDER_MAX_BATCH_SIZE")]
     #[config(layer_attr(arg(
+        id = "embedder_max_batch_size",
         long = "embedder-max-batch-size",
         help = "Max inputs per embedding batch"
     )))]
     pub max_batch_size: usize,
+    #[config(default = 1000, env = "EMBEDDER_REQUESTS_PER_MINUTE")]
+    #[config(layer_attr(arg(
+        id = "embedder_requests_per_minute",
+        long = "embedder-requests-per-minute",
+        help = "Rate limit for embedding requests per minute"
+    )))]
+    pub requests_per_minute: usize,
+    #[config(default = 300, env = "EMBEDDER_MAX_CONCURRENT_REQUESTS")]
+    #[config(layer_attr(arg(
+        id = "embedder_max_concurrent_requests",
+        long = "embedder-max-concurrent-requests",
+        help = "Max concurrent embedding requests"
+    )))]
+    pub max_concurrent_requests: usize,
     #[config(default = 1_000_000, env = "EMBEDDER_TOKENS_PER_MINUTE")]
     #[config(layer_attr(arg(
+        id = "embedder_tokens_per_minute",
         long = "embedder-tokens-per-minute",
-        help = "Rate limit for embedding tokens per minute (0 disables)"
+        help = "Rate limit for embedding tokens per minute"
     )))]
     pub tokens_per_minute: u32,
 }
@@ -92,31 +132,43 @@ pub struct Embedding {
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Reranker {
     #[config(default = "https://api.deepinfra.com/v1", env = "RERANKER_URL")]
-    #[config(layer_attr(arg(long = "reranker-url", help = "Reranker API base URL")))]
+    #[config(layer_attr(arg(
+        id = "reranker_url",
+        long = "reranker-url",
+        help = "Reranker API base URL"
+    )))]
     pub url: String,
     #[config(env = "RERANKER_API_KEY")]
     #[config(layer_attr(arg(
+        id = "reranker_api_key",
         long = "reranker-api-key",
         help = "Reranker API key (or set in secrets)"
     )))]
     pub api_key: Option<SecretString>,
     #[config(default = "Qwen/Qwen3-Reranker-0.6B", env = "RERANKER_MODEL")]
-    #[config(layer_attr(arg(long = "reranker-model", help = "Reranker model name")))]
+    #[config(layer_attr(arg(
+        id = "reranker_model",
+        long = "reranker-model",
+        help = "Reranker model name"
+    )))]
     pub model: String,
     #[config(default = "deepinfra", env = "RERANKER_DIALECT")]
     #[config(layer_attr(arg(
+        id = "reranker_dialect",
         long = "reranker-dialect",
         help = "Provider dialect: openai|deepinfra"
     )))]
     pub dialect: String,
     #[config(default = 10, env = "RERANKER_TIMEOUT_SECONDS")]
     #[config(layer_attr(arg(
+        id = "reranker_timeout_seconds",
         long = "reranker-timeout-seconds",
         help = "Reranker request timeout in seconds"
     )))]
     pub timeout_seconds: u64,
     #[config(env = "RERANKER_INSTRUCTION")]
     #[config(layer_attr(arg(
+        id = "reranker_instruction",
         long = "reranker-instruction",
         help = "Optional reranker instruction/prompt"
     )))]
@@ -201,6 +253,12 @@ pub struct SearchOptions {
     #[config(default = 10, env = "CONTEXT_SEARCH_LIMIT")]
     #[config(layer_attr(arg(long = "limit", help = "Max results to return")))]
     pub limit: usize,
+    #[config(default = 0.25, env = "CONTEXT_SEARCH_MIN_SCORE")]
+    #[config(layer_attr(arg(
+        long = "min-score",
+        help = "Minimum score to include in results (0.0-1.0)"
+    )))]
+    pub min_score: f64,
     #[config(default = 0.6, env = "CONTEXT_HYBRID_WEIGHT")]
     #[config(layer_attr(arg(
         long = "hybrid-weight",
@@ -240,6 +298,7 @@ pub struct SearchOptions {
 pub struct Prompting {
     #[config(default = "", env = "CONTEXT_PROMPT_TOKENIZER")]
     #[config(layer_attr(arg(
+        id = "prompt_tokenizer",
         long = "prompt-tokenizer",
         help = "Tokenizer for prompt budgeting (defaults to embedding tokenizer)"
     )))]
@@ -600,7 +659,10 @@ dialect = "deepinfra"
 timeout_seconds = 10
 embedding_dim = 1024
 context_length = 32768
+stream_batch_size = 256
 max_batch_size = 15
+requests_per_minute = 1000
+max_concurrent_requests = 300
 tokens_per_minute = 1000000
 
 [reranker]
@@ -635,6 +697,7 @@ issue_regex = "(#\\d+)"
 
 [search]
 limit = 10
+min_score = 0.25
 hybrid_weight = 0.6
 # path_prefixes = ["src/"]
 # file_exts = ["rs"]
@@ -813,8 +876,22 @@ fn validate_config(config: &AppConfig) -> eyre::Result<()> {
     if config.embedding.context_length == 0 {
         return Err(eyre::eyre!("embedder context_length must be > 0"));
     }
+    if config.embedding.stream_batch_size == 0 {
+        return Err(eyre::eyre!("embedder stream_batch_size must be > 0"));
+    }
     if config.embedding.max_batch_size == 0 {
         return Err(eyre::eyre!("embedder max_batch_size must be > 0"));
+    }
+    if config.embedding.requests_per_minute == 0 {
+        return Err(eyre::eyre!("embedder requests_per_minute must be > 0"));
+    }
+    if config.embedding.max_concurrent_requests == 0 {
+        return Err(eyre::eyre!(
+            "embedder max_concurrent_requests must be > 0"
+        ));
+    }
+    if config.embedding.tokens_per_minute == 0 {
+        return Err(eyre::eyre!("embedder tokens_per_minute must be > 0"));
     }
     if config.chunking.max_chunk_size == 0 {
         return Err(eyre::eyre!("max_chunk_size must be > 0"));
@@ -833,6 +910,9 @@ fn validate_config(config: &AppConfig) -> eyre::Result<()> {
     }
     if config.search.limit == 0 {
         return Err(eyre::eyre!("search limit must be > 0"));
+    }
+    if !(0.0..=1.0).contains(&config.search.min_score) {
+        return Err(eyre::eyre!("search min_score must be in [0.0, 1.0]"));
     }
     if !(0.0..=1.0).contains(&config.search.hybrid_weight) {
         return Err(eyre::eyre!("hybrid_weight must be in [0.0, 1.0]"));
@@ -1020,8 +1100,11 @@ mod tests {
                 timeout_seconds: 10,
                 embedding_dim: 2,
                 context_length: 8,
+                stream_batch_size: 4,
                 max_batch_size: 4,
-                tokens_per_minute: 0,
+                requests_per_minute: 1000,
+                max_concurrent_requests: 300,
+                tokens_per_minute: 1,
             },
             reranker: Reranker {
                 url: "http://localhost".to_string(),
@@ -1050,6 +1133,7 @@ mod tests {
             projects,
             search: SearchOptions {
                 limit: 1,
+                min_score: 0.25,
                 hybrid_weight: 0.6,
                 path_prefixes: Vec::new(),
                 file_exts: Vec::new(),
@@ -1114,8 +1198,11 @@ mod tests {
                 timeout_seconds: 10,
                 embedding_dim: 2,
                 context_length: 8,
+                stream_batch_size: 4,
                 max_batch_size: 4,
-                tokens_per_minute: 0,
+                requests_per_minute: 1000,
+                max_concurrent_requests: 300,
+                tokens_per_minute: 1,
             },
             reranker: Reranker {
                 url: "http://localhost".to_string(),
@@ -1144,6 +1231,7 @@ mod tests {
             projects,
             search: SearchOptions {
                 limit: 1,
+                min_score: 0.25,
                 hybrid_weight: 0.6,
                 path_prefixes: Vec::new(),
                 file_exts: Vec::new(),

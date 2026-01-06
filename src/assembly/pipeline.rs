@@ -184,11 +184,13 @@ impl RetrieveCandidates for DefaultRetrieve {
         let embedder = ctx
             .embedder
             .ok_or_else(|| eyre!("embedding provider required for retrieval"))?;
+        let tokenizer = crate::parse_tokenizer(&ctx.config.embedding.tokenizer)?;
         let query = arena.get(input);
         let results = crate::search::search(
             ctx.db,
             embedder,
             ctx.reranker,
+            &tokenizer,
             &query.text,
             self.config.clone(),
         )
@@ -402,6 +404,7 @@ pub fn default_pipeline(
     DefaultAssembleContext,
 > {
     let mut search_config = SearchConfig::new(config.search.limit, config.search.hybrid_weight);
+    search_config.min_score = config.search.min_score;
     search_config.path_prefixes = config.search.path_prefixes.clone();
     search_config.file_exts = config.search.file_exts.clone();
     search_config.decompose = config.search.decompose;

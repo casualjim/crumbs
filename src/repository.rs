@@ -39,6 +39,10 @@ pub trait Repository {
     fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>>;
     fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsRow>>;
     fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>>;
+    fn cochange_partners(&self, file_path: &str, limit: usize) -> Result<Vec<(String, f64)>>;
+    fn file_commit_count(&self, file_path: &str) -> Result<i64>;
+    fn refresh_file_dependency_edges(&self) -> Result<()>;
+    fn file_dependency_pagerank(&self, limit: usize) -> Result<Vec<(String, f64)>>;
     fn chunks_for_files(
         &self,
         file_paths: &[String],

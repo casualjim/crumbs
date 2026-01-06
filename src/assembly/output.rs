@@ -8,6 +8,11 @@ use text_chunking::languages;
 use crate::assembly::pipeline::{CandidateSource, ContextBlock};
 use crate::repository::Repository;
 
+const SUMMARY_LIMIT: usize = 20;
+const SUMMARY_COCHANGE_LIMIT: usize = 3;
+const SUMMARY_CORE_LIMIT: usize = 5;
+const SUMMARY_HIGH_CHURN_COMMITS: i64 = 10;
+
 #[derive(Clone, Copy, Debug)]
 pub enum PromptFormat {
     Xml,
@@ -37,14 +42,11 @@ pub struct RepositoryOverview {
     pub name: String,
     pub structure: Vec<String>,
     pub tech_stack: Vec<String>,
+    pub summary: Vec<String>,
 }
 
 fn line_from_i64(value: i64) -> usize {
-    if value <= 0 {
-        1
-    } else {
-        value as usize
-    }
+    if value <= 0 { 1 } else { value as usize }
 }
 
 fn normalized_fence_language(language: &str) -> String {
@@ -132,6 +134,14 @@ fn render_xml(payload: &PromptPayload) -> String {
         )
         .ok();
     }
+    if !payload.overview.summary.is_empty() {
+        write_cdata(
+            &mut out,
+            "    <summary_map><![CDATA[",
+            &payload.overview.summary.join("\n"),
+            "]]></summary_map>",
+        );
+    }
     writeln!(out, "  </repository_overview>").ok();
     writeln!(out, "  <code_context>").ok();
 
@@ -208,6 +218,13 @@ fn render_markdown(payload: &PromptPayload) -> String {
     if !payload.overview.structure.is_empty() {
         writeln!(out, "\n### Structure\n```").ok();
         for line in &payload.overview.structure {
+            writeln!(out, "{line}").ok();
+        }
+        writeln!(out, "```").ok();
+    }
+    if !payload.overview.summary.is_empty() {
+        writeln!(out, "\n### Summary Map\n```").ok();
+        for line in &payload.overview.summary {
             writeln!(out, "{line}").ok();
         }
         writeln!(out, "```").ok();
@@ -291,7 +308,7 @@ fn write_cdata(out: &mut String, prefix: &str, text: &str, suffix: &str) {
     out.push('\n');
 }
 
-pub fn build_repository_overview(repo_root: &Path) -> RepositoryOverview {
+pub fn build_repository_overview(repo_root: &Path, db: &dyn Repository) -> RepositoryOverview {
     let name = repo_root
         .file_name()
         .and_then(|name| name.to_str())
@@ -299,11 +316,106 @@ pub fn build_repository_overview(repo_root: &Path) -> RepositoryOverview {
         .to_string();
     let structure = build_structure(repo_root, 2, 200);
     let tech_stack = detect_tech_stack(repo_root);
+    let summary = build_repository_summary(repo_root, db);
     RepositoryOverview {
         name,
         structure,
         tech_stack,
+        summary,
     }
+}
+
+fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Ok(ranks) = db.file_dependency_pagerank(SUMMARY_LIMIT) else {
+        return lines;
+    };
+    if ranks.is_empty() {
+        return lines;
+    }
+
+    let core_limit = SUMMARY_CORE_LIMIT.min(ranks.len());
+
+    for (idx, (file_path, score)) in ranks.iter().enumerate() {
+        let display_path_value = display_path(repo_root, file_path);
+        let mut badges = Vec::new();
+        if idx < core_limit {
+            badges.push("core");
+        }
+        if is_test_path(&display_path_value) {
+            badges.push("test");
+        }
+        if let Ok(commit_count) = db.file_commit_count(file_path) {
+            if commit_count >= SUMMARY_HIGH_CHURN_COMMITS {
+                badges.push("high-churn");
+            }
+        }
+
+        let badge_text = if badges.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {}",
+                badges
+                    .iter()
+                    .map(|b| format!("[{b}]"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        lines.push(format!(
+            "{}{} (rank {:.4})",
+            display_path_value, badge_text, score
+        ));
+
+        if let Ok(partners) = db.cochange_partners(file_path, SUMMARY_COCHANGE_LIMIT) {
+            if !partners.is_empty() {
+                let items = partners
+                    .into_iter()
+                    .map(|(path, weight)| {
+                        format!("{} ({:.2})", display_path(repo_root, &path), weight)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("  <-> changes with: {items}"));
+            }
+        }
+    }
+
+    lines
+}
+
+fn display_path(repo_root: &Path, file_path: &str) -> String {
+    let path = Path::new(file_path);
+    if path.is_absolute() {
+        if let Ok(stripped) = path.strip_prefix(repo_root) {
+            if let Some(rel) = stripped.to_str() {
+                if !rel.is_empty() {
+                    return rel.replace('\\', "/");
+                }
+            }
+        }
+    }
+    file_path.replace('\\', "/")
+}
+
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("/tests/") || lower.contains("\\tests\\") || lower.contains("__tests__") {
+        return true;
+    }
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with(".spec")
+        || stem.ends_with(".test")
 }
 
 fn build_structure(root: &Path, max_depth: usize, max_entries: usize) -> Vec<String> {
@@ -403,6 +515,110 @@ fn push_unique(stack: &mut Vec<String>, label: &str, present: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    use crate::db::{Db, GraphData, ReferenceRecord, SymbolRecord};
+
+    #[test]
+    fn repository_summary_includes_pagerank_and_badges() -> Result<()> {
+        let dir = TempDir::new()?;
+        let repo_root = dir.path();
+        let src_dir = repo_root.join("src");
+        std::fs::create_dir_all(&src_dir)?;
+
+        let file_a = src_dir.join("a.rs");
+        let file_b = src_dir.join("b.rs");
+        std::fs::write(&file_a, "fn call_foo() { foo(); }\n")?;
+        std::fs::write(&file_b, "fn foo() {}\n")?;
+
+        let db_path = repo_root.join("context.duckdb");
+        let db = Db::open(&db_path, Some(3))?;
+
+        let b_path = file_b.to_string_lossy().to_string();
+        let b_size = std::fs::metadata(&file_b)?.len();
+        let graph_b = GraphData {
+            symbols: vec![SymbolRecord {
+                id: "sym_b".to_string(),
+                file_path: String::new(),
+                name: "foo".to_string(),
+                kind: "definition".to_string(),
+                start_byte: 0,
+                end_byte: 3,
+                language: "rust".to_string(),
+            }],
+            references: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        db.replace_file_graph(&b_path, b_size, [0u8; 32], "rust", None, graph_b)?;
+
+        let a_path = file_a.to_string_lossy().to_string();
+        let a_size = std::fs::metadata(&file_a)?.len();
+        let graph_a = GraphData {
+            symbols: Vec::new(),
+            references: vec![ReferenceRecord {
+                id: "ref_a".to_string(),
+                file_path: String::new(),
+                name: "foo".to_string(),
+                start_byte: 0,
+                end_byte: 3,
+                language: "rust".to_string(),
+            }],
+            resolutions: Vec::new(),
+        };
+        db.replace_file_graph(&a_path, a_size, [1u8; 32], "rust", None, graph_a)?;
+
+        let mut commit_edges = Vec::new();
+        for i in 0..12 {
+            commit_edges.push((a_path.clone(), format!("c{i}")));
+        }
+        let cochange_edges = vec![(a_path.clone(), b_path.clone(), 3, 0.5)];
+        db.replace_history_edges(&commit_edges, &cochange_edges)?;
+
+        match db.file_dependency_pagerank(1) {
+            Ok(ranks) => {
+                if ranks.is_empty() {
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+
+        let overview = build_repository_overview(repo_root, &db);
+        let summary = overview.summary.clone();
+        assert!(!summary.is_empty(), "expected summary to be populated");
+
+        let main_lines: Vec<&String> = summary
+            .iter()
+            .filter(|line| !line.starts_with("  <->"))
+            .collect();
+        assert!(
+            main_lines[0].contains("src/b.rs"),
+            "expected pagerank to prioritize src/b.rs, got {:?}",
+            main_lines
+        );
+        let a_line = main_lines
+            .iter()
+            .find(|line| line.contains("src/a.rs"))
+            .expect("expected src/a.rs in summary");
+        assert!(
+            a_line.contains("[high-churn]"),
+            "expected high-churn badge on src/a.rs"
+        );
+
+        let xml = render_prompt(
+            PromptFormat::Xml,
+            &PromptPayload {
+                overview,
+                task: "test".to_string(),
+                blocks: Vec::new(),
+            },
+        );
+        assert!(
+            xml.contains("<summary_map>"),
+            "expected summary_map in XML output"
+        );
+        Ok(())
+    }
 
     #[test]
     fn xml_escape_rewrites_special_chars() {
