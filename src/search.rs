@@ -3,10 +3,14 @@ use std::collections::HashMap;
 use eyre::{Result, eyre};
 use tracing::warn;
 
+use std::path::Path;
+
 use crate::db::{FtsRow, SearchRow};
 use crate::embedding::{EmbeddingInput, EmbeddingProvider};
+use crate::reranker::RerankingProvider;
 use crate::repository::Repository;
 
+#[derive(Clone)]
 pub struct SearchResult {
     pub file_path: String,
     pub start_byte: i64,
@@ -17,7 +21,146 @@ pub struct SearchResult {
     pub fts_score: Option<f64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SearchConfig {
+    pub limit: usize,
+    pub hybrid_weight: f32,
+    pub path_prefixes: Vec<String>,
+    pub file_exts: Vec<String>,
+    pub decompose: bool,
+    pub rerank: bool,
+}
+
+impl SearchConfig {
+    pub fn new(limit: usize, hybrid_weight: f32) -> Self {
+        Self {
+            limit,
+            hybrid_weight,
+            path_prefixes: Vec::new(),
+            file_exts: Vec::new(),
+            decompose: false,
+            rerank: false,
+        }
+    }
+
+    fn normalize(mut self) -> Self {
+        self.path_prefixes = self
+            .path_prefixes
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        self.file_exts = self
+            .file_exts
+            .into_iter()
+            .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|item| !item.is_empty())
+            .collect();
+        self
+    }
+
+    fn matches_path(&self, file_path: &str) -> bool {
+        if !self.path_prefixes.is_empty()
+            && !self
+                .path_prefixes
+                .iter()
+                .any(|prefix| file_path.starts_with(prefix))
+        {
+            return false;
+        }
+        if !self.file_exts.is_empty() {
+            let ext = Path::new(file_path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !self.file_exts.iter().any(|item| item == &ext) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 pub async fn search(
+    db: &dyn Repository,
+    embedder: &dyn EmbeddingProvider,
+    reranker: Option<&dyn RerankingProvider>,
+    query: &str,
+    config: SearchConfig,
+) -> Result<Vec<SearchResult>> {
+    let config = config.normalize();
+    let query_text = query;
+    let queries = if config.decompose {
+        split_query(query)
+    } else {
+        vec![query.to_string()]
+    };
+    let mut combined: HashMap<String, SearchResult> = HashMap::new();
+
+    for query in queries {
+        let results = search_single(
+            db,
+            embedder,
+            &query,
+            config.limit,
+            config.hybrid_weight,
+        )
+        .await?;
+        for result in results {
+            if !config.matches_path(&result.file_path) {
+                continue;
+            }
+            let id = format!("{}:{}-{}", result.file_path, result.start_byte, result.end_byte);
+            match combined.get_mut(&id) {
+                Some(existing) => {
+                    if result.score > existing.score {
+                        *existing = result;
+                    }
+                }
+                None => {
+                    combined.insert(id, result);
+                }
+            }
+        }
+    }
+
+    let mut combined = combined.into_values().collect::<Vec<_>>();
+    combined.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    combined.truncate(config.limit);
+    if config.rerank {
+        if let Some(reranker) = reranker {
+            let documents: Vec<String> = combined.iter().map(|item| item.text.clone()).collect();
+            match reranker.rerank(query_text, &documents).await {
+                Ok(scores) if scores.len() == combined.len() => {
+                    for (result, score) in combined.iter_mut().zip(scores.iter()) {
+                        result.score = *score;
+                    }
+                    combined.sort_by(|a, b| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                Ok(_) => {
+                    warn!("Reranker returned unexpected score count; using hybrid scores");
+                }
+                Err(err) => {
+                    warn!("Reranking failed, using hybrid scores: {err}");
+                }
+            }
+        } else {
+            warn!("Reranking requested but no reranker configured");
+        }
+    }
+    Ok(combined)
+}
+
+async fn search_single(
     db: &dyn Repository,
     embedder: &dyn EmbeddingProvider,
     query: &str,
@@ -141,4 +284,27 @@ fn merge_results(
 
 fn vector_score(distance: f64) -> f64 {
     (1.0 - (distance / 2.0)).clamp(0.0, 1.0)
+}
+
+fn split_query(query: &str) -> Vec<String> {
+    let cleaned = query
+        .replace(';', " and ")
+        .replace('\n', " and ")
+        .replace('\t', " ");
+    if !cleaned.contains(" and ") {
+        return vec![query.trim().to_string()];
+    }
+    let mut parts = Vec::new();
+    for part in cleaned.split(" and ") {
+        let trimmed = part.trim();
+        if trimmed.len() > 2 {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if parts.is_empty() {
+        vec![query.trim().to_string()]
+    } else {
+        parts.truncate(4);
+        parts
+    }
 }

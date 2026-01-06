@@ -879,6 +879,36 @@ impl Repository for Db {
 
         Ok(results)
     }
+
+    fn symbols_in_range(
+        &self,
+        file_path: &str,
+        start_byte: i64,
+        end_byte: i64,
+    ) -> Result<Vec<SymbolRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, name, kind, start_byte, end_byte, language
+       FROM symbols
+       WHERE file_path = ?
+         AND start_byte < ?
+         AND end_byte > ?
+       ORDER BY start_byte ASC",
+        )?;
+        let mut rows = stmt.query(params![file_path, end_byte, start_byte])?;
+        let mut symbols = Vec::new();
+        while let Some(row) = rows.next()? {
+            symbols.push(SymbolRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                name: row.get(2)?,
+                kind: row.get(3)?,
+                start_byte: row.get(4)?,
+                end_byte: row.get(5)?,
+                language: row.get(6)?,
+            });
+        }
+        Ok(symbols)
+    }
 }
 
 #[cfg(test)]

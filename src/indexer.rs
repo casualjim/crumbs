@@ -291,7 +291,8 @@ mod tests {
         indexer.index().await?;
 
         let db = Db::open(&db_path, Some(embedding_dim))?;
-        let results = search::search(&db, &embedder, "add numbers", 5, 0.6).await?;
+        let search_config = search::SearchConfig::new(5, 0.6);
+        let results = search::search(&db, &embedder, None, "add numbers", search_config).await?;
 
         assert!(!results.is_empty(), "expected search to return results");
         Ok(())

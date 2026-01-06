@@ -1,4 +1,5 @@
 pub mod pipeline;
+pub mod output;
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ pub struct AssemblyContext<'a> {
     pub repo_path: &'a Path,
     pub db: &'a dyn Repository,
     pub embedder: Option<&'a dyn EmbeddingProvider>,
+    pub reranker: Option<&'a dyn crate::reranker::RerankingProvider>,
     #[allow(dead_code)]
     pub config: &'a AppConfig,
 }

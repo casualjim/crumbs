@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use confique::Config as _;
 use confique::Layer as _;
 use secrecy::SecretString;
@@ -16,6 +16,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub embedding: Embedding,
     #[config(nested)]
+    pub reranker: Reranker,
+    #[config(nested)]
     pub chunking: Chunking,
     #[config(nested)]
     pub history: History,
@@ -23,6 +25,8 @@ pub struct AppConfig {
     pub projects: BTreeMap<String, Project>,
     #[config(nested)]
     pub search: SearchOptions,
+    #[config(nested)]
+    pub prompt: Prompting,
 }
 
 #[derive(confique::Config, Debug, Clone)]
@@ -82,6 +86,41 @@ pub struct Embedding {
         help = "Rate limit for embedding tokens per minute (0 disables)"
     )))]
     pub tokens_per_minute: u32,
+}
+
+#[derive(confique::Config, Debug, Clone)]
+#[config(layer_attr(derive(clap::Args, Clone)))]
+pub struct Reranker {
+    #[config(default = "https://api.deepinfra.com/v1", env = "RERANKER_URL")]
+    #[config(layer_attr(arg(long = "reranker-url", help = "Reranker API base URL")))]
+    pub url: String,
+    #[config(env = "RERANKER_API_KEY")]
+    #[config(layer_attr(arg(
+        long = "reranker-api-key",
+        help = "Reranker API key (or set in secrets)"
+    )))]
+    pub api_key: Option<SecretString>,
+    #[config(default = "Qwen/Qwen3-Reranker-0.6B", env = "RERANKER_MODEL")]
+    #[config(layer_attr(arg(long = "reranker-model", help = "Reranker model name")))]
+    pub model: String,
+    #[config(default = "deepinfra", env = "RERANKER_DIALECT")]
+    #[config(layer_attr(arg(
+        long = "reranker-dialect",
+        help = "Provider dialect: openai|deepinfra"
+    )))]
+    pub dialect: String,
+    #[config(default = 10, env = "RERANKER_TIMEOUT_SECONDS")]
+    #[config(layer_attr(arg(
+        long = "reranker-timeout-seconds",
+        help = "Reranker request timeout in seconds"
+    )))]
+    pub timeout_seconds: u64,
+    #[config(env = "RERANKER_INSTRUCTION")]
+    #[config(layer_attr(arg(
+        long = "reranker-instruction",
+        help = "Optional reranker instruction/prompt"
+    )))]
+    pub instruction: Option<String>,
 }
 
 #[derive(confique::Config, Debug, Clone)]
@@ -168,6 +207,43 @@ pub struct SearchOptions {
         help = "Weight for hybrid scoring (0=FTS, 1=vector)"
     )))]
     pub hybrid_weight: f32,
+    #[config(default = [], env = "CONTEXT_SEARCH_PATH_PREFIX")]
+    #[config(layer_attr(arg(
+        long = "path-prefix",
+        value_delimiter = ',',
+        help = "Restrict results to file path prefixes (comma-separated)"
+    )))]
+    pub path_prefixes: Vec<String>,
+    #[config(default = [], env = "CONTEXT_SEARCH_FILE_EXT")]
+    #[config(layer_attr(arg(
+        long = "file-ext",
+        value_delimiter = ',',
+        help = "Restrict results to file extensions (comma-separated)"
+    )))]
+    pub file_exts: Vec<String>,
+    #[config(default = false, env = "CONTEXT_SEARCH_DECOMPOSE")]
+    #[config(layer_attr(arg(
+        long = "decompose",
+        help = "Split multi-part queries on conjunctions"
+    )))]
+    pub decompose: bool,
+    #[config(default = true, env = "CONTEXT_SEARCH_RERANK")]
+    #[config(layer_attr(arg(
+        long = "rerank",
+        help = "Apply model-based reranking"
+    )))]
+    pub rerank: bool,
+}
+
+#[derive(confique::Config, Debug, Clone)]
+#[config(layer_attr(derive(clap::Args, Clone)))]
+pub struct Prompting {
+    #[config(default = "", env = "CONTEXT_PROMPT_TOKENIZER")]
+    #[config(layer_attr(arg(
+        long = "prompt-tokenizer",
+        help = "Tokenizer for prompt budgeting (defaults to embedding tokenizer)"
+    )))]
+    pub tokenizer: String,
 }
 
 #[derive(Parser)]
@@ -224,6 +300,8 @@ pub struct SearchCli {
     #[command(flatten)]
     pub embedding: <Embedding as confique::Config>::Layer,
     #[command(flatten)]
+    pub reranker: <Reranker as confique::Config>::Layer,
+    #[command(flatten)]
     pub project: ProjectCli,
     #[command(flatten)]
     pub search: <SearchOptions as confique::Config>::Layer,
@@ -247,11 +325,41 @@ pub struct PromptCli {
     #[command(flatten)]
     pub embedding: <Embedding as confique::Config>::Layer,
     #[command(flatten)]
+    pub reranker: <Reranker as confique::Config>::Layer,
+    #[command(flatten)]
     pub project: ProjectCli,
     #[command(flatten)]
     pub search: <SearchOptions as confique::Config>::Layer,
+    #[command(flatten)]
+    pub prompt: <Prompting as confique::Config>::Layer,
+    #[arg(
+        long = "max-tokens",
+        default_value_t = 0,
+        help = "Max input tokens for assembled context (0 uses embedder context length)"
+    )]
+    pub max_tokens: usize,
+    #[arg(
+        long = "reserved-output-tokens",
+        default_value_t = 0,
+        help = "Tokens reserved for model output"
+    )]
+    pub reserved_output_tokens: usize,
+    #[arg(
+        long = "format",
+        value_enum,
+        default_value = "xml",
+        help = "Output format: xml|markdown"
+    )]
+    pub format: PromptFormat,
     #[arg(value_name = "TASK", help = "Task or question to build context for")]
     pub task: String,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+pub enum PromptFormat {
+    #[value(alias = "md")]
+    Markdown,
+    Xml,
 }
 
 #[derive(Args)]
@@ -294,11 +402,14 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
         }
         Command::Search(cmd) => {
             cli_layer.embedding = cmd.embedding.clone();
+            cli_layer.reranker = cmd.reranker.clone();
             cli_layer.search = cmd.search.clone();
         }
         Command::Prompt(cmd) => {
             cli_layer.embedding = cmd.embedding.clone();
+            cli_layer.reranker = cmd.reranker.clone();
             cli_layer.search = cmd.search.clone();
+            cli_layer.prompt = cmd.prompt.clone();
         }
         Command::Config(_) => {}
     }
@@ -492,6 +603,13 @@ context_length = 32768
 max_batch_size = 15
 tokens_per_minute = 1000000
 
+[reranker]
+url = "https://api.deepinfra.com/v1"
+model = "Qwen/Qwen3-Reranker-0.6B"
+dialect = "deepinfra"
+timeout_seconds = 10
+# instruction = ""
+
 [chunking]
 max_chunk_size = 1500
 overlap = 0.2
@@ -518,12 +636,22 @@ issue_regex = "(#\\d+)"
 [search]
 limit = 10
 hybrid_weight = 0.6
+# path_prefixes = ["src/"]
+# file_exts = ["rs"]
+# decompose = false
+rerank = true
+
+[prompt]
+# tokenizer = "" # defaults to embedding tokenizer
 "#;
 
 const DEFAULT_SECRETS_TOML: &str = r#"# Secrets for context
 # You can also set EMBEDDER_API_KEY in your environment instead.
 
 [embedding]
+# api_key = "sk-..."
+
+[reranker]
 # api_key = "sk-..."
 "#;
 
@@ -895,6 +1023,14 @@ mod tests {
                 max_batch_size: 4,
                 tokens_per_minute: 0,
             },
+            reranker: Reranker {
+                url: "http://localhost".to_string(),
+                api_key: None,
+                model: "model".to_string(),
+                dialect: "openai".to_string(),
+                timeout_seconds: 10,
+                instruction: None,
+            },
             chunking: Chunking {
                 max_chunk_size: 10,
                 overlap: 1.5,
@@ -915,6 +1051,13 @@ mod tests {
             search: SearchOptions {
                 limit: 1,
                 hybrid_weight: 0.6,
+                path_prefixes: Vec::new(),
+                file_exts: Vec::new(),
+                decompose: false,
+                rerank: false,
+            },
+            prompt: Prompting {
+                tokenizer: String::new(),
             },
         };
 
@@ -974,6 +1117,14 @@ mod tests {
                 max_batch_size: 4,
                 tokens_per_minute: 0,
             },
+            reranker: Reranker {
+                url: "http://localhost".to_string(),
+                api_key: None,
+                model: "model".to_string(),
+                dialect: "openai".to_string(),
+                timeout_seconds: 10,
+                instruction: None,
+            },
             chunking: Chunking {
                 max_chunk_size: 10,
                 overlap: 0.2,
@@ -994,6 +1145,13 @@ mod tests {
             search: SearchOptions {
                 limit: 1,
                 hybrid_weight: 0.6,
+                path_prefixes: Vec::new(),
+                file_exts: Vec::new(),
+                decompose: false,
+                rerank: false,
+            },
+            prompt: Prompting {
+                tokenizer: String::new(),
             },
         };
 

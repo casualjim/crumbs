@@ -2,9 +2,11 @@
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
+use text_chunking::Tokenizer;
 
 use super::{Arena, AssemblyContext, Handle};
 use crate::config::AppConfig;
+use crate::search::SearchConfig;
 
 /// Input query for assembly.
 pub struct QueryInput {
@@ -161,8 +163,7 @@ where
 
 /// Default stage: retrieve candidates using embedding/FTS search.
 pub struct DefaultRetrieve {
-    pub limit: usize,
-    pub hybrid_weight: f32,
+    pub config: SearchConfig,
 }
 
 #[async_trait(?Send)]
@@ -180,9 +181,9 @@ impl RetrieveCandidates for DefaultRetrieve {
         let results = crate::search::search(
             ctx.db,
             embedder,
+            ctx.reranker,
             &query.text,
-            self.limit,
-            self.hybrid_weight,
+            self.config.clone(),
         )
         .await?;
         let chunks = results
@@ -290,6 +291,9 @@ impl RefineAst for DefaultRefineAst {
 pub struct DefaultBudgetAndMerge {
     pub max_blocks: usize,
     pub max_bytes: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub reserved_output_tokens: usize,
+    pub tokenizer: Option<Tokenizer>,
 }
 
 #[async_trait(?Send)]
@@ -301,20 +305,48 @@ impl BudgetAndMerge for DefaultBudgetAndMerge {
         input: Handle<AstBlocks>,
     ) -> Result<Handle<BudgetedBlocks>> {
         let blocks = arena.get(input);
+        let mut ordered = blocks.blocks.clone();
+        ordered.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.start_byte.cmp(&b.start_byte))
+        });
+
+        let token_counter = if let Some(tokenizer) = &self.tokenizer {
+            Some(TokenCounter::new(tokenizer.clone())?)
+        } else {
+            None
+        };
+        let token_budget = self
+            .max_tokens
+            .map(|limit| limit.saturating_sub(self.reserved_output_tokens));
         let mut seen = std::collections::HashSet::new();
         let mut limited = Vec::new();
         let mut bytes = 0usize;
+        let mut tokens = 0usize;
 
-        for block in &blocks.blocks {
+        for block in &ordered {
             let key = (block.file_path.clone(), block.start_byte, block.end_byte);
             if !seen.insert(key) {
                 continue;
+            }
+            if let Some(counter) = token_counter.as_ref() {
+                let block_tokens = counter.count(&block.text)?;
+                if let Some(max_tokens) = token_budget {
+                    if tokens + block_tokens > max_tokens {
+                        continue;
+                    }
+                }
+                tokens += block_tokens;
             }
             let next_bytes = bytes + block.text.len();
             if let Some(max) = self.max_bytes
                 && next_bytes > max
             {
-                break;
+                continue;
             }
             limited.push(block.clone());
             bytes = next_bytes;
@@ -347,6 +379,7 @@ impl AssembleContext for DefaultAssembleContext {
 
 pub fn default_pipeline(
     config: &AppConfig,
+    budget: BudgetOptions,
 ) -> AssemblyPipeline<
     DefaultRetrieve,
     DefaultExpandGraph,
@@ -354,11 +387,13 @@ pub fn default_pipeline(
     DefaultBudgetAndMerge,
     DefaultAssembleContext,
 > {
+    let mut search_config = SearchConfig::new(config.search.limit, config.search.hybrid_weight);
+    search_config.path_prefixes = config.search.path_prefixes.clone();
+    search_config.file_exts = config.search.file_exts.clone();
+    search_config.decompose = config.search.decompose;
+    search_config.rerank = config.search.rerank;
     AssemblyPipeline::new(
-        DefaultRetrieve {
-            limit: config.search.limit,
-            hybrid_weight: config.search.hybrid_weight,
-        },
+        DefaultRetrieve { config: search_config },
         DefaultExpandGraph {
             max_expanded_files: config.search.limit,
         },
@@ -366,7 +401,50 @@ pub fn default_pipeline(
         DefaultBudgetAndMerge {
             max_blocks: config.search.limit,
             max_bytes: None,
+            max_tokens: budget.max_tokens,
+            reserved_output_tokens: budget.reserved_output_tokens,
+            tokenizer: budget.tokenizer,
         },
         DefaultAssembleContext,
     )
+}
+
+pub struct BudgetOptions {
+    pub max_tokens: Option<usize>,
+    pub reserved_output_tokens: usize,
+    pub tokenizer: Option<Tokenizer>,
+}
+
+struct TokenCounter {
+    tokenizer: Tokenizer,
+}
+
+impl TokenCounter {
+    fn new(tokenizer: Tokenizer) -> Result<Self> {
+        let tokenizer = tokenizer
+            .preload()
+            .map_err(|err| eyre!("tokenizer preload failed: {err}"))?;
+        Ok(Self { tokenizer })
+    }
+
+    fn count(&self, text: &str) -> Result<usize> {
+        match &self.tokenizer {
+            Tokenizer::Characters => Ok(text.chars().count()),
+            Tokenizer::PreloadedTiktoken(bpe) => Ok(bpe.encode_ordinary(text).len()),
+            Tokenizer::PreloadedHuggingFace(tokenizer) => tokenizer
+                .encode(text, false)
+                .map(|encoding| encoding.len())
+                .map_err(|err| eyre!("tokenizer encode failed: {err}")),
+            Tokenizer::Tiktoken(_) | Tokenizer::HuggingFace(_) => {
+                Err(eyre!("tokenizer must be preloaded before counting tokens"))
+            }
+        }
+    }
+}
+
+fn source_rank(source: CandidateSource) -> u8 {
+    match source {
+        CandidateSource::Primary => 0,
+        CandidateSource::Expanded => 1,
+    }
 }

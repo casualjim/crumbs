@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use eyre::Result;
 
-use crate::db::{ChunkRecord, FtsRow, GraphData, SearchRow};
+use crate::db::{ChunkRecord, FtsRow, GraphData, SearchRow, SymbolRecord};
 
 pub trait Repository {
     fn load_existing_hashes(&self) -> Result<BTreeMap<PathBuf, [u8; 32]>>;
@@ -41,4 +41,10 @@ pub trait Repository {
         file_paths: &[String],
         limit_per_file: usize,
     ) -> Result<Vec<SearchRow>>;
+    fn symbols_in_range(
+        &self,
+        file_path: &str,
+        start_byte: i64,
+        end_byte: i64,
+    ) -> Result<Vec<SymbolRecord>>;
 }

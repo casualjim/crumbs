@@ -55,6 +55,26 @@ Optional: assemble prompt-ready context:
 context prompt "refactor the search pipeline"
 ```
 
+Optional: choose Markdown output for readability:
+```
+context prompt --format markdown "refactor the search pipeline"
+```
+
+Optional: set prompt token budgets:
+```
+context prompt --max-tokens 400000 --reserved-output-tokens 4000 "refactor the search pipeline"
+```
+
+Optional: use a separate tokenizer for prompt budgeting:
+```
+context prompt --prompt-tokenizer tiktoken:o200k_base "refactor the search pipeline"
+```
+
+Optional: retrieval tweaks (filters, decomposition, rerank):
+```
+context prompt --path-prefix src/ --file-ext rs --decompose --rerank "refactor the search pipeline"
+```
+
 ## Configuration
 
 Config is loaded in this order (later files override earlier):
@@ -84,6 +104,12 @@ embedding_dim = 1024
 context_length = 32768
 max_batch_size = 15
 tokens_per_minute = 1000000
+
+[reranker]
+url = "https://api.deepinfra.com/v1"
+model = "Qwen/Qwen3-Reranker-0.6B"
+dialect = "deepinfra"
+timeout_seconds = 10
 
 [chunking]
 max_chunk_size = 1500

@@ -4,6 +4,7 @@ mod db;
 mod embedding;
 mod graph;
 mod indexer;
+mod reranker;
 mod repository;
 mod search;
 #[cfg(test)]
@@ -19,6 +20,7 @@ use crate::config::{Cli, Command};
 use crate::db::Db;
 use crate::embedding::{Client as EmbedClient, EmbedderConfig, ProviderDialect};
 use crate::indexer::{Indexer, IndexerConfig};
+use crate::reranker::{Client as RerankerClient, RerankerConfig, RerankingProvider};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -69,17 +71,25 @@ async fn main() -> Result<()> {
         Command::Search(cmd) => {
             let cfg = config::load_config(&cli)?;
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-            let embedder = build_embedder(&cfg.embedding, tokenizer)?;
+            let embedder = build_embedder(&cfg.embedding, tokenizer.clone())?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
-            let results = search::search(
-                &db,
-                &embedder,
-                &cmd.query,
-                cfg.search.limit,
-                cfg.search.hybrid_weight,
-            )
-            .await?;
+            let reranker = if cfg.search.rerank {
+                Some(build_reranker(&cfg)?)
+            } else {
+                None
+            };
+            let reranker_ref = reranker
+                .as_ref()
+                .map(|client| client as &dyn RerankingProvider);
+            let mut search_config =
+                search::SearchConfig::new(cfg.search.limit, cfg.search.hybrid_weight);
+            search_config.path_prefixes = cfg.search.path_prefixes.clone();
+            search_config.file_exts = cfg.search.file_exts.clone();
+            search_config.decompose = cfg.search.decompose;
+            search_config.rerank = cfg.search.rerank;
+            let results =
+                search::search(&db, &embedder, reranker_ref, &cmd.query, search_config).await?;
             for (idx, result) in results.iter().enumerate() {
                 let mut score_line = format!("score={:.4}", result.score);
                 if let Some(vector) = result.vector_score {
@@ -102,17 +112,46 @@ async fn main() -> Result<()> {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-            let embedder = build_embedder(&cfg.embedding, tokenizer)?;
+            let embedder = build_embedder(&cfg.embedding, tokenizer.clone())?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
+            let reranker = if cfg.search.rerank {
+                Some(build_reranker(&cfg)?)
+            } else {
+                None
+            };
 
             let ctx = assembly::AssemblyContext {
                 repo_path: &project.repo_path,
                 db: &db,
                 embedder: Some(&embedder),
+                reranker: reranker
+                    .as_ref()
+                    .map(|client| client as &dyn RerankingProvider),
                 config: &cfg,
             };
 
-            let pipeline = assembly::pipeline::default_pipeline(&cfg);
+            let max_tokens = if cmd.max_tokens == 0 {
+                Some(cfg.embedding.context_length)
+            } else {
+                Some(cmd.max_tokens)
+            };
+            let prompt_tokenizer_value = cmd
+                .prompt
+                .tokenizer
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| cfg.prompt.tokenizer.clone());
+            let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
+                tokenizer.clone()
+            } else {
+                parse_tokenizer(&prompt_tokenizer_value)?
+            };
+            let budget = assembly::pipeline::BudgetOptions {
+                max_tokens,
+                reserved_output_tokens: cmd.reserved_output_tokens,
+                tokenizer: Some(prompt_tokenizer),
+            };
+            let pipeline = assembly::pipeline::default_pipeline(&cfg, budget);
             let mut arena = assembly::Arena::new();
             let input = arena.insert(assembly::pipeline::QueryInput {
                 text: cmd.task.clone(),
@@ -120,20 +159,29 @@ async fn main() -> Result<()> {
             let handle = pipeline.run(&ctx, &mut arena, input).await?;
             let assembled = arena.get(handle);
 
-            println!("<context>");
-            for block in &assembled.blocks {
-                let source = match block.source {
-                    assembly::pipeline::CandidateSource::Primary => "primary",
-                    assembly::pipeline::CandidateSource::Expanded => "expanded",
-                };
-                println!(
-                    "<file path=\"{}\" start_byte=\"{}\" end_byte=\"{}\" source=\"{}\">",
-                    block.file_path, block.start_byte, block.end_byte, source
-                );
-                println!("{}", block.text);
-                println!("</file>");
-            }
-            println!("</context>");
+            let enriched = assembly::output::enrich_blocks(
+                &project.repo_path,
+                &db,
+                &assembled.blocks,
+            )
+            .await?;
+            let repo_name = project
+                .repo_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repo")
+                .to_string();
+            let payload = assembly::output::PromptPayload {
+                repo_name,
+                task: cmd.task.clone(),
+                blocks: enriched,
+            };
+            let format = match cmd.format {
+                config::PromptFormat::Xml => assembly::output::PromptFormat::Xml,
+                config::PromptFormat::Markdown => assembly::output::PromptFormat::Markdown,
+            };
+            let rendered = assembly::output::render_prompt(format, &payload);
+            print!("{rendered}");
         }
         Command::Config(cmd) => match &cmd.command {
             config::ConfigCommand::Show => {
@@ -193,6 +241,23 @@ pub(crate) fn build_embedder(cfg: &config::Embedding, tokenizer: Tokenizer) -> R
     };
 
     EmbedClient::new(config).map_err(|err| eyre!(err))
+}
+
+pub(crate) fn build_reranker(cfg: &config::AppConfig) -> Result<RerankerClient> {
+    let dialect = parse_dialect(cfg.reranker.dialect.as_str())?;
+    let config = RerankerConfig {
+        api_key: cfg
+            .reranker
+            .api_key
+            .clone()
+            .or_else(|| cfg.embedding.api_key.clone()),
+        base_url: cfg.reranker.url.clone(),
+        timeout: Duration::from_secs(cfg.reranker.timeout_seconds),
+        dialect,
+        model: cfg.reranker.model.clone(),
+        instruction: cfg.reranker.instruction.clone(),
+    };
+    RerankerClient::new(config).map_err(|err| eyre!(err))
 }
 
 fn parse_dialect(value: &str) -> Result<ProviderDialect> {
