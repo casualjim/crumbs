@@ -6,3 +6,8 @@ context.duckdb-wal
 context.duckdb-shm
 secrets.toml
 !.gitignore
+context.db
+context.db.wal
+context.db.shm
+context.db-wal
+context.db-shm

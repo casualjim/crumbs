@@ -130,7 +130,7 @@ issue_regex = "(#\\d+)"
 [projects.example]
 repo = "/path/to/repo"
 # data_dir = "/path/to/data"
-# database = "context.duckdb"
+# database = "context.db"
 
 [search]
 limit = 10

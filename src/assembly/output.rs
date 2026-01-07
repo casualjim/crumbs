@@ -531,7 +531,7 @@ mod tests {
         std::fs::write(&file_a, "fn call_foo() { foo(); }\n")?;
         std::fs::write(&file_b, "fn foo() {}\n")?;
 
-        let db_path = repo_root.join("context.duckdb");
+        let db_path = repo_root.join("context.db");
         let db = Db::open(&db_path, Some(3))?;
 
         let b_path = file_b.to_string_lossy().to_string();
@@ -549,7 +549,7 @@ mod tests {
             references: Vec::new(),
             resolutions: Vec::new(),
         };
-        db.replace_file_graph(&b_path, b_size, [0u8; 32], "rust", None, graph_b)?;
+        db.upsert_file_graph(&b_path, b_size, [0u8; 32], "rust", None, graph_b)?;
 
         let a_path = file_a.to_string_lossy().to_string();
         let a_size = std::fs::metadata(&file_a)?.len();
@@ -565,14 +565,14 @@ mod tests {
             }],
             resolutions: Vec::new(),
         };
-        db.replace_file_graph(&a_path, a_size, [1u8; 32], "rust", None, graph_a)?;
+        db.upsert_file_graph(&a_path, a_size, [1u8; 32], "rust", None, graph_a)?;
 
         let mut commit_edges = Vec::new();
         for i in 0..12 {
             commit_edges.push((a_path.clone(), format!("c{i}")));
         }
         let cochange_edges = vec![(a_path.clone(), b_path.clone(), 3, 0.5)];
-        db.replace_history_edges(&commit_edges, &cochange_edges)?;
+        db.upsert_history_edges(&commit_edges, &cochange_edges)?;
 
         match db.file_dependency_pagerank(1) {
             Ok(ranks) => {

@@ -60,7 +60,6 @@ pub(crate) fn load_test_embedder() -> Result<(crate::embedding::Client, usize)> 
         ));
     }
 
-    let tokenizer = crate::parse_tokenizer(&cfg.embedding.tokenizer)?;
-    let embedder = crate::build_embedder(&cfg.embedding, tokenizer)?;
+    let embedder = crate::build_embedder(&cfg.embedding)?;
     Ok((embedder, cfg.embedding.embedding_dim))
 }

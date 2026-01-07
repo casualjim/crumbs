@@ -6,11 +6,13 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
+blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 confique = { version = "0.4.0", features = ["toml", "json5", "yaml"] }
 cupido = "0.3.5"
 dirs = "6"
-duckdb = "1"
+rusqlite = { package = "libsql-rusqlite", version = "0.33.0" }
+dashmap = "6"
 eyre = "0.6"
 futures = "0.3"
 http = "1"
@@ -24,6 +26,7 @@ text-chunking = { version = "0.1.6", registry = "forgejo" }
 tiktoken-rs = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
+tokio-util = "0.7"
 toml_edit = "0.22"
 tokenizers = { version = "0.22.1", default-features = false, features = ["esaxx_fast", "http", "onig"] }
 tracing = "0.1"

@@ -5,7 +5,6 @@ use eyre::Result;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use text_chunking::Tokenizer as ChunkTokenizer;
 use tracing::debug;
 
 use crate::reqwestx::api_client::{ApiClient, ApiClientConfig};
@@ -33,7 +32,6 @@ pub struct EmbedderConfig {
     pub timeout: Duration,
     pub dialect: ProviderDialect,
     pub model: String,
-    pub tokenizer: ChunkTokenizer,
     pub embedding_dim: usize,
     pub requests_per_minute: usize,
     pub max_concurrent_requests: usize,
@@ -170,7 +168,6 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 dialect: ProviderDialect::OpenAI,
                 model: "test-model".to_string(),
-                tokenizer: ChunkTokenizer::Characters,
                 embedding_dim: 2,
                 requests_per_minute: 1000,
                 max_concurrent_requests: 300,

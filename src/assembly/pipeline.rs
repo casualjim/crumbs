@@ -409,6 +409,7 @@ pub fn default_pipeline(
     search_config.file_exts = config.search.file_exts.clone();
     search_config.decompose = config.search.decompose;
     search_config.rerank = config.search.rerank;
+    search_config.rerank_min_score = config.search.rerank_min_score;
     AssemblyPipeline::new(
         DefaultRetrieve { config: search_config },
         DefaultExpandGraph {

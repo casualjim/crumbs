@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::db::ChunkRecord;
 
 pub(crate) struct PendingFile {
     pub(crate) file_size: u64,
     pub(crate) chunks: Vec<ChunkRecord>,
+    pub(crate) chunk_index: HashMap<String, usize>,
+    pub(crate) pending_embeddings: HashSet<String>,
+    pub(crate) file_row_ensured: bool,
 }
 
 impl PendingFile {
@@ -12,6 +15,9 @@ impl PendingFile {
         Self {
             file_size,
             chunks: Vec::new(),
+            chunk_index: HashMap::new(),
+            pending_embeddings: HashSet::new(),
+            file_row_ensured: false,
         }
     }
 }
@@ -24,7 +30,6 @@ pub(crate) struct PendingEof {
 pub(crate) struct IndexerState {
     pub(crate) pending: HashMap<String, PendingFile>,
     pub(crate) pending_eof: HashMap<String, PendingEof>,
-    pub(crate) embeddings: HashMap<String, Vec<f32>>,
 }
 
 impl IndexerState {
@@ -32,7 +37,6 @@ impl IndexerState {
         Self {
             pending: HashMap::new(),
             pending_eof: HashMap::new(),
-            embeddings: HashMap::new(),
         }
     }
 }

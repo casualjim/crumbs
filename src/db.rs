@@ -1,10 +1,9 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use duckdb::types::Value;
-use duckdb::{Connection, OptionalExt, params, params_from_iter};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use eyre::{Result, eyre};
-use tracing::warn;
 
 use crate::repository::Repository;
 
@@ -12,7 +11,6 @@ pub struct Db {
     conn: Connection,
     embedding_dim: usize,
     vss_loaded: bool,
-    duckpgq_loaded: bool,
     fts_loaded: bool,
 }
 
@@ -23,7 +21,6 @@ impl Db {
             conn,
             embedding_dim: 0,
             vss_loaded: false,
-            duckpgq_loaded: false,
             fts_loaded: false,
         };
         db.init(embedding_dim)?;
@@ -40,13 +37,15 @@ impl Db {
             .query_row(
                 "SELECT value FROM meta WHERE key = 'embedding_dim'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
             .optional()?;
 
         let resolved_dim = match (existing_dim, embedding_dim) {
             (Some(value), Some(requested)) => {
-                let parsed: usize = value.parse::<usize>().map_err(|err| eyre!(err))?;
+                let parsed: usize = value
+                    .parse::<usize>()
+                    .map_err(|err: std::num::ParseIntError| eyre!(err))?;
                 if parsed != requested {
                     return Err(eyre!(
                         "embedding dimension mismatch: db has {}, requested {}",
@@ -56,7 +55,9 @@ impl Db {
                 }
                 parsed
             }
-            (Some(value), None) => value.parse::<usize>().map_err(|err| eyre!(err))?,
+            (Some(value), None) => value
+                .parse::<usize>()
+                .map_err(|err: std::num::ParseIntError| eyre!(err))?,
             (None, Some(requested)) => {
                 self.conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('embedding_dim', ?)",
@@ -72,10 +73,8 @@ impl Db {
         };
 
         self.embedding_dim = resolved_dim;
-
-        self.duckpgq_loaded = load_optional_extension(&self.conn, "duckpgq", Some("community"))?;
-        self.vss_loaded = load_optional_extension(&self.conn, "vss", None)?;
-        self.fts_loaded = load_optional_extension(&self.conn, "fts", None)?;
+        self.vss_loaded = true;
+        self.fts_loaded = false;
 
         self.create_schema()?;
         Ok(())
@@ -88,7 +87,7 @@ impl Db {
           content_hash BLOB,
           size BIGINT,
           primary_language TEXT,
-          updated_at TIMESTAMP DEFAULT now()
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS file_commit_edges (
           file_path TEXT NOT NULL REFERENCES files(path),
@@ -119,8 +118,8 @@ impl Db {
           text TEXT NOT NULL,
           kind TEXT NOT NULL,
           ordinal INTEGER NOT NULL,
-          tokens INTEGER[],
-          embedding FLOAT[{dim}] NOT NULL
+          tokens BLOB,
+          embedding F32_BLOB({dim}) NOT NULL
         );
         CREATE TABLE IF NOT EXISTS file_chunk_edges (
           file_path TEXT NOT NULL REFERENCES files(path),
@@ -169,81 +168,73 @@ impl Db {
         CREATE INDEX IF NOT EXISTS file_dependency_edges_dst_idx ON file_dependency_edges (dst_path);
         CREATE INDEX IF NOT EXISTS file_chunk_edges_file_idx ON file_chunk_edges (file_path);
         CREATE INDEX IF NOT EXISTS symbols_file_path_idx ON symbols (file_path);
-        CREATE INDEX IF NOT EXISTS references_file_path_idx ON symbol_references (file_path);",
+        CREATE INDEX IF NOT EXISTS symbols_name_kind_idx ON symbols (name, kind);
+        CREATE INDEX IF NOT EXISTS symbols_name_file_idx ON symbols (name, file_path);
+        CREATE INDEX IF NOT EXISTS references_file_path_idx ON symbol_references (file_path);
+        CREATE INDEX IF NOT EXISTS references_name_idx ON symbol_references (name);
+        CREATE INDEX IF NOT EXISTS references_name_file_idx ON symbol_references (name, file_path);",
             dim = self.embedding_dim
         );
 
         self.conn.execute_batch(&create_sql)?;
-        self.ensure_chunk_tokens_column()?;
-
-        if self.vss_loaded {
-            let _ = self
-                .conn
-                .execute_batch("SET hnsw_enable_experimental_persistence=true;");
-            let _ = self.conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw \
-         ON chunks USING HNSW (embedding) WITH (metric='cosine');",
-            );
-        }
-
-        if self.duckpgq_loaded {
-            let graph_sql = "CREATE OR REPLACE PROPERTY GRAPH code_graph
-        VERTEX TABLES (files, chunks, symbols, symbol_references)
-        EDGE TABLES (
-          file_chunk_edges
-            SOURCE KEY (file_path) REFERENCES files (path)
-            DESTINATION KEY (chunk_id) REFERENCES chunks (id)
-            LABEL contains,
-          file_symbol_edges
-            SOURCE KEY (file_path) REFERENCES files (path)
-            DESTINATION KEY (symbol_id) REFERENCES symbols (id)
-            LABEL defines,
-          file_reference_edges
-            SOURCE KEY (file_path) REFERENCES files (path)
-            DESTINATION KEY (reference_id) REFERENCES symbol_references (id)
-            LABEL references,
-          reference_symbol_edges
-            SOURCE KEY (reference_id) REFERENCES symbol_references (id)
-            DESTINATION KEY (symbol_id) REFERENCES symbols (id)
-            LABEL resolves,
-          file_cochange_edges
-            SOURCE KEY (src_path) REFERENCES files (path)
-            DESTINATION KEY (dst_path) REFERENCES files (path)
-            LABEL cochanges,
-          file_dependency_edges
-            SOURCE KEY (src_path) REFERENCES files (path)
-            DESTINATION KEY (dst_path) REFERENCES files (path)
-            LABEL depends_on
-        );";
-            let _ = self.conn.execute_batch(graph_sql);
-        }
-
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS chunks_embedding_idx \
+             ON chunks(libsql_vector_idx(embedding));",
+        )?;
+        self.init_fts()?;
         Ok(())
     }
 
-    fn ensure_chunk_tokens_column(&self) -> Result<()> {
-        if self.column_exists("chunks", "tokens")? {
+    fn init_fts(&mut self) -> Result<()> {
+        let fts_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5( \
+          text, content='chunks', content_rowid='rowid' \
+        ); \
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN \
+          INSERT INTO fts_chunks(rowid, text) VALUES (new.rowid, new.text); \
+        END; \
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN \
+          INSERT INTO fts_chunks(fts_chunks, rowid, text) VALUES('delete', old.rowid, old.text); \
+        END; \
+        CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN \
+          INSERT INTO fts_chunks(fts_chunks, rowid, text) VALUES('delete', old.rowid, old.text); \
+          INSERT INTO fts_chunks(rowid, text) VALUES (new.rowid, new.text); \
+        END;";
+        if let Err(err) = self.conn.execute_batch(fts_sql) {
+            self.fts_loaded = false;
+            tracing::warn!("failed to initialize FTS: {err}");
             return Ok(());
         }
-        self.conn
-            .execute("ALTER TABLE chunks ADD COLUMN tokens INTEGER[]", [])?;
-        Ok(())
-    }
-
-    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
-        let pragma = format!("PRAGMA table_info('{table}')");
-        let mut stmt = self.conn.prepare(&pragma)?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(1)?;
-            if name == column {
-                return Ok(true);
-            }
+        if let Err(err) = self
+            .conn
+            .execute("INSERT INTO fts_chunks(fts_chunks) VALUES('rebuild')", [])
+        {
+            tracing::warn!("failed to rebuild FTS index: {err}");
         }
-        Ok(false)
+        self.fts_loaded = true;
+        Ok(())
     }
 
     fn clear_file_chunks(&self, file_path: &str) -> Result<()> {
+        self.delete_file_chunk_rows(file_path)
+    }
+
+    fn clear_file_graph(&self, file_path: &str) -> Result<()> {
+        self.delete_file_graph_rows(file_path)
+    }
+
+    fn clear_file_history(&self, file_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_commit_edges WHERE file_path = ?",
+            params![file_path],
+        )?;
+        self.conn.execute(
+            "DELETE FROM file_cochange_edges WHERE src_path = ? OR dst_path = ?",
+            params![file_path, file_path],
+        )?;
+        Ok(())
+    }
+
+    fn delete_file_chunk_rows(&self, file_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_chunk_edges WHERE file_path = ?",
             params![file_path],
@@ -253,7 +244,7 @@ impl Db {
         Ok(())
     }
 
-    fn clear_file_graph(&self, file_path: &str) -> Result<()> {
+    fn delete_file_graph_rows(&self, file_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM reference_symbol_edges WHERE symbol_id IN \
        (SELECT id FROM symbols WHERE file_path = ?)",
@@ -265,11 +256,21 @@ impl Db {
             params![file_path],
         )?;
         self.conn.execute(
+            "DELETE FROM file_reference_edges WHERE reference_id IN \
+       (SELECT id FROM symbol_references WHERE file_path = ?)",
+            params![file_path],
+        )?;
+        self.conn.execute(
             "DELETE FROM file_reference_edges WHERE file_path = ?",
             params![file_path],
         )?;
         self.conn.execute(
             "DELETE FROM symbol_references WHERE file_path = ?",
+            params![file_path],
+        )?;
+        self.conn.execute(
+            "DELETE FROM file_symbol_edges WHERE symbol_id IN \
+       (SELECT id FROM symbols WHERE file_path = ?)",
             params![file_path],
         )?;
         self.conn.execute(
@@ -287,18 +288,6 @@ impl Db {
         Ok(())
     }
 
-    fn clear_file_history(&self, file_path: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM file_commit_edges WHERE file_path = ?",
-            params![file_path],
-        )?;
-        self.conn.execute(
-            "DELETE FROM file_cochange_edges WHERE src_path = ? OR dst_path = ?",
-            params![file_path, file_path],
-        )?;
-        Ok(())
-    }
-
     fn upsert_file(
         &self,
         file_path: &str,
@@ -308,12 +297,16 @@ impl Db {
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO files (path, content_hash, size, primary_language, updated_at)
-       VALUES (?, ?, ?, ?, now())
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
        ON CONFLICT(path) DO UPDATE SET
          content_hash = excluded.content_hash,
          size = excluded.size,
          primary_language = excluded.primary_language,
-         updated_at = now()",
+         updated_at = CURRENT_TIMESTAMP
+       WHERE files.content_hash IS NULL
+          OR files.content_hash != excluded.content_hash
+          OR files.size != excluded.size
+          OR COALESCE(files.primary_language, '') != COALESCE(excluded.primary_language, '')",
             params![
                 file_path,
                 content_hash.to_vec(),
@@ -332,16 +325,19 @@ impl Db {
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO files (path, size, primary_language, updated_at)
-       VALUES (?, ?, ?, now())
+       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
        ON CONFLICT(path) DO UPDATE SET
          size = excluded.size,
          primary_language = excluded.primary_language,
-         updated_at = now()",
+         updated_at = CURRENT_TIMESTAMP
+       WHERE files.size != excluded.size
+          OR COALESCE(files.primary_language, '') != COALESCE(excluded.primary_language, '')",
             params![file_path, file_size as i64, primary_language],
         )?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn insert_chunk(&self, record: &ChunkRecord, embedding: &[f32]) -> Result<()> {
         self.ensure_file_exists(&record.file_path)?;
         if record.start_byte > record.end_byte {
@@ -359,39 +355,35 @@ impl Db {
             ));
         }
 
-        let array_value_sql = array_value_placeholder(self.embedding_dim);
-        let (tokens_sql, tokens_params_len) = match record
+        let tokens_blob = record
             .tokens
             .as_ref()
             .filter(|tokens| !tokens.is_empty())
-        {
-            Some(tokens) => (format!("{}::INTEGER[]", array_value_placeholder(tokens.len())), tokens.len()),
-            None => ("NULL".to_string(), 0),
-        };
+            .map(|tokens| encode_u32_blob(tokens));
+        let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
+        let embedding_json = encode_f32_json(embedding);
         let sql = format!(
             "INSERT INTO chunks \
       (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, {array}::FLOAT[{dim}])",
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?))",
             tokens_sql = tokens_sql,
-            array = array_value_sql,
-            dim = self.embedding_dim
         );
 
-        let mut params_vec = Vec::with_capacity(10 + tokens_params_len + embedding.len());
+        let mut params_vec = Vec::with_capacity(12);
         params_vec.push(Value::Text(record.id.clone()));
         params_vec.push(Value::Text(record.file_path.clone()));
-        params_vec.push(Value::BigInt(record.start_byte as i64));
-        params_vec.push(Value::BigInt(record.end_byte as i64));
+        params_vec.push(Value::Integer(record.start_byte as i64));
+        params_vec.push(Value::Integer(record.end_byte as i64));
         params_vec.push(Value::Blob(record.chunk_hash.to_vec()));
-        params_vec.push(Value::BigInt(record.start_line as i64));
-        params_vec.push(Value::BigInt(record.end_line as i64));
+        params_vec.push(Value::Integer(record.start_line as i64));
+        params_vec.push(Value::Integer(record.end_line as i64));
         params_vec.push(Value::Text(record.text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
-        params_vec.push(Value::Int(record.ordinal as i32));
-        if let Some(tokens) = record.tokens.as_ref().filter(|tokens| !tokens.is_empty()) {
-            params_vec.extend(tokens.iter().map(|token| Value::Int(*token as i32)));
+        params_vec.push(Value::Integer(record.ordinal as i64));
+        if let Some(tokens_blob) = tokens_blob {
+            params_vec.push(Value::Blob(tokens_blob));
         }
-        params_vec.extend(embedding.iter().copied().map(Value::Float));
+        params_vec.push(Value::Text(embedding_json));
 
         let mut stmt = self.conn.prepare(&sql)?;
         stmt.execute(params_from_iter(params_vec))?;
@@ -401,6 +393,230 @@ impl Db {
             params![record.file_path, record.id, record.ordinal as i32],
         )?;
 
+        Ok(())
+    }
+
+    fn upsert_chunk_with_embedding(&self, record: &ChunkRecord, embedding: &[f32]) -> Result<()> {
+        self.ensure_file_exists(&record.file_path)?;
+        if record.start_byte > record.end_byte {
+            return Err(eyre!(
+                "chunk byte range invalid: start {} > end {}",
+                record.start_byte,
+                record.end_byte
+            ));
+        }
+        if embedding.len() != self.embedding_dim {
+            return Err(eyre!(
+                "embedding dimension mismatch: expected {}, got {}",
+                self.embedding_dim,
+                embedding.len()
+            ));
+        }
+
+        let tokens_blob = record
+            .tokens
+            .as_ref()
+            .filter(|tokens| !tokens.is_empty())
+            .map(|tokens| encode_u32_blob(tokens));
+        let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
+        let embedding_json = encode_f32_json(embedding);
+        let sql = format!(
+            "INSERT INTO chunks \
+      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?)) \
+      ON CONFLICT(id) DO UPDATE SET \
+        file_path = excluded.file_path, \
+        start_byte = excluded.start_byte, \
+        end_byte = excluded.end_byte, \
+        chunk_hash = excluded.chunk_hash, \
+        start_line = excluded.start_line, \
+        end_line = excluded.end_line, \
+        text = excluded.text, \
+        kind = excluded.kind, \
+        ordinal = excluded.ordinal, \
+        tokens = excluded.tokens, \
+        embedding = excluded.embedding",
+            tokens_sql = tokens_sql,
+        );
+
+        let mut params_vec = Vec::with_capacity(12);
+        params_vec.push(Value::Text(record.id.clone()));
+        params_vec.push(Value::Text(record.file_path.clone()));
+        params_vec.push(Value::Integer(record.start_byte as i64));
+        params_vec.push(Value::Integer(record.end_byte as i64));
+        params_vec.push(Value::Blob(record.chunk_hash.to_vec()));
+        params_vec.push(Value::Integer(record.start_line as i64));
+        params_vec.push(Value::Integer(record.end_line as i64));
+        params_vec.push(Value::Text(record.text.clone()));
+        params_vec.push(Value::Text(record.kind.clone()));
+        params_vec.push(Value::Integer(record.ordinal as i64));
+        if let Some(tokens_blob) = tokens_blob {
+            params_vec.push(Value::Blob(tokens_blob));
+        }
+        params_vec.push(Value::Text(embedding_json));
+
+        self.with_transaction(|db| {
+            let mut stmt = db.conn.prepare(&sql)?;
+            stmt.execute(params_from_iter(params_vec))?;
+
+            db.conn.execute(
+                "INSERT INTO file_chunk_edges (file_path, chunk_id, ordinal) VALUES (?, ?, ?) \
+                 ON CONFLICT(file_path, chunk_id) DO UPDATE SET ordinal = excluded.ordinal",
+                params![record.file_path, record.id, record.ordinal as i32],
+            )?;
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    fn upsert_chunks_with_embeddings(
+        &self,
+        records: &[ChunkRecord],
+        embeddings: &[Vec<f32>],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if records.len() != embeddings.len() {
+            return Err(eyre!(
+                "embedding count mismatch: {} records, {} embeddings",
+                records.len(),
+                embeddings.len()
+            ));
+        }
+
+        let mut values_sql = Vec::with_capacity(records.len());
+        let mut values_edges = Vec::with_capacity(records.len());
+        let mut params_vec = Vec::new();
+        let mut params_edges = Vec::with_capacity(records.len() * 3);
+        for (record, embedding) in records.iter().zip(embeddings.iter()) {
+            self.ensure_file_exists(&record.file_path)?;
+            if record.start_byte > record.end_byte {
+                return Err(eyre!(
+                    "chunk byte range invalid: start {} > end {}",
+                    record.start_byte,
+                    record.end_byte
+                ));
+            }
+            if embedding.len() != self.embedding_dim {
+                return Err(eyre!(
+                    "embedding dimension mismatch: expected {}, got {}",
+                    self.embedding_dim,
+                    embedding.len()
+                ));
+            }
+
+            let tokens_blob = record
+                .tokens
+                .as_ref()
+                .filter(|tokens| !tokens.is_empty())
+                .map(|tokens| encode_u32_blob(tokens));
+            let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
+            let embed_sql = "vector32(?)";
+
+            values_sql.push(format!(
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, {embed_sql})",
+                tokens_sql = tokens_sql,
+                embed_sql = embed_sql
+            ));
+            values_edges.push("(?, ?, ?)".to_string());
+
+            params_vec.push(Value::Text(record.id.clone()));
+            params_vec.push(Value::Text(record.file_path.clone()));
+            params_vec.push(Value::Integer(record.start_byte as i64));
+            params_vec.push(Value::Integer(record.end_byte as i64));
+            params_vec.push(Value::Blob(record.chunk_hash.to_vec()));
+            params_vec.push(Value::Integer(record.start_line as i64));
+            params_vec.push(Value::Integer(record.end_line as i64));
+            params_vec.push(Value::Text(record.text.clone()));
+            params_vec.push(Value::Text(record.kind.clone()));
+            params_vec.push(Value::Integer(record.ordinal as i64));
+            if let Some(tokens_blob) = tokens_blob {
+                params_vec.push(Value::Blob(tokens_blob));
+            }
+            params_vec.push(Value::Text(encode_f32_json(embedding)));
+
+            params_edges.push(Value::Text(record.file_path.clone()));
+            params_edges.push(Value::Text(record.id.clone()));
+            params_edges.push(Value::Integer(record.ordinal as i64));
+        }
+
+        let sql = format!(
+            "INSERT INTO chunks (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
+             VALUES {values} \
+             ON CONFLICT(id) DO UPDATE SET \
+               file_path = excluded.file_path, \
+               start_byte = excluded.start_byte, \
+               end_byte = excluded.end_byte, \
+               chunk_hash = excluded.chunk_hash, \
+               start_line = excluded.start_line, \
+               end_line = excluded.end_line, \
+               text = excluded.text, \
+               kind = excluded.kind, \
+               ordinal = excluded.ordinal, \
+               tokens = excluded.tokens, \
+               embedding = excluded.embedding",
+            values = values_sql.join(", ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        stmt.execute(params_from_iter(params_vec))?;
+        let edges_sql = format!(
+            "INSERT OR REPLACE INTO file_chunk_edges (file_path, chunk_id, ordinal) \
+             VALUES {values}",
+            values = values_edges.join(", ")
+        );
+        let mut edges_stmt = self.conn.prepare(&edges_sql)?;
+        edges_stmt.execute(params_from_iter(params_edges))?;
+        Ok(())
+    }
+
+    fn update_chunk_without_embedding(&self, record: &ChunkRecord) -> Result<()> {
+        self.ensure_file_exists(&record.file_path)?;
+        let tokens_blob = record
+            .tokens
+            .as_ref()
+            .filter(|tokens| !tokens.is_empty())
+            .map(|tokens| encode_u32_blob(tokens));
+        let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
+        let sql = format!(
+            "UPDATE chunks SET \
+           file_path = ?, start_byte = ?, end_byte = ?, chunk_hash = ?, start_line = ?, end_line = ?, \
+           text = ?, kind = ?, ordinal = ?, tokens = {tokens_sql} \
+           WHERE id = ?",
+            tokens_sql = tokens_sql
+        );
+        let mut params_vec = Vec::with_capacity(11);
+        params_vec.push(Value::Text(record.file_path.clone()));
+        params_vec.push(Value::Integer(record.start_byte as i64));
+        params_vec.push(Value::Integer(record.end_byte as i64));
+        params_vec.push(Value::Blob(record.chunk_hash.to_vec()));
+        params_vec.push(Value::Integer(record.start_line as i64));
+        params_vec.push(Value::Integer(record.end_line as i64));
+        params_vec.push(Value::Text(record.text.clone()));
+        params_vec.push(Value::Text(record.kind.clone()));
+        params_vec.push(Value::Integer(record.ordinal as i64));
+        if let Some(tokens_blob) = tokens_blob {
+            params_vec.push(Value::Blob(tokens_blob));
+        }
+        params_vec.push(Value::Text(record.id.clone()));
+        self.conn.execute(
+            "DELETE FROM file_chunk_edges WHERE chunk_id = ?",
+            params![record.id],
+        )?;
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let updated = stmt.execute(params_from_iter(params_vec))?;
+        if updated == 0 {
+            return Err(eyre!("missing existing chunk {}", record.id));
+        }
+
+        self.conn.execute(
+            "INSERT INTO file_chunk_edges (file_path, chunk_id, ordinal) VALUES (?, ?, ?) \
+             ON CONFLICT(file_path, chunk_id) DO UPDATE SET ordinal = excluded.ordinal",
+            params![record.file_path, record.id, record.ordinal as i32],
+        )?;
         Ok(())
     }
 
@@ -448,8 +664,6 @@ impl Db {
     }
 
     fn link_reference_symbol(&self, reference_id: &str, symbol_id: &str) -> Result<()> {
-        self.ensure_reference_exists(reference_id)?;
-        self.ensure_symbol_exists(symbol_id)?;
         self.conn.execute(
             "INSERT INTO reference_symbol_edges (reference_id, symbol_id) VALUES (?, ?)",
             params![reference_id, symbol_id],
@@ -463,41 +677,11 @@ impl Db {
             .query_row(
                 "SELECT 1 FROM files WHERE path = ?",
                 params![file_path],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
             .optional()?;
         if exists.is_none() {
             return Err(eyre!("file not found: {}", file_path));
-        }
-        Ok(())
-    }
-
-    fn ensure_reference_exists(&self, reference_id: &str) -> Result<()> {
-        let exists: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM symbol_references WHERE id = ?",
-                params![reference_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(eyre!("reference not found: {}", reference_id));
-        }
-        Ok(())
-    }
-
-    fn ensure_symbol_exists(&self, symbol_id: &str) -> Result<()> {
-        let exists: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM symbols WHERE id = ?",
-                params![symbol_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(eyre!("symbol not found: {}", symbol_id));
         }
         Ok(())
     }
@@ -512,7 +696,7 @@ impl Db {
             Ok(value) => {
                 if let Err(err) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(err.into());
+                    return Err(eyre!(err));
                 }
                 Ok(value)
             }
@@ -523,40 +707,9 @@ impl Db {
         }
     }
 
-    fn persist_graph(&self, file_path: &str, language: &str, graph: GraphData) -> Result<()> {
-        let mut symbols_by_name: HashMap<String, Vec<String>> = HashMap::new();
-
-        for mut symbol in graph.symbols {
-            symbol.file_path = file_path.to_string();
-            symbol.language = language.to_string();
-            symbols_by_name
-                .entry(symbol.name.clone())
-                .or_default()
-                .push(symbol.id.clone());
-            self.insert_symbol(&symbol)?;
-        }
-
-        for mut reference in graph.references {
-            reference.file_path = file_path.to_string();
-            reference.language = language.to_string();
-            self.insert_reference(&reference)?;
-
-            if let Some(symbol_ids) = symbols_by_name.get(&reference.name)
-                && symbol_ids.len() == 1
-            {
-                let symbol_id = &symbol_ids[0];
-                self.link_reference_symbol(&reference.id, symbol_id)?;
-            }
-        }
-
-        for (reference_id, symbol_id) in graph.resolutions {
-            self.link_reference_symbol(&reference_id, &symbol_id)?;
-        }
-
-        Ok(())
-    }
 }
 
+#[derive(Clone)]
 pub struct ChunkRecord {
     pub id: String,
     pub file_path: String,
@@ -571,6 +724,7 @@ pub struct ChunkRecord {
     pub tokens: Option<Vec<u32>>,
 }
 
+#[derive(Clone)]
 pub struct SymbolRecord {
     pub id: String,
     pub file_path: String,
@@ -581,6 +735,7 @@ pub struct SymbolRecord {
     pub language: String,
 }
 
+#[derive(Clone)]
 pub struct ReferenceRecord {
     pub id: String,
     pub file_path: String,
@@ -590,6 +745,7 @@ pub struct ReferenceRecord {
     pub language: String,
 }
 
+#[derive(Clone)]
 pub struct GraphData {
     pub symbols: Vec<SymbolRecord>,
     pub references: Vec<ReferenceRecord>,
@@ -625,22 +781,28 @@ fn array_value_placeholder(count: usize) -> String {
     if vars.is_empty() {
         vars.push('?');
     }
-    format!("array_value({vars})")
+    vars
 }
 
-fn load_optional_extension(conn: &Connection, name: &str, from: Option<&str>) -> Result<bool> {
-    if conn.execute_batch(&format!("LOAD {name};")).is_ok() {
-        return Ok(true);
+fn encode_u32_blob(tokens: &[u32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(tokens.len() * 4);
+    for token in tokens {
+        buf.extend_from_slice(&token.to_le_bytes());
     }
-    let install = match from {
-        Some(source) => format!("INSTALL {name} FROM {source}; LOAD {name};"),
-        None => format!("INSTALL {name}; LOAD {name};"),
-    };
-    if let Err(err) = conn.execute_batch(&install) {
-        warn!("Failed to load/install extension {name}: {err}");
-        return Ok(false);
+    buf
+}
+
+fn encode_f32_json(embedding: &[f32]) -> String {
+    let mut out = String::with_capacity(embedding.len() * 8 + 2);
+    out.push('[');
+    for (idx, value) in embedding.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&value.to_string());
     }
-    Ok(true)
+    out.push(']');
+    out
 }
 
 impl Repository for Db {
@@ -651,8 +813,8 @@ impl Repository for Db {
         let mut rows = stmt.query([])?;
         let mut hashes = BTreeMap::new();
         while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let hash: Vec<u8> = row.get(1)?;
+            let path: String = row.get::<_, String>(0)?;
+            let hash: Vec<u8> = row.get::<_, Vec<u8>>(1)?;
             if hash.len() != 32 {
                 continue;
             }
@@ -661,6 +823,357 @@ impl Repository for Db {
             hashes.insert(PathBuf::from(path), buf);
         }
         Ok(hashes)
+    }
+
+    fn find_chunk_id(
+        &self,
+        _file_path: &str,
+        _start_byte: usize,
+        _end_byte: usize,
+        kind: &str,
+        chunk_hash: [u8; 32],
+    ) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM chunks \
+                 WHERE kind = ? AND chunk_hash = ? \
+                 LIMIT 1",
+            )?;
+        let id: Option<String> = stmt
+            .query_row(
+                params![kind, chunk_hash.to_vec()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    fn upsert_file_metadata(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        content_hash: [u8; 32],
+        primary_language: Option<String>,
+    ) -> Result<()> {
+        self.upsert_file(
+            file_path,
+            file_size,
+            content_hash,
+            primary_language.as_deref(),
+        )
+    }
+
+    fn ensure_file_row(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        primary_language: Option<String>,
+    ) -> Result<()> {
+        self.ensure_file(file_path, file_size, primary_language.as_deref())
+    }
+
+    fn upsert_chunk_with_embedding(
+        &self,
+        record: &ChunkRecord,
+        embedding: &[f32],
+    ) -> Result<()> {
+        self.upsert_chunk_with_embedding(record, embedding)
+    }
+
+    fn upsert_chunks_with_embeddings(
+        &self,
+        records: &[ChunkRecord],
+        embeddings: &[Vec<f32>],
+    ) -> Result<()> {
+        self.upsert_chunks_with_embeddings(records, embeddings)
+    }
+
+    fn update_chunk_without_embedding(&self, record: &ChunkRecord) -> Result<()> {
+        self.update_chunk_without_embedding(record)
+    }
+
+    fn delete_missing_chunks(&self, file_path: &str, keep_ids: &[String]) -> Result<()> {
+        if keep_ids.is_empty() {
+            return self.clear_file_chunks(file_path);
+        }
+
+        let placeholders = "?,".repeat(keep_ids.len()).trim_end_matches(',').to_string();
+        let delete_edges = format!(
+            "DELETE FROM file_chunk_edges WHERE file_path = ? AND chunk_id NOT IN ({})",
+            placeholders
+        );
+        let delete_chunks = format!(
+            "DELETE FROM chunks WHERE file_path = ? AND id NOT IN ({})",
+            placeholders
+        );
+
+        self.with_transaction(|db| {
+            let mut params = Vec::with_capacity(keep_ids.len() + 1);
+            params.push(Value::Text(file_path.to_string()));
+            params.extend(keep_ids.iter().cloned().map(Value::Text));
+            db.conn
+                .execute(&delete_edges, params_from_iter(params.clone()))?;
+            db.conn.execute(&delete_chunks, params_from_iter(params))?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn upsert_file_graph(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        content_hash: [u8; 32],
+        language: &str,
+        primary_language: Option<String>,
+        graph: GraphData,
+    ) -> Result<()> {
+        let primary_language = primary_language.as_deref();
+        if graph.symbols.is_empty() && graph.references.is_empty() && graph.resolutions.is_empty() {
+            self.ensure_file(file_path, file_size, primary_language)?;
+            self.delete_file_graph_rows(file_path)?;
+            self.upsert_file(file_path, file_size, content_hash, primary_language)?;
+            self.update_file_dependency_edges(file_path)?;
+            return Ok(());
+        }
+
+        self.with_transaction(|db| {
+            db.ensure_file(file_path, file_size, primary_language)?;
+
+            let symbol_ids: Vec<String> = graph.symbols.iter().map(|s| s.id.clone()).collect();
+            let reference_ids: Vec<String> =
+                graph.references.iter().map(|r| r.id.clone()).collect();
+
+            db.conn.execute(
+                "DELETE FROM reference_symbol_edges WHERE symbol_id IN \
+                 (SELECT id FROM symbols WHERE file_path = ?)",
+                params![file_path],
+            )?;
+            db.conn.execute(
+                "DELETE FROM reference_symbol_edges WHERE reference_id IN \
+                 (SELECT id FROM symbol_references WHERE file_path = ?)",
+                params![file_path],
+            )?;
+            db.conn.execute(
+                "DELETE FROM file_symbol_edges WHERE symbol_id IN \
+                 (SELECT id FROM symbols WHERE file_path = ?)",
+                params![file_path],
+            )?;
+            db.conn.execute(
+                "DELETE FROM file_reference_edges WHERE reference_id IN \
+                 (SELECT id FROM symbol_references WHERE file_path = ?)",
+                params![file_path],
+            )?;
+
+            if symbol_ids.is_empty() {
+                db.conn.execute(
+                    "DELETE FROM file_symbol_edges WHERE file_path = ?",
+                    params![file_path],
+                )?;
+                db.conn
+                    .execute("DELETE FROM symbols WHERE file_path = ?", params![file_path])?;
+            } else {
+                let placeholders =
+                    "?,".repeat(symbol_ids.len()).trim_end_matches(',').to_string();
+                let mut params = Vec::with_capacity(symbol_ids.len() + 1);
+                params.push(Value::Text(file_path.to_string()));
+                params.extend(symbol_ids.iter().cloned().map(Value::Text));
+                db.conn.execute(
+                    &format!(
+                        "DELETE FROM file_symbol_edges WHERE file_path = ? AND symbol_id NOT IN ({})",
+                        placeholders
+                    ),
+                    params_from_iter(params.clone()),
+                )?;
+                db.conn.execute(
+                    &format!(
+                        "DELETE FROM symbols WHERE file_path = ? AND id NOT IN ({})",
+                        placeholders
+                    ),
+                    params_from_iter(params),
+                )?;
+            }
+
+            if reference_ids.is_empty() {
+                db.conn.execute(
+                    "DELETE FROM file_reference_edges WHERE file_path = ?",
+                    params![file_path],
+                )?;
+                db.conn.execute(
+                    "DELETE FROM symbol_references WHERE file_path = ?",
+                    params![file_path],
+                )?;
+            } else {
+                let placeholders =
+                    "?,".repeat(reference_ids.len()).trim_end_matches(',').to_string();
+                let mut params = Vec::with_capacity(reference_ids.len() + 1);
+                params.push(Value::Text(file_path.to_string()));
+                params.extend(reference_ids.iter().cloned().map(Value::Text));
+                db.conn.execute(
+                    &format!(
+                        "DELETE FROM file_reference_edges WHERE file_path = ? AND reference_id NOT IN ({})",
+                        placeholders
+                    ),
+                    params_from_iter(params.clone()),
+                )?;
+                db.conn.execute(
+                    &format!(
+                        "DELETE FROM symbol_references WHERE file_path = ? AND id NOT IN ({})",
+                        placeholders
+                    ),
+                    params_from_iter(params),
+                )?;
+            }
+
+            if !graph.symbols.is_empty() {
+                let mut values = Vec::with_capacity(graph.symbols.len());
+                let mut params = Vec::with_capacity(graph.symbols.len() * 7);
+                let mut edge_values = Vec::with_capacity(graph.symbols.len());
+                let mut edge_params = Vec::with_capacity(graph.symbols.len() * 2);
+                for symbol in &graph.symbols {
+                    values.push("(?, ?, ?, ?, ?, ?, ?)".to_string());
+                    edge_values.push("(?, ?)".to_string());
+                    params.push(Value::Text(symbol.id.clone()));
+                    params.push(Value::Text(file_path.to_string()));
+                    params.push(Value::Text(symbol.name.clone()));
+                    params.push(Value::Text(symbol.kind.clone()));
+                    params.push(Value::Integer(symbol.start_byte as i64));
+                    params.push(Value::Integer(symbol.end_byte as i64));
+                    params.push(Value::Text(language.to_string()));
+                    edge_params.push(Value::Text(file_path.to_string()));
+                    edge_params.push(Value::Text(symbol.id.clone()));
+                }
+
+                let sql = format!(
+                    "INSERT INTO symbols (id, file_path, name, kind, start_byte, end_byte, language) \
+                     VALUES {values} \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       file_path = excluded.file_path, \
+                       name = excluded.name, \
+                       kind = excluded.kind, \
+                       start_byte = excluded.start_byte, \
+                       end_byte = excluded.end_byte, \
+                       language = excluded.language",
+                    values = values.join(", ")
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                stmt.execute(params_from_iter(params))?;
+
+                let edge_sql = format!(
+                    "INSERT INTO file_symbol_edges (file_path, symbol_id) \
+                     VALUES {values} \
+                     ON CONFLICT(file_path, symbol_id) DO NOTHING",
+                    values = edge_values.join(", ")
+                );
+                let mut edge_stmt = db.conn.prepare(&edge_sql)?;
+                edge_stmt.execute(params_from_iter(edge_params))?;
+            }
+
+            if !graph.references.is_empty() {
+                let mut values = Vec::with_capacity(graph.references.len());
+                let mut params = Vec::with_capacity(graph.references.len() * 6);
+                let mut edge_values = Vec::with_capacity(graph.references.len());
+                let mut edge_params = Vec::with_capacity(graph.references.len() * 2);
+                for reference in &graph.references {
+                    values.push("(?, ?, ?, ?, ?, ?)".to_string());
+                    edge_values.push("(?, ?)".to_string());
+                    params.push(Value::Text(reference.id.clone()));
+                    params.push(Value::Text(file_path.to_string()));
+                    params.push(Value::Text(reference.name.clone()));
+                    params.push(Value::Integer(reference.start_byte as i64));
+                    params.push(Value::Integer(reference.end_byte as i64));
+                    params.push(Value::Text(language.to_string()));
+                    edge_params.push(Value::Text(file_path.to_string()));
+                    edge_params.push(Value::Text(reference.id.clone()));
+                }
+
+                let sql = format!(
+                    "INSERT INTO symbol_references (id, file_path, name, start_byte, end_byte, language) \
+                     VALUES {values} \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       file_path = excluded.file_path, \
+                       name = excluded.name, \
+                       start_byte = excluded.start_byte, \
+                       end_byte = excluded.end_byte, \
+                       language = excluded.language",
+                    values = values.join(", ")
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                stmt.execute(params_from_iter(params))?;
+
+                let edge_sql = format!(
+                    "INSERT INTO file_reference_edges (file_path, reference_id) \
+                     VALUES {values} \
+                     ON CONFLICT(file_path, reference_id) DO NOTHING",
+                    values = edge_values.join(", ")
+                );
+                let mut edge_stmt = db.conn.prepare(&edge_sql)?;
+                edge_stmt.execute(params_from_iter(edge_params))?;
+            }
+
+            if !graph.symbols.is_empty() && !graph.references.is_empty() {
+                let mut symbol_values = Vec::with_capacity(graph.symbols.len());
+                let mut symbol_params = Vec::with_capacity(graph.symbols.len() * 2);
+                for symbol in &graph.symbols {
+                    symbol_values.push("(?, ?)".to_string());
+                    symbol_params.push(Value::Text(symbol.id.clone()));
+                    symbol_params.push(Value::Text(symbol.name.clone()));
+                }
+
+                let mut ref_values = Vec::with_capacity(graph.references.len());
+                let mut ref_params = Vec::with_capacity(graph.references.len() * 2);
+                for reference in &graph.references {
+                    ref_values.push("(?, ?)".to_string());
+                    ref_params.push(Value::Text(reference.id.clone()));
+                    ref_params.push(Value::Text(reference.name.clone()));
+                }
+
+                let sql = format!(
+                    "WITH symbols(id, name) AS (SELECT * FROM (VALUES {sym_values})), \
+                     refs(id, name) AS (SELECT * FROM (VALUES {ref_values})), \
+                     unique_links AS ( \
+                       SELECT r.id AS reference_id, MIN(s.id) AS symbol_id \
+                       FROM refs r \
+                       JOIN symbols s ON r.name = s.name \
+                       GROUP BY r.id \
+                       HAVING COUNT(DISTINCT s.id) = 1 \
+                     ) \
+                     INSERT OR IGNORE INTO reference_symbol_edges (reference_id, symbol_id) \
+                     SELECT reference_id, symbol_id FROM unique_links",
+                    sym_values = symbol_values.join(", "),
+                    ref_values = ref_values.join(", ")
+                );
+                let mut params = Vec::with_capacity(symbol_params.len() + ref_params.len());
+                params.extend(symbol_params);
+                params.extend(ref_params);
+                let mut stmt = db.conn.prepare(&sql)?;
+                stmt.execute(params_from_iter(params))?;
+            }
+
+            if !graph.resolutions.is_empty() {
+                let mut values = Vec::with_capacity(graph.resolutions.len());
+                let mut params = Vec::with_capacity(graph.resolutions.len() * 2);
+                for (reference_id, symbol_id) in &graph.resolutions {
+                    values.push("(?, ?)".to_string());
+                    params.push(Value::Text(reference_id.clone()));
+                    params.push(Value::Text(symbol_id.clone()));
+                }
+                let sql = format!(
+                    "INSERT OR IGNORE INTO reference_symbol_edges (reference_id, symbol_id) \
+                     VALUES {values}",
+                    values = values.join(", ")
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                stmt.execute(params_from_iter(params))?;
+            }
+
+            db.upsert_file(file_path, file_size, content_hash, primary_language)?;
+            Ok(())
+        })?;
+
+        self.update_file_dependency_edges(file_path)?;
+        Ok(())
     }
 
     fn delete_file(&self, file_path: &str) -> Result<()> {
@@ -672,82 +1185,12 @@ impl Repository for Db {
         Ok(())
     }
 
-    fn replace_file_chunks(
-        &self,
-        file_path: &str,
-        file_size: u64,
-        content_hash: [u8; 32],
-        primary_language: Option<String>,
-        chunks: &[ChunkRecord],
-        embeddings: &[Vec<f32>],
-    ) -> Result<()> {
-        if chunks.len() != embeddings.len() {
-            return Err(eyre!(
-                "chunk/embedding count mismatch: {} chunks vs {} embeddings",
-                chunks.len(),
-                embeddings.len()
-            ));
-        }
-        for record in chunks {
-            if record.file_path != file_path {
-                return Err(eyre!(
-                    "chunk file_path mismatch: expected {}, got {}",
-                    file_path,
-                    record.file_path
-                ));
-            }
-        }
-
-        let primary_language = primary_language.as_deref();
-        self.with_transaction(|db| {
-            db.ensure_file(file_path, file_size, primary_language)?;
-            db.clear_file_chunks(file_path)?;
-            for (record, embedding) in chunks.iter().zip(embeddings.iter()) {
-                db.insert_chunk(record, embedding)?;
-            }
-            db.upsert_file(file_path, file_size, content_hash, primary_language)?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    fn refresh_fts_index(&self) -> Result<()> {
-        if !self.fts_loaded {
-            warn!("fts extension not available; skipping full-text index refresh");
-            return Ok(());
-        }
-        let _ = self.conn.execute_batch("PRAGMA drop_fts_index('chunks');");
-        self.conn
-            .execute_batch("PRAGMA create_fts_index('chunks', 'id', 'text');")?;
-        Ok(())
-    }
-
-    fn replace_file_graph(
-        &self,
-        file_path: &str,
-        file_size: u64,
-        content_hash: [u8; 32],
-        language: &str,
-        primary_language: Option<String>,
-        graph: GraphData,
-    ) -> Result<()> {
-        let primary_language = primary_language.as_deref();
-        self.with_transaction(|db| {
-            db.ensure_file(file_path, file_size, primary_language)?;
-            db.clear_file_graph(file_path)?;
-            db.persist_graph(file_path, language, graph)?;
-            db.upsert_file(file_path, file_size, content_hash, primary_language)?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
     fn list_files(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT path FROM files")?;
         let mut rows = stmt.query([])?;
         let mut files = Vec::new();
         while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
+            let path: String = row.get::<_, String>(0)?;
             files.push(path);
         }
         Ok(files)
@@ -759,25 +1202,23 @@ impl Repository for Db {
             .prepare("SELECT primary_language FROM files WHERE path = ?")?;
         let mut rows = stmt.query(params![file_path])?;
         if let Some(row) = rows.next()? {
-            let lang: Option<String> = row.get(0)?;
+            let lang: Option<String> = row.get::<_, Option<String>>(0)?;
             Ok(lang)
         } else {
             Ok(None)
         }
     }
 
-    fn replace_history_edges(
+    fn upsert_history_edges(
         &self,
         file_commit_edges: &[(String, String)],
         cochange_edges: &[(String, String, i64, f64)],
     ) -> Result<()> {
         self.with_transaction(|db| {
-            db.conn.execute("DELETE FROM file_commit_edges", [])?;
-            db.conn.execute("DELETE FROM file_cochange_edges", [])?;
-
             for (file_path, commit_id) in file_commit_edges {
                 db.conn.execute(
-                    "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?)",
+                    "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?) \
+                     ON CONFLICT(file_path, commit_id) DO NOTHING",
                     params![file_path, commit_id],
                 )?;
             }
@@ -785,7 +1226,10 @@ impl Repository for Db {
             for (src, dst, commit_count, weight) in cochange_edges {
                 db.conn.execute(
                     "INSERT INTO file_cochange_edges \
-                     (src_path, dst_path, commit_count, weight) VALUES (?, ?, ?, ?)",
+                     (src_path, dst_path, commit_count, weight) VALUES (?, ?, ?, ?) \
+                     ON CONFLICT(src_path, dst_path) DO UPDATE SET \
+                       commit_count = excluded.commit_count, \
+                       weight = excluded.weight",
                     params![src, dst, commit_count, weight],
                 )?;
             }
@@ -804,10 +1248,8 @@ impl Repository for Db {
     }
 
     fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>> {
-        if !self.vss_loaded {
-            return Err(eyre!(
-                "vss extension not available; install/load it to enable vector search"
-            ));
+        if !self.vss_loaded || limit == 0 {
+            return Ok(Vec::new());
         }
         if query_embedding.len() != self.embedding_dim {
             return Err(eyre!(
@@ -816,25 +1258,18 @@ impl Repository for Db {
                 query_embedding.len()
             ));
         }
+        let query_json = encode_f32_json(query_embedding);
+        let sql = "SELECT c.id, c.file_path, c.start_byte, c.end_byte, c.chunk_hash, c.start_line, \
+       c.end_line, c.text, vector_distance_cos(c.embedding, vector32(?)) AS distance \
+       FROM vector_top_k('chunks_embedding_idx', vector32(?), ?) v \
+       JOIN chunks c ON c.rowid = v.id \
+       ORDER BY distance ASC";
 
-        let array_value_sql = array_value_placeholder(self.embedding_dim);
-        let sql = format!(
-            "SELECT id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, \
-       array_cosine_distance(embedding, {array}::FLOAT[{dim}]) AS distance \
-       FROM chunks ORDER BY distance ASC LIMIT ?",
-            array = array_value_sql,
-            dim = self.embedding_dim
-        );
-
-        let mut params_vec = Vec::with_capacity(query_embedding.len() + 1);
-        params_vec.extend(query_embedding.iter().copied().map(Value::Float));
-        params_vec.push(Value::BigInt(limit as i64));
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params_vec))?;
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params![query_json, query_json, limit as i64])?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
-            let chunk_hash: Vec<u8> = row.get(4)?;
+            let chunk_hash: Vec<u8> = row.get::<_, Vec<u8>>(4)?;
             if chunk_hash.len() != 32 {
                 return Err(eyre!(
                     "invalid chunk_hash length for {}",
@@ -844,15 +1279,15 @@ impl Repository for Db {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&chunk_hash);
             results.push(SearchRow {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                start_byte: row.get(2)?,
-                end_byte: row.get(3)?,
+                id: row.get::<_, String>(0)?,
+                file_path: row.get::<_, String>(1)?,
+                start_byte: row.get::<_, i64>(2)?,
+                end_byte: row.get::<_, i64>(3)?,
                 chunk_hash: hash,
-                start_line: row.get(5)?,
-                end_line: row.get(6)?,
-                text: row.get(7)?,
-                distance: row.get(8)?,
+                start_line: row.get::<_, i64>(5)?,
+                end_line: row.get::<_, i64>(6)?,
+                text: row.get::<_, String>(7)?,
+                distance: row.get::<_, f64>(8)?,
             });
         }
         Ok(results)
@@ -865,13 +1300,15 @@ impl Repository for Db {
             ));
         }
 
-        let sql = "SELECT id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, score \
-      FROM ( \
-        SELECT id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, \
-          fts_main_chunks.match_bm25(id, ?) AS score \
-        FROM chunks \
-      ) sq \
-      WHERE score IS NOT NULL \
+        let Some(query) = Self::normalize_fts_query(query) else {
+            return Ok(Vec::new());
+        };
+
+        let sql = "SELECT c.id, c.file_path, c.start_byte, c.end_byte, c.chunk_hash, c.start_line, \
+       c.end_line, c.text, (1.0 / (1.0 + bm25(fts_chunks))) AS score \
+      FROM fts_chunks \
+      JOIN chunks c ON c.rowid = fts_chunks.rowid \
+      WHERE fts_chunks MATCH ? \
       ORDER BY score DESC \
       LIMIT ?";
 
@@ -879,7 +1316,7 @@ impl Repository for Db {
         let mut rows = stmt.query(params![query, limit as i64])?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
-            let chunk_hash: Vec<u8> = row.get(4)?;
+            let chunk_hash: Vec<u8> = row.get::<_, Vec<u8>>(4)?;
             if chunk_hash.len() != 32 {
                 return Err(eyre!(
                     "invalid chunk_hash length for {}",
@@ -889,19 +1326,48 @@ impl Repository for Db {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&chunk_hash);
             results.push(FtsRow {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                start_byte: row.get(2)?,
-                end_byte: row.get(3)?,
+                id: row.get::<_, String>(0)?,
+                file_path: row.get::<_, String>(1)?,
+                start_byte: row.get::<_, i64>(2)?,
+                end_byte: row.get::<_, i64>(3)?,
                 chunk_hash: hash,
-                start_line: row.get(5)?,
-                end_line: row.get(6)?,
-                text: row.get(7)?,
-                score: row.get(8)?,
+                start_line: row.get::<_, i64>(5)?,
+                end_line: row.get::<_, i64>(6)?,
+                text: row.get::<_, String>(7)?,
+                score: row.get::<_, f64>(8)?,
             });
         }
         Ok(results)
     }
+
+    fn normalize_fts_query(query: &str) -> Option<String> {
+        let mut out = String::with_capacity(query.len());
+        let mut last_space = true;
+    for ch in query.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+            last_space = false;
+        } else if ch.is_alphanumeric() {
+            for lowered in ch.to_lowercase() {
+                out.push(lowered);
+            }
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+
+    while out.ends_with(' ') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
 
     fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>> {
         if seeds.is_empty() || limit == 0 {
@@ -928,13 +1394,13 @@ impl Repository for Db {
         let mut params_vec = Vec::with_capacity(seeds.len() * 2 + 1);
         params_vec.extend(seeds.iter().cloned().map(Value::Text));
         params_vec.extend(seeds.iter().cloned().map(Value::Text));
-        params_vec.push(Value::BigInt(limit as i64));
+        params_vec.push(Value::Integer(limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(params_vec))?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
+            let path: String = row.get::<_, String>(0)?;
             results.push(path);
         }
         Ok(results)
@@ -962,8 +1428,8 @@ impl Repository for Db {
         let mut rows = stmt.query(params![file_path, file_path, limit as i64])?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let weight: f64 = row.get(1)?;
+            let path: String = row.get::<_, String>(0)?;
+            let weight: f64 = row.get::<_, f64>(1)?;
             results.push((path, weight));
         }
         Ok(results)
@@ -975,24 +1441,53 @@ impl Repository for Db {
             .query_row(
                 "SELECT COUNT(*) FROM file_commit_edges WHERE file_path = ?",
                 params![file_path],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
             .optional()?;
         Ok(count.unwrap_or(0))
     }
 
-    fn refresh_file_dependency_edges(&self) -> Result<()> {
-        let sql = "WITH unique_symbols AS ( \
-        SELECT name, MIN(file_path) AS file_path \
-          FROM symbols \
-         WHERE kind = 'definition' \
-         GROUP BY name \
-        HAVING COUNT(DISTINCT file_path) = 1 \
-      ), edges AS ( \
-        SELECT r.file_path AS src_path, u.file_path AS dst_path \
+    fn update_file_dependency_edges(&self, file_path: &str) -> Result<()> {
+        let has_refs: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM symbol_references WHERE file_path = ? LIMIT 1",
+                params![file_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let has_defs: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM symbols WHERE file_path = ? AND kind = 'definition' LIMIT 1",
+                params![file_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if has_refs.is_none() && has_defs.is_none() {
+            return Ok(());
+        }
+
+        let sql_src = "WITH edges AS ( \
+        SELECT r.file_path AS src_path, s.file_path AS dst_path \
           FROM symbol_references r \
-          JOIN unique_symbols u ON r.name = u.name \
-         WHERE r.file_path <> u.file_path \
+          JOIN symbols s ON r.name = s.name AND s.kind = 'definition' \
+         WHERE r.file_path = ? AND r.file_path <> s.file_path \
+      ) \
+      INSERT INTO file_dependency_edges (src_path, dst_path, reference_count) \
+      SELECT src_path, dst_path, COUNT(*) AS reference_count \
+        FROM edges \
+       GROUP BY src_path, dst_path";
+
+        let sql_dst = "WITH defs AS ( \
+        SELECT DISTINCT name \
+          FROM symbols \
+         WHERE kind = 'definition' AND file_path = ? \
+      ), edges AS ( \
+        SELECT r.file_path AS src_path, ? AS dst_path \
+          FROM symbol_references r \
+          JOIN defs d ON r.name = d.name \
+         WHERE r.file_path <> ? \
       ) \
       INSERT INTO file_dependency_edges (src_path, dst_path, reference_count) \
       SELECT src_path, dst_path, COUNT(*) AS reference_count \
@@ -1000,31 +1495,91 @@ impl Repository for Db {
        GROUP BY src_path, dst_path";
 
         self.with_transaction(|db| {
-            db.conn.execute("DELETE FROM file_dependency_edges", [])?;
-            db.conn.execute(sql, [])?;
+            db.conn.execute(
+                "DELETE FROM file_dependency_edges WHERE src_path = ? OR dst_path = ?",
+                params![file_path, file_path],
+            )?;
+            db.conn.execute(sql_src, params![file_path])?;
+            db.conn.execute(sql_dst, params![file_path, file_path, file_path])?;
             Ok(())
         })?;
         Ok(())
     }
 
     fn file_dependency_pagerank(&self, limit: usize) -> Result<Vec<(String, f64)>> {
-        if limit == 0 || !self.duckpgq_loaded {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT src_path, dst_path, reference_count FROM file_dependency_edges")?;
+        let mut rows = stmt.query([])?;
+        let mut edges = Vec::new();
+        let mut nodes = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let src: String = row.get::<_, String>(0)?;
+            let dst: String = row.get::<_, String>(1)?;
+            let weight: i64 = row.get::<_, i64>(2)?;
+            let next_src = nodes.len();
+            nodes.entry(src.clone()).or_insert(next_src);
+            let next_dst = nodes.len();
+            nodes.entry(dst.clone()).or_insert(next_dst);
+            edges.push((src, dst, weight.max(0) as f64));
+        }
+
+        if nodes.is_empty() {
             return Ok(Vec::new());
         }
 
-        self.refresh_file_dependency_edges()?;
-
-        let sql = "SELECT * FROM pagerank('code_graph', 'files', 'depends_on') \
-      ORDER BY 2 DESC LIMIT ?";
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query(params![limit as i64])?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            let score: f64 = row.get(1)?;
-            results.push((path, score));
+        let n = nodes.len();
+        let mut index_to_path = vec![String::new(); n];
+        for (path, idx) in &nodes {
+            index_to_path[*idx] = path.clone();
         }
-        Ok(results)
+
+        let mut out_weight = vec![0.0; n];
+        let mut edge_idx = Vec::with_capacity(edges.len());
+        for (src, dst, weight) in edges {
+            let src_idx = nodes[&src];
+            let dst_idx = nodes[&dst];
+            out_weight[src_idx] += weight;
+            edge_idx.push((src_idx, dst_idx, weight));
+        }
+
+        let damping = 0.85;
+        let mut ranks = vec![1.0 / n as f64; n];
+        let mut next = vec![0.0; n];
+        for _ in 0..20 {
+            for val in &mut next {
+                *val = (1.0 - damping) / n as f64;
+            }
+            let mut dangling = 0.0;
+            for idx in 0..n {
+                if out_weight[idx] == 0.0 {
+                    dangling += ranks[idx];
+                }
+            }
+            let dangling_share = damping * dangling / n as f64;
+            for val in &mut next {
+                *val += dangling_share;
+            }
+            for (src_idx, dst_idx, weight) in &edge_idx {
+                if out_weight[*src_idx] > 0.0 {
+                    next[*dst_idx] += damping * ranks[*src_idx] * (*weight / out_weight[*src_idx]);
+                }
+            }
+            ranks.clone_from_slice(&next);
+        }
+
+        let mut scored: Vec<(String, f64)> = index_to_path
+            .into_iter()
+            .zip(ranks.into_iter())
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if scored.len() > limit {
+            scored.truncate(limit);
+        }
+        Ok(scored)
     }
 
     fn chunks_for_files(
@@ -1046,7 +1601,7 @@ impl Repository for Db {
         for file_path in file_paths {
             let mut rows = stmt.query(params![file_path, limit_per_file as i64])?;
             while let Some(row) = rows.next()? {
-                let chunk_hash: Vec<u8> = row.get(4)?;
+                let chunk_hash: Vec<u8> = row.get::<_, Vec<u8>>(4)?;
                 if chunk_hash.len() != 32 {
                     return Err(eyre!(
                         "invalid chunk_hash length for {}",
@@ -1056,15 +1611,15 @@ impl Repository for Db {
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(&chunk_hash);
                 results.push(SearchRow {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    start_byte: row.get(2)?,
-                    end_byte: row.get(3)?,
+                    id: row.get::<_, String>(0)?,
+                    file_path: row.get::<_, String>(1)?,
+                    start_byte: row.get::<_, i64>(2)?,
+                    end_byte: row.get::<_, i64>(3)?,
                     chunk_hash: hash,
-                    start_line: row.get(5)?,
-                    end_line: row.get(6)?,
-                    text: row.get(7)?,
-                    distance: row.get(8)?,
+                    start_line: row.get::<_, i64>(5)?,
+                    end_line: row.get::<_, i64>(6)?,
+                    text: row.get::<_, String>(7)?,
+                    distance: row.get::<_, f64>(8)?,
                 });
             }
         }
@@ -1090,13 +1645,13 @@ impl Repository for Db {
         let mut symbols = Vec::new();
         while let Some(row) = rows.next()? {
             symbols.push(SymbolRecord {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                start_byte: row.get(4)?,
-                end_byte: row.get(5)?,
-                language: row.get(6)?,
+                id: row.get::<_, String>(0)?,
+                file_path: row.get::<_, String>(1)?,
+                name: row.get::<_, String>(2)?,
+                kind: row.get::<_, String>(3)?,
+                start_byte: row.get::<_, i64>(4)? as usize,
+                end_byte: row.get::<_, i64>(5)? as usize,
+                language: row.get::<_, String>(6)?,
             });
         }
         Ok(symbols)
@@ -1106,13 +1661,13 @@ impl Repository for Db {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use duckdb::Connection;
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
     #[test]
     fn db_enforces_embedding_dim() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
 
         let _db = Db::open(&db_path, Some(2))?;
         let mismatch = Db::open(&db_path, Some(3));
@@ -1123,7 +1678,7 @@ mod tests {
     #[test]
     fn db_rejects_chunk_without_file_row() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(2))?;
 
         let record = ChunkRecord {
@@ -1151,7 +1706,7 @@ mod tests {
     #[test]
     fn db_rejects_chunk_with_inverted_bounds() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(2))?;
         let hash = [0u8; 32];
 
@@ -1182,7 +1737,7 @@ mod tests {
     #[test]
     fn db_rejects_symbol_without_file_row() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(2))?;
 
         let record = SymbolRecord {
@@ -1206,7 +1761,7 @@ mod tests {
     #[test]
     fn db_rejects_reference_without_file_row() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(2))?;
 
         let record = ReferenceRecord {
@@ -1229,7 +1784,7 @@ mod tests {
     #[test]
     fn db_rejects_reference_symbol_links_for_missing_ids() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(2))?;
 
         let result = db.link_reference_symbol("missing-ref", "missing-sym");
@@ -1244,7 +1799,7 @@ mod tests {
     #[test]
     fn db_delete_file_cleans_cross_file_reference_edges() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(2))?;
         let hash = [0u8; 32];
 
@@ -1278,7 +1833,7 @@ mod tests {
         let conn = Connection::open(&db_path)?;
         let edge_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM reference_symbol_edges", [], |row| {
-                row.get(0)
+                row.get::<_, i64>(0)
             })?;
 
         assert_eq!(

@@ -2,14 +2,54 @@ use std::collections::HashSet;
 
 use eyre::{Result, eyre};
 
-use super::IndexProcessor;
-use super::super::batcher::BatchItem;
-use super::super::embedder::embed_batch;
+use super::super::batcher::BatchMeta;
 use super::super::state::{PendingEof, PendingFile};
+use super::IndexProcessor;
 
 impl<'a> IndexProcessor<'a> {
-    pub(super) async fn process_batch(&mut self, batch: Vec<BatchItem>) -> Result<()> {
-        let touched = embed_batch(self.embedder, batch, &mut self.state.embeddings).await?;
+    pub(crate) fn apply_embeddings(
+        &mut self,
+        batch: Vec<BatchMeta>,
+        embeddings: Vec<Vec<f32>>,
+    ) -> Result<()> {
+        if embeddings.len() != batch.len() {
+            return Err(eyre!(
+                "embedder returned {} embeddings for {} inputs",
+                embeddings.len(),
+                batch.len()
+            ));
+        }
+
+        let mut touched = HashSet::new();
+        let mut records = Vec::with_capacity(batch.len());
+        let mut embed_values = Vec::with_capacity(batch.len());
+        let mut pending = Vec::with_capacity(batch.len());
+
+        for (item, embedding) in batch.into_iter().zip(embeddings.into_iter()) {
+            let Some(entry) = self.state.pending.get_mut(&item.file_path) else {
+                continue;
+            };
+            let Some(idx) = entry.chunk_index.get(&item.chunk_id).copied() else {
+                continue;
+            };
+            if let Some(record) = entry.chunks.get(idx) {
+                records.push(record.clone());
+                embed_values.push(embedding);
+                pending.push((item.file_path, item.chunk_id));
+            }
+        }
+
+        if !records.is_empty() {
+            self.db
+                .upsert_chunks_with_embeddings(&records, &embed_values)?;
+            for (file_path, chunk_id) in pending {
+                if let Some(entry) = self.state.pending.get_mut(&file_path) {
+                    entry.pending_embeddings.remove(&chunk_id);
+                }
+                touched.insert(file_path);
+            }
+        }
+
         self.try_finalize_files(touched)
     }
 
@@ -29,11 +69,7 @@ impl<'a> IndexProcessor<'a> {
             let Some(entry) = self.state.pending.get(&file_path) else {
                 continue;
             };
-            let ready = entry
-                .chunks
-                .iter()
-                .all(|chunk| self.state.embeddings.contains_key(&chunk.id));
-            if !ready {
+            if !entry.pending_embeddings.is_empty() {
                 continue;
             }
 
@@ -47,24 +83,14 @@ impl<'a> IndexProcessor<'a> {
                 .remove(&file_path)
                 .unwrap_or_else(|| PendingFile::new(0));
 
-            let mut ordered = Vec::with_capacity(entry.chunks.len());
-            for chunk in &entry.chunks {
-                let embedding = self
-                    .state
-                    .embeddings
-                    .remove(&chunk.id)
-                    .ok_or_else(|| eyre!("missing embedding for {}", chunk.id))?;
-                ordered.push(embedding);
-            }
-
-            self.db.replace_file_chunks(
+            let keep_ids: Vec<String> = entry.chunks.iter().map(|chunk| chunk.id.clone()).collect();
+            self.db.upsert_file_metadata(
                 &file_path,
                 entry.file_size,
                 eof.content_hash,
                 eof.primary_language.clone(),
-                &entry.chunks,
-                &ordered,
             )?;
+            self.db.delete_missing_chunks(&file_path, &keep_ids)?;
             self.state.pending_eof.remove(&file_path);
         }
 

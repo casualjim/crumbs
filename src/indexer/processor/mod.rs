@@ -1,77 +1,74 @@
 mod finalize;
 mod handlers;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use eyre::{Result, eyre};
 use text_chunking::{Chunk, ProjectChunk};
 
-use crate::embedding::EmbeddingProvider;
 use crate::repository::Repository;
 
-use super::IndexerConfig;
-use super::batcher::{ChunkBatch, StreamBatcher, split_by_tokens};
+use super::batcher::BatchItem;
 use super::observer::ObservedGraph;
 use super::state::IndexerState;
 
 pub(crate) struct IndexProcessor<'a> {
     db: &'a dyn Repository,
-    embedder: &'a dyn EmbeddingProvider,
     state: IndexerState,
-    stream_batcher: StreamBatcher,
-    max_tokens: usize,
-    max_batch_size: usize,
-    observed_graphs: Arc<Mutex<std::collections::HashMap<String, ObservedGraph>>>,
+    observed_graphs: Arc<DashMap<String, ObservedGraph>>,
+}
+
+pub(crate) enum ProcessorOutput {
+    Batch(BatchItem),
+    RemoveFile(String),
+    None,
 }
 
 impl<'a> IndexProcessor<'a> {
     pub(crate) fn new(
         db: &'a dyn Repository,
-        embedder: &'a dyn EmbeddingProvider,
-        config: &'a IndexerConfig,
-        observed_graphs: Arc<Mutex<std::collections::HashMap<String, ObservedGraph>>>,
+        observed_graphs: Arc<DashMap<String, ObservedGraph>>,
     ) -> Self {
         Self {
             db,
-            embedder,
             state: IndexerState::new(),
-            stream_batcher: StreamBatcher::new(config.stream_batch_size),
-            max_tokens: config.max_tokens,
-            max_batch_size: config.max_batch_size,
             observed_graphs,
         }
     }
 
-    pub(crate) async fn handle_chunk(&mut self, project_chunk: ProjectChunk) -> Result<()> {
+    pub(crate) fn handle_chunk(&mut self, project_chunk: ProjectChunk) -> Result<ProcessorOutput> {
         let ProjectChunk {
             file_path,
             chunk,
             file_size,
         } = project_chunk;
         match chunk {
-            Chunk::Delete { file_path } => self.handle_delete(&file_path),
+            Chunk::Delete { file_path } => {
+                self.handle_delete(&file_path)?;
+                Ok(ProcessorOutput::RemoveFile(file_path))
+            }
             Chunk::Semantic(chunk) => {
-                self.handle_chunk_like(file_path, file_size, chunk, "semantic")
-                    .await
+                let item = self.handle_content_chunk(file_path, file_size, chunk, "semantic")?;
+                Ok(item.map_or(ProcessorOutput::None, ProcessorOutput::Batch))
             }
             Chunk::Text(chunk) => {
-                self.handle_chunk_like(file_path, file_size, chunk, "text")
-                    .await
+                let item = self.handle_content_chunk(file_path, file_size, chunk, "text")?;
+                Ok(item.map_or(ProcessorOutput::None, ProcessorOutput::Batch))
             }
             Chunk::EndOfFile {
                 file_path,
                 content_hash,
                 file_metadata,
                 ..
-            } => self.handle_eof(file_size, &file_path, content_hash, file_metadata),
+            } => {
+                self.handle_eof(file_size, &file_path, content_hash, file_metadata)?;
+                Ok(ProcessorOutput::None)
+            }
         }
     }
 
-    pub(crate) async fn finish(&mut self) -> Result<()> {
-        if let Some(batch) = self.stream_batcher.flush() {
-            self.process_chunk_batch(batch).await?;
-        }
-
+    pub(crate) fn finish(&mut self) -> Result<()> {
         if !self.state.pending_eof.is_empty() {
             let remaining = self.state.pending_eof.keys().cloned().collect::<Vec<_>>();
             self.try_finalize_files(remaining)?;
@@ -92,14 +89,6 @@ impl<'a> IndexProcessor<'a> {
             ));
         }
 
-        Ok(())
-    }
-
-    pub(super) async fn process_chunk_batch(&mut self, batch: ChunkBatch) -> Result<()> {
-        let batches = split_by_tokens(batch.items, self.max_tokens, self.max_batch_size);
-        for embedding_batch in batches {
-            self.process_batch(embedding_batch).await?;
-        }
         Ok(())
     }
 }

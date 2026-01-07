@@ -25,9 +25,9 @@ use syntastica_queries::{
     URSA_LOCALS_CRATES_IO, VERILOG_LOCALS_CRATES_IO, WAT_LOCALS_CRATES_IO,
     YAML_LOCALS_CRATES_IO, ZIG_LOCALS_CRATES_IO,
 };
+use blake3::Hasher;
 use tracing::{info, warn};
 use tree_sitter::{Query, QueryCursor, StreamingIterator};
-use uuid::Uuid;
 
 use crate::db::{GraphData, ReferenceRecord, SymbolRecord};
 use crate::repository::Repository;
@@ -139,7 +139,7 @@ pub(crate) fn index_history(
         .collect();
     cochange_edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    db.replace_history_edges(&commit_edges, &cochange_edges)?;
+    db.upsert_history_edges(&commit_edges, &cochange_edges)?;
     info!(
         "history indexing complete: commits={}, cochanges={}",
         commit_edges.len(),
@@ -149,6 +149,7 @@ pub(crate) fn index_history(
 }
 
 pub(crate) fn extract_graph_from_tree(
+    file_path: &str,
     language: &str,
     ts_language: tree_sitter::Language,
     tree: &tree_sitter::Tree,
@@ -158,10 +159,11 @@ pub(crate) fn extract_graph_from_tree(
         return Ok(None);
     };
 
-    extract_graph_from_tree_inner(ts_language, tree, source, query_source)
+    extract_graph_from_tree_inner(file_path, ts_language, tree, source, query_source)
 }
 
 fn extract_graph_from_tree_inner(
+    file_path: &str,
     ts_language: tree_sitter::Language,
     tree: &tree_sitter::Tree,
     source: &str,
@@ -208,8 +210,9 @@ fn extract_graph_from_tree_inner(
             }
 
             if name.starts_with("local.definition") {
+                let id = stable_id(file_path, "definition", start_byte, end_byte, &text);
                 symbols.push(SymbolRecord {
-                    id: Uuid::now_v7().to_string(),
+                    id,
                     file_path: String::new(),
                     name: text,
                     kind: "definition".to_string(),
@@ -218,8 +221,9 @@ fn extract_graph_from_tree_inner(
                     language: String::new(),
                 });
             } else {
+                let id = stable_id(file_path, "reference", start_byte, end_byte, &text);
                 references.push(ReferenceRecord {
-                    id: Uuid::now_v7().to_string(),
+                    id,
                     file_path: String::new(),
                     name: text,
                     start_byte,
@@ -235,6 +239,27 @@ fn extract_graph_from_tree_inner(
         references,
         resolutions: Vec::new(),
     }))
+}
+
+fn stable_id(
+    file_path: &str,
+    kind: &str,
+    start_byte: usize,
+    end_byte: usize,
+    name: &str,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(file_path.as_bytes());
+    hasher.update(kind.as_bytes());
+    hasher.update(&start_byte.to_le_bytes());
+    hasher.update(&end_byte.to_le_bytes());
+    hasher.update(name.as_bytes());
+    let hash = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in hash.as_bytes() {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 fn graph_query_for_language(language: &str) -> Option<&'static str> {
@@ -324,7 +349,7 @@ mod tests {
         let dir = TempDir::new()?;
         write_fixture_repo(dir.path())?;
 
-        let db_path = dir.path().join("context.duckdb");
+        let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(embedding_dim))?;
 
         let config = IndexerConfig {
@@ -335,9 +360,10 @@ mod tests {
             max_parallel: 4,
             max_file_size: Some(5 * 1024 * 1024),
             large_file_threads: 2,
-            stream_batch_size: 256,
             max_batch_size: 16,
             max_tokens: 8_192,
+            embedding_workers: 1,
+            cancel_token: None,
             history: HistoryConfig {
                 depth: 10240,
                 commit_size_limit_ratio: 1.0,
@@ -351,11 +377,12 @@ mod tests {
         let indexer = Indexer::new(&db, embedder, config);
         indexer.index().await?;
 
-        let conn = duckdb::Connection::open(&db_path)?;
-        let symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let symbols: i64 =
+            conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get::<_, i64>(0))?;
         let references: i64 =
             conn.query_row("SELECT COUNT(*) FROM symbol_references", [], |row| {
-                row.get(0)
+                row.get::<_, i64>(0)
             })?;
 
         assert!(symbols > 0, "expected symbols to be populated");

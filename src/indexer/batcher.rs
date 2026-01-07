@@ -5,90 +5,59 @@ pub(crate) struct BatchItem {
     pub(crate) token_count: usize,
 }
 
-pub(crate) struct ChunkBatch {
-    pub(crate) batch_id: usize,
-    pub(crate) items: Vec<BatchItem>,
+pub(crate) struct BatchMeta {
+    pub(crate) chunk_id: String,
+    pub(crate) file_path: String,
 }
 
-pub(crate) struct StreamBatcher {
-    buffer: Vec<BatchItem>,
-    chunk_count: usize,
-    max_batch_size: usize,
-    batch_id: usize,
+pub(crate) struct TokenAwareBatcher {
+    max_tokens_per_batch: usize,
+    max_items_per_batch: usize,
+    current_tokens: usize,
+    current: Vec<BatchItem>,
 }
 
-impl StreamBatcher {
-    pub(crate) fn new(max_batch_size: usize) -> Self {
+impl TokenAwareBatcher {
+    pub(crate) fn new(max_tokens_per_batch: usize, max_items_per_batch: usize) -> Self {
         Self {
-            buffer: Vec::new(),
-            chunk_count: 0,
-            max_batch_size: max_batch_size.max(1),
-            batch_id: 0,
+            max_tokens_per_batch: max_tokens_per_batch.max(1),
+            max_items_per_batch: max_items_per_batch.max(1),
+            current_tokens: 0,
+            current: Vec::new(),
         }
     }
 
-    pub(crate) fn add(&mut self, item: BatchItem) -> Option<ChunkBatch> {
-        self.chunk_count = self.chunk_count.saturating_add(1);
-        self.buffer.push(item);
-
-        if self.chunk_count >= self.max_batch_size {
-            return self.flush();
+    pub(crate) fn add(&mut self, item: BatchItem) -> Option<Vec<BatchItem>> {
+        if !self.current.is_empty()
+            && (self.current.len() >= self.max_items_per_batch
+                || self.current_tokens.saturating_add(item.token_count) > self.max_tokens_per_batch)
+        {
+            let batch = std::mem::take(&mut self.current);
+            self.current_tokens = 0;
+            self.current_tokens = self.current_tokens.saturating_add(item.token_count);
+            self.current.push(item);
+            return Some(batch);
         }
 
+        self.current_tokens = self.current_tokens.saturating_add(item.token_count);
+        self.current.push(item);
         None
     }
 
-    pub(crate) fn flush(&mut self) -> Option<ChunkBatch> {
-        if self.buffer.is_empty() {
-            return None;
+    pub(crate) fn flush(&mut self) -> Option<Vec<BatchItem>> {
+        if self.current.is_empty() {
+            None
+        } else {
+            self.current_tokens = 0;
+            Some(std::mem::take(&mut self.current))
         }
-
-        let batch = ChunkBatch {
-            batch_id: self.batch_id,
-            items: std::mem::take(&mut self.buffer),
-        };
-        self.batch_id = self.batch_id.saturating_add(1);
-        self.chunk_count = 0;
-        Some(batch)
     }
 
     pub(crate) fn remove_file(&mut self, file_path: &str) {
-        if self.buffer.is_empty() {
+        if self.current.is_empty() {
             return;
         }
-        self.buffer.retain(|item| item.file_path != file_path);
-        self.chunk_count = self.buffer.len();
+        self.current.retain(|item| item.file_path != file_path);
+        self.current_tokens = self.current.iter().map(|item| item.token_count).sum();
     }
-}
-
-pub(crate) fn split_by_tokens(
-    items: Vec<BatchItem>,
-    max_tokens_per_batch: usize,
-    max_items_per_batch: usize,
-) -> Vec<Vec<BatchItem>> {
-    let max_tokens = max_tokens_per_batch.max(1);
-    let max_items = max_items_per_batch.max(1);
-    let mut result = Vec::new();
-    let mut current = Vec::new();
-    let mut current_tokens = 0usize;
-
-    for item in items {
-        let item_tokens = item.token_count;
-        if !current.is_empty()
-            && (current.len() >= max_items
-                || current_tokens.saturating_add(item_tokens) > max_tokens)
-        {
-            result.push(std::mem::take(&mut current));
-            current_tokens = 0;
-        }
-
-        current_tokens = current_tokens.saturating_add(item_tokens);
-        current.push(item);
-    }
-
-    if !current.is_empty() {
-        result.push(current);
-    }
-
-    result
 }

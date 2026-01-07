@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::fs;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-const DEFAULT_DATABASE_NAME: &str = "context.duckdb";
+const DEFAULT_DATABASE_NAME: &str = "context.db";
 
 #[derive(confique::Config, Debug, Clone)]
 pub struct AppConfig {
@@ -91,13 +91,6 @@ pub struct Embedding {
         help = "Max tokens per embedding request"
     )))]
     pub context_length: usize,
-    #[config(default = 256, env = "EMBEDDER_STREAM_BATCH_SIZE")]
-    #[config(layer_attr(arg(
-        id = "embedder_stream_batch_size",
-        long = "embedder-stream-batch-size",
-        help = "Max chunks per stream batch before token-aware splitting"
-    )))]
-    pub stream_batch_size: usize,
     #[config(default = 15, env = "EMBEDDER_MAX_BATCH_SIZE")]
     #[config(layer_attr(arg(
         id = "embedder_max_batch_size",
@@ -105,6 +98,13 @@ pub struct Embedding {
         help = "Max inputs per embedding batch"
     )))]
     pub max_batch_size: usize,
+    #[config(default = 5, env = "EMBEDDER_WORKERS")]
+    #[config(layer_attr(arg(
+        id = "embedder_workers",
+        long = "embedder-workers",
+        help = "Concurrent embedding workers"
+    )))]
+    pub workers: usize,
     #[config(default = 1000, env = "EMBEDDER_REQUESTS_PER_MINUTE")]
     #[config(layer_attr(arg(
         id = "embedder_requests_per_minute",
@@ -291,6 +291,12 @@ pub struct SearchOptions {
         help = "Apply model-based reranking"
     )))]
     pub rerank: bool,
+    #[config(default = 0.25, env = "CONTEXT_SEARCH_RERANK_MIN_SCORE")]
+    #[config(layer_attr(arg(
+        long = "rerank-min-score",
+        help = "Minimum reranker score to include in results (0.0-1.0)"
+    )))]
+    pub rerank_min_score: f64,
 }
 
 #[derive(confique::Config, Debug, Clone)]
@@ -659,8 +665,8 @@ dialect = "deepinfra"
 timeout_seconds = 10
 embedding_dim = 1024
 context_length = 32768
-stream_batch_size = 256
 max_batch_size = 15
+workers = 5
 requests_per_minute = 1000
 max_concurrent_requests = 300
 tokens_per_minute = 1000000
@@ -693,7 +699,7 @@ issue_regex = "(#\\d+)"
 # [projects.example]
 # repo = "/path/to/repo"
 # # data_dir = "/path/to/data"
-# # database = "context.duckdb"
+# # database = "context.db"
 
 [search]
 limit = 10
@@ -703,6 +709,7 @@ hybrid_weight = 0.6
 # file_exts = ["rs"]
 # decompose = false
 rerank = true
+rerank_min_score = 0.25
 
 [prompt]
 # tokenizer = "" # defaults to embedding tokenizer
@@ -876,11 +883,11 @@ fn validate_config(config: &AppConfig) -> eyre::Result<()> {
     if config.embedding.context_length == 0 {
         return Err(eyre::eyre!("embedder context_length must be > 0"));
     }
-    if config.embedding.stream_batch_size == 0 {
-        return Err(eyre::eyre!("embedder stream_batch_size must be > 0"));
-    }
     if config.embedding.max_batch_size == 0 {
         return Err(eyre::eyre!("embedder max_batch_size must be > 0"));
+    }
+    if config.embedding.workers == 0 {
+        return Err(eyre::eyre!("embedder workers must be > 0"));
     }
     if config.embedding.requests_per_minute == 0 {
         return Err(eyre::eyre!("embedder requests_per_minute must be > 0"));
@@ -913,6 +920,11 @@ fn validate_config(config: &AppConfig) -> eyre::Result<()> {
     }
     if !(0.0..=1.0).contains(&config.search.min_score) {
         return Err(eyre::eyre!("search min_score must be in [0.0, 1.0]"));
+    }
+    if !(0.0..=1.0).contains(&config.search.rerank_min_score) {
+        return Err(eyre::eyre!(
+            "search rerank_min_score must be in [0.0, 1.0]"
+        ));
     }
     if !(0.0..=1.0).contains(&config.search.hybrid_weight) {
         return Err(eyre::eyre!("hybrid_weight must be in [0.0, 1.0]"));
@@ -1100,8 +1112,8 @@ mod tests {
                 timeout_seconds: 10,
                 embedding_dim: 2,
                 context_length: 8,
-                stream_batch_size: 4,
                 max_batch_size: 4,
+                workers: 1,
                 requests_per_minute: 1000,
                 max_concurrent_requests: 300,
                 tokens_per_minute: 1,
@@ -1139,6 +1151,7 @@ mod tests {
                 file_exts: Vec::new(),
                 decompose: false,
                 rerank: false,
+                rerank_min_score: 0.25,
             },
             prompt: Prompting {
                 tokenizer: String::new(),
@@ -1198,8 +1211,8 @@ mod tests {
                 timeout_seconds: 10,
                 embedding_dim: 2,
                 context_length: 8,
-                stream_batch_size: 4,
                 max_batch_size: 4,
+                workers: 1,
                 requests_per_minute: 1000,
                 max_concurrent_requests: 300,
                 tokens_per_minute: 1,
@@ -1237,6 +1250,7 @@ mod tests {
                 file_exts: Vec::new(),
                 decompose: false,
                 rerank: false,
+                rerank_min_score: 0.25,
             },
             prompt: Prompting {
                 tokenizer: String::new(),

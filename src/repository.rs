@@ -7,18 +7,40 @@ use crate::db::{ChunkRecord, FtsRow, GraphData, SearchRow, SymbolRecord};
 
 pub trait Repository {
     fn load_existing_hashes(&self) -> Result<BTreeMap<PathBuf, [u8; 32]>>;
-    fn delete_file(&self, file_path: &str) -> Result<()>;
-    fn replace_file_chunks(
+    fn find_chunk_id(
+        &self,
+        file_path: &str,
+        start_byte: usize,
+        end_byte: usize,
+        kind: &str,
+        chunk_hash: [u8; 32],
+    ) -> Result<Option<String>>;
+    fn upsert_file_metadata(
         &self,
         file_path: &str,
         file_size: u64,
         content_hash: [u8; 32],
         primary_language: Option<String>,
-        chunks: &[ChunkRecord],
+    ) -> Result<()>;
+    fn ensure_file_row(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        primary_language: Option<String>,
+    ) -> Result<()>;
+    fn upsert_chunk_with_embedding(
+        &self,
+        record: &ChunkRecord,
+        embedding: &[f32],
+    ) -> Result<()>;
+    fn upsert_chunks_with_embeddings(
+        &self,
+        records: &[ChunkRecord],
         embeddings: &[Vec<f32>],
     ) -> Result<()>;
-    fn refresh_fts_index(&self) -> Result<()>;
-    fn replace_file_graph(
+    fn update_chunk_without_embedding(&self, record: &ChunkRecord) -> Result<()>;
+    fn delete_missing_chunks(&self, file_path: &str, keep_ids: &[String]) -> Result<()>;
+    fn upsert_file_graph(
         &self,
         file_path: &str,
         file_size: u64,
@@ -27,9 +49,10 @@ pub trait Repository {
         primary_language: Option<String>,
         graph: GraphData,
     ) -> Result<()>;
+    fn delete_file(&self, file_path: &str) -> Result<()>;
     fn list_files(&self) -> Result<Vec<String>>;
     fn file_primary_language(&self, file_path: &str) -> Result<Option<String>>;
-    fn replace_history_edges(
+    fn upsert_history_edges(
         &self,
         file_commit_edges: &[(String, String)],
         cochange_edges: &[(String, String, i64, f64)],
@@ -41,7 +64,7 @@ pub trait Repository {
     fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>>;
     fn cochange_partners(&self, file_path: &str, limit: usize) -> Result<Vec<(String, f64)>>;
     fn file_commit_count(&self, file_path: &str) -> Result<i64>;
-    fn refresh_file_dependency_edges(&self) -> Result<()>;
+    fn update_file_dependency_edges(&self, file_path: &str) -> Result<()>;
     fn file_dependency_pagerank(&self, limit: usize) -> Result<Vec<(String, f64)>>;
     fn chunks_for_files(
         &self,

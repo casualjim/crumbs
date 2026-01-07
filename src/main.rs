@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
 
-            let embedder = build_embedder(&cfg.embedding, tokenizer.clone())?;
+            let embedder = build_embedder(&cfg.embedding)?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let index_config = IndexerConfig {
                 repo_path: project.repo_path.clone(),
@@ -58,9 +58,10 @@ async fn main() -> Result<()> {
                 max_parallel: cfg.chunking.max_parallel,
                 max_file_size: Some(cfg.chunking.max_file_size),
                 large_file_threads: cfg.chunking.large_file_threads,
-                stream_batch_size: cfg.embedding.stream_batch_size,
                 max_batch_size: cfg.embedding.max_batch_size,
                 max_tokens: cfg.embedding.context_length,
+                embedding_workers: cfg.embedding.workers,
+                cancel_token: None,
                 history: graph::HistoryConfig {
                     depth: cfg.history.depth,
                     commit_size_limit_ratio: cfg.history.commit_size_limit_ratio,
@@ -77,7 +78,7 @@ async fn main() -> Result<()> {
         Command::Search(cmd) => {
             let cfg = config::load_config(&cli)?;
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-            let embedder = build_embedder(&cfg.embedding, tokenizer.clone())?;
+            let embedder = build_embedder(&cfg.embedding)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let reranker = if cfg.search.rerank {
@@ -94,6 +95,7 @@ async fn main() -> Result<()> {
             search_config.file_exts = cfg.search.file_exts.clone();
             search_config.decompose = cfg.search.decompose;
             search_config.rerank = cfg.search.rerank;
+            search_config.rerank_min_score = cfg.search.rerank_min_score;
             let results =
                 search::search(&db, &embedder, reranker_ref, &tokenizer, &cmd.query, search_config)
                     .await?;
@@ -119,7 +121,7 @@ async fn main() -> Result<()> {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-            let embedder = build_embedder(&cfg.embedding, tokenizer.clone())?;
+            let embedder = build_embedder(&cfg.embedding)?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
             let reranker = if cfg.search.rerank {
                 Some(build_reranker(&cfg)?)
@@ -203,8 +205,8 @@ async fn main() -> Result<()> {
                 if cfg.embedding.api_key.is_none() {
                     return Err(eyre!("embedding api key missing"));
                 }
-                let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-                let _ = build_embedder(&cfg.embedding, tokenizer)?;
+                let _ = parse_tokenizer(&cfg.embedding.tokenizer)?;
+                let _ = build_embedder(&cfg.embedding)?;
                 println!("Config OK");
             }
         },
@@ -223,7 +225,7 @@ fn project_override(command: &Command) -> Option<&str> {
     }
 }
 
-pub(crate) fn build_embedder(cfg: &config::Embedding, tokenizer: Tokenizer) -> Result<EmbedClient> {
+pub(crate) fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {
     let dialect = parse_dialect(cfg.dialect.as_str())?;
     let config = EmbedderConfig {
         api_key: cfg.api_key.clone(),
@@ -231,7 +233,6 @@ pub(crate) fn build_embedder(cfg: &config::Embedding, tokenizer: Tokenizer) -> R
         timeout: Duration::from_secs(cfg.timeout_seconds),
         dialect,
         model: cfg.model.clone(),
-        tokenizer,
         embedding_dim: cfg.embedding_dim,
         requests_per_minute: cfg.requests_per_minute,
         max_concurrent_requests: cfg.max_concurrent_requests,

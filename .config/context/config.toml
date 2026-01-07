@@ -22,11 +22,11 @@ timeout_seconds = 10
 # instruction = ""
 
 [chunking]
-max_chunk_size = 1500
+max_chunk_size = 800
 overlap = 0.2
-max_parallel = 4
+max_parallel = 8
 max_file_size = 5242880
-large_file_threads = 4
+large_file_threads = 2
 
 [history]
 depth = 10240

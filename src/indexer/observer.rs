@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use eyre::Result;
 use text_chunking::{ChunkError, CodeParseInfo, CodeParseObserver};
 use tracing::warn;
@@ -14,11 +14,11 @@ pub(crate) struct ObservedGraph {
 }
 
 pub(crate) struct GraphObserver {
-    graphs: Arc<Mutex<HashMap<String, ObservedGraph>>>,
+    graphs: Arc<DashMap<String, ObservedGraph>>,
 }
 
 impl GraphObserver {
-    pub(crate) fn new(graphs: Arc<Mutex<HashMap<String, ObservedGraph>>>) -> Self {
+    pub(crate) fn new(graphs: Arc<DashMap<String, ObservedGraph>>) -> Self {
         Self { graphs }
     }
 }
@@ -28,14 +28,15 @@ impl CodeParseObserver for GraphObserver {
         let language = info.language_id.clone();
 
         match extract_graph_from_tree(
+            &info.file_path,
             &language,
             info.language,
             info.tree.as_ref(),
             info.source.as_ref(),
         ) {
             Ok(Some(graph)) => {
-                let mut guard = self.graphs.lock().expect("graph observer lock poisoned");
-                guard.insert(info.file_path.clone(), ObservedGraph { language, graph });
+                self.graphs
+                    .insert(info.file_path.clone(), ObservedGraph { language, graph });
             }
             Ok(None) => {}
             Err(err) => {

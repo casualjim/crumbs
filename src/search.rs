@@ -37,6 +37,7 @@ pub struct SearchConfig {
     pub file_exts: Vec<String>,
     pub decompose: bool,
     pub rerank: bool,
+    pub rerank_min_score: f64,
 }
 
 impl SearchConfig {
@@ -48,7 +49,8 @@ impl SearchConfig {
             path_prefixes: Vec::new(),
             file_exts: Vec::new(),
             decompose: false,
-            rerank: false,
+            rerank: true,
+            rerank_min_score: 0.25,
         }
     }
 
@@ -136,33 +138,37 @@ pub async fn search(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    combined.retain(|item| item.score >= config.min_score);
+    combined.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     combined.truncate(config.limit);
     if config.rerank {
-        if let Some(reranker) = reranker {
-            let documents: Vec<String> = combined.iter().map(|item| item.text.clone()).collect();
-            match reranker.rerank(query_text, &documents).await {
-                Ok(scores) if scores.len() == combined.len() => {
-                    for (result, score) in combined.iter_mut().zip(scores.iter()) {
-                        result.score = *score;
-                    }
-                    combined.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-                Ok(_) => {
-                    warn!("Reranker returned unexpected score count; using hybrid scores");
-                }
-                Err(err) => {
-                    warn!("Reranking failed, using hybrid scores: {err}");
-                }
-            }
-        } else {
-            warn!("Reranking requested but no reranker configured");
+        let reranker = reranker.ok_or_else(|| eyre!("reranker required but not configured"))?;
+        let documents: Vec<String> = combined.iter().map(|item| item.text.clone()).collect();
+        let scores = reranker
+            .rerank(query_text, &documents)
+            .await
+            .map_err(|err| eyre!("reranking failed: {err}"))?;
+        if scores.len() != combined.len() {
+            return Err(eyre!(
+                "reranker returned {} scores for {} results",
+                scores.len(),
+                combined.len()
+            ));
         }
+        for (result, score) in combined.iter_mut().zip(scores.iter()) {
+            result.score = *score;
+        }
+        combined.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        combined.retain(|item| item.score >= config.rerank_min_score);
     }
-    combined.retain(|item| item.score >= config.min_score);
     Ok(combined)
 }
 

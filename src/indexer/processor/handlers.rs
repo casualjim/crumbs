@@ -4,34 +4,26 @@ use uuid::Uuid;
 
 use crate::db::ChunkRecord;
 
-use super::IndexProcessor;
 use super::super::batcher::BatchItem;
 use super::super::state::{PendingEof, PendingFile};
+use super::IndexProcessor;
 
 impl<'a> IndexProcessor<'a> {
     pub(super) fn handle_delete(&mut self, file_path: &str) -> Result<()> {
         self.db.delete_file(file_path)?;
-        if let Some(entry) = self.state.pending.remove(file_path) {
-            for chunk in entry.chunks {
-                self.state.embeddings.remove(&chunk.id);
-            }
-        }
+        self.state.pending.remove(file_path);
         self.state.pending_eof.remove(file_path);
-        self.stream_batcher.remove_file(file_path);
-        self.observed_graphs
-            .lock()
-            .expect("graph observer lock poisoned")
-            .remove(file_path);
+        self.observed_graphs.remove(file_path);
         Ok(())
     }
 
-    pub(super) async fn handle_chunk_like(
+    pub(super) fn handle_content_chunk(
         &mut self,
         file_path: String,
         file_size: u64,
         chunk: SemanticChunk,
         kind: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<BatchItem>> {
         let SemanticChunk {
             start_byte,
             end_byte,
@@ -47,16 +39,28 @@ impl<'a> IndexProcessor<'a> {
             .entry(file_path.clone())
             .or_insert_with(|| PendingFile::new(file_size));
         entry.file_size = file_size;
+        if !entry.file_row_ensured {
+            self.db
+                .ensure_file_row(&file_path, file_size, None)?;
+            entry.file_row_ensured = true;
+        }
 
         let ordinal = entry.chunks.len();
         let token_count = tokens.as_ref().map(|tokens| tokens.len()).ok_or_else(|| {
-            eyre!(
-                "missing token counts for chunk; configure tokenizer to provide tokens"
-            )
+            eyre!("missing token counts for chunk; configure tokenizer to provide tokens")
         })?;
 
+        let existing_id = self.db.find_chunk_id(
+            &file_path,
+            start_byte,
+            end_byte,
+            kind,
+            chunk_hash,
+        )?;
         let record = ChunkRecord {
-            id: Uuid::now_v7().to_string(),
+            id: existing_id
+                .clone()
+                .unwrap_or_else(|| Uuid::now_v7().to_string()),
             file_path,
             start_byte,
             end_byte,
@@ -69,14 +73,30 @@ impl<'a> IndexProcessor<'a> {
             tokens,
         };
 
+        let is_existing = existing_id.is_some();
+        let chunk_id = record.id.clone();
+        let record_file_path = record.file_path.clone();
+        let record_text = record.text.clone();
+        let record = {
+            let idx = entry.chunks.len();
+            entry.chunks.push(record);
+            entry.chunk_index.insert(chunk_id.clone(), idx);
+            entry.chunks[idx].clone()
+        };
+        if is_existing {
+            self.db.update_chunk_without_embedding(&record)?;
+            return Ok(None);
+        }
+
+        entry.pending_embeddings.insert(chunk_id.clone());
+
         let batch_item = BatchItem {
-            chunk_id: record.id.clone(),
-            file_path: record.file_path.clone(),
-            text: record.text.clone(),
+            chunk_id,
+            file_path: record_file_path,
+            text: record_text,
             token_count,
         };
-        entry.chunks.push(record);
-        self.maybe_process_batch(batch_item).await
+        Ok(Some(batch_item))
     }
 
     pub(super) fn handle_eof(
@@ -101,14 +121,10 @@ impl<'a> IndexProcessor<'a> {
             .or_insert_with(|| PendingFile::new(file_size));
         entry.file_size = file_size;
 
-        let observed = self
-            .observed_graphs
-            .lock()
-            .expect("graph observer lock poisoned")
-            .remove(file_path);
+        let observed = self.observed_graphs.remove(file_path);
 
-        if let Some(observed) = observed {
-            self.db.replace_file_graph(
+        if let Some((_, observed)) = observed {
+            self.db.upsert_file_graph(
                 file_path,
                 entry.file_size,
                 hash,
@@ -128,10 +144,4 @@ impl<'a> IndexProcessor<'a> {
         self.try_finalize_files(vec![file_path.to_string()])
     }
 
-    pub(super) async fn maybe_process_batch(&mut self, item: BatchItem) -> Result<()> {
-        if let Some(batch) = self.stream_batcher.add(item) {
-            self.process_chunk_batch(batch).await?;
-        }
-        Ok(())
-    }
 }
