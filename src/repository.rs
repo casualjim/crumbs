@@ -28,11 +28,6 @@ pub trait Repository {
         file_size: u64,
         primary_language: Option<String>,
     ) -> Result<()>;
-    fn upsert_chunk_with_embedding(
-        &self,
-        record: &ChunkRecord,
-        embedding: &[f32],
-    ) -> Result<()>;
     fn upsert_chunks_with_embeddings(
         &self,
         records: &[ChunkRecord],

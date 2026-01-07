@@ -416,6 +416,14 @@ pub struct PromptCli {
         help = "Output format: xml|markdown"
     )]
     pub format: PromptFormat,
+    #[arg(
+        long = "sections",
+        value_enum,
+        value_delimiter = ',',
+        num_args = 1..,
+        help = "Sections to include: structure,summary,context,query (comma-separated or repeated). Omit for all sections."
+    )]
+    pub sections: Vec<PromptSection>,
     #[arg(value_name = "TASK", help = "Task or question to build context for")]
     pub task: String,
 }
@@ -425,6 +433,14 @@ pub enum PromptFormat {
     #[value(alias = "md")]
     Markdown,
     Xml,
+}
+
+#[derive(ValueEnum, Clone, Debug, Eq, PartialEq)]
+pub enum PromptSection {
+    Structure,
+    Summary,
+    Context,
+    Query,
 }
 
 #[derive(Args)]

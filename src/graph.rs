@@ -159,11 +159,12 @@ pub(crate) fn extract_graph_from_tree(
         return Ok(None);
     };
 
-    extract_graph_from_tree_inner(file_path, ts_language, tree, source, query_source)
+    extract_graph_from_tree_inner(file_path, language, ts_language, tree, source, query_source)
 }
 
 fn extract_graph_from_tree_inner(
     file_path: &str,
+    language: &str,
     ts_language: tree_sitter::Language,
     tree: &tree_sitter::Tree,
     source: &str,
@@ -213,22 +214,22 @@ fn extract_graph_from_tree_inner(
                 let id = stable_id(file_path, "definition", start_byte, end_byte, &text);
                 symbols.push(SymbolRecord {
                     id,
-                    file_path: String::new(),
+                    file_path: file_path.to_string(),
                     name: text,
                     kind: "definition".to_string(),
                     start_byte,
                     end_byte,
-                    language: String::new(),
+                    language: language.to_string(),
                 });
             } else {
                 let id = stable_id(file_path, "reference", start_byte, end_byte, &text);
                 references.push(ReferenceRecord {
                     id,
-                    file_path: String::new(),
+                    file_path: file_path.to_string(),
                     name: text,
                     start_byte,
                     end_byte,
-                    language: String::new(),
+                    language: language.to_string(),
                 });
             }
         }

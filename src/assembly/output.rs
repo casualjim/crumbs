@@ -37,6 +37,33 @@ pub struct PromptPayload {
     pub blocks: Vec<EnrichedBlock>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PromptSections {
+    pub structure: bool,
+    pub summary: bool,
+    pub context: bool,
+    pub query: bool,
+}
+
+impl PromptSections {
+    pub fn all() -> Self {
+        Self {
+            structure: true,
+            summary: true,
+            context: true,
+            query: true,
+        }
+    }
+
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    fn overview_enabled(self) -> bool {
+        self.structure || self.summary
+    }
+}
+
 #[derive(Clone)]
 pub struct RepositoryOverview {
     pub name: String,
@@ -106,53 +133,59 @@ pub async fn enrich_blocks(
     Ok(enriched)
 }
 
-pub fn render_prompt(format: PromptFormat, payload: &PromptPayload) -> String {
+pub fn render_prompt(format: PromptFormat, payload: &PromptPayload, sections: PromptSections) -> String {
     match format {
-        PromptFormat::Xml => render_xml(payload),
-        PromptFormat::Markdown => render_markdown(payload),
+        PromptFormat::Xml => render_xml(payload, sections),
+        PromptFormat::Markdown => render_markdown(payload, sections),
     }
 }
 
-fn render_xml(payload: &PromptPayload) -> String {
+fn render_xml(payload: &PromptPayload, sections: PromptSections) -> String {
     let mut out = String::new();
     writeln!(out, "<context>").ok();
-    writeln!(out, "  <repository_overview>").ok();
-    writeln!(out, "    <name>{}</name>", payload.overview.name).ok();
-    if !payload.overview.structure.is_empty() {
-        write_cdata(
-            &mut out,
-            "    <structure><![CDATA[",
-            &payload.overview.structure.join("\n"),
-            "]]></structure>",
-        );
+    if sections.overview_enabled() {
+        writeln!(out, "  <repository_overview>").ok();
+        writeln!(out, "    <name>{}</name>", payload.overview.name).ok();
+        if sections.structure && !payload.overview.structure.is_empty() {
+            write_cdata(
+                &mut out,
+                "    <structure><![CDATA[",
+                &payload.overview.structure.join("\n"),
+                "]]></structure>",
+            );
+        }
+        if sections.summary && !payload.overview.tech_stack.is_empty() {
+            writeln!(
+                out,
+                "    <tech_stack>{}</tech_stack>",
+                xml_escape(&payload.overview.tech_stack.join(", "))
+            )
+            .ok();
+        }
+        if sections.summary && !payload.overview.summary.is_empty() {
+            write_cdata(
+                &mut out,
+                "    <summary_map><![CDATA[",
+                &payload.overview.summary.join("\n"),
+                "]]></summary_map>",
+            );
+        }
+        writeln!(out, "  </repository_overview>").ok();
     }
-    if !payload.overview.tech_stack.is_empty() {
-        writeln!(
-            out,
-            "    <tech_stack>{}</tech_stack>",
-            xml_escape(&payload.overview.tech_stack.join(", "))
-        )
-        .ok();
-    }
-    if !payload.overview.summary.is_empty() {
-        write_cdata(
-            &mut out,
-            "    <summary_map><![CDATA[",
-            &payload.overview.summary.join("\n"),
-            "]]></summary_map>",
-        );
-    }
-    writeln!(out, "  </repository_overview>").ok();
-    writeln!(out, "  <code_context>").ok();
+    if sections.context {
+        writeln!(out, "  <code_context>").ok();
 
-    let (primary, expanded) = split_blocks(&payload.blocks);
-    write_xml_group(&mut out, "retrieved_files", &primary);
-    write_xml_group(&mut out, "expanded_files", &expanded);
+        let (primary, expanded) = split_blocks(&payload.blocks);
+        write_xml_group(&mut out, "retrieved_files", &primary);
+        write_xml_group(&mut out, "expanded_files", &expanded);
 
-    writeln!(out, "  </code_context>").ok();
-    writeln!(out, "  <user_query>").ok();
-    writeln!(out, "{}", xml_escape(&payload.task)).ok();
-    writeln!(out, "  </user_query>").ok();
+        writeln!(out, "  </code_context>").ok();
+    }
+    if sections.query {
+        writeln!(out, "  <user_query>").ok();
+        writeln!(out, "{}", xml_escape(&payload.task)).ok();
+        writeln!(out, "  </user_query>").ok();
+    }
     writeln!(out, "</context>").ok();
     out
 }
@@ -204,43 +237,48 @@ fn write_xml_group(out: &mut String, label: &str, blocks: &[EnrichedBlock]) {
     writeln!(out, "    </{label}>").ok();
 }
 
-fn render_markdown(payload: &PromptPayload) -> String {
+fn render_markdown(payload: &PromptPayload, sections: PromptSections) -> String {
     let mut out = String::new();
-    writeln!(out, "## Repository: {}", payload.overview.name).ok();
-    if !payload.overview.tech_stack.is_empty() {
+    if sections.overview_enabled() {
+        writeln!(out, "## Repository: {}", payload.overview.name).ok();
+        if sections.summary && !payload.overview.tech_stack.is_empty() {
+            writeln!(
+                out,
+                "Tech stack: {}",
+                payload.overview.tech_stack.join(", ")
+            )
+            .ok();
+        }
+        if sections.structure && !payload.overview.structure.is_empty() {
+            writeln!(out, "\n### Structure\n```").ok();
+            for line in &payload.overview.structure {
+                writeln!(out, "{line}").ok();
+            }
+            writeln!(out, "```").ok();
+        }
+        if sections.summary && !payload.overview.summary.is_empty() {
+            writeln!(out, "\n### Summary Map\n```").ok();
+            for line in &payload.overview.summary {
+                writeln!(out, "{line}").ok();
+            }
+            writeln!(out, "```").ok();
+        }
+    }
+    if sections.context {
         writeln!(
             out,
-            "Tech stack: {}",
-            payload.overview.tech_stack.join(", ")
+            "\n## Retrieved Context ({} blocks)",
+            payload.blocks.len()
         )
         .ok();
-    }
-    if !payload.overview.structure.is_empty() {
-        writeln!(out, "\n### Structure\n```").ok();
-        for line in &payload.overview.structure {
-            writeln!(out, "{line}").ok();
-        }
-        writeln!(out, "```").ok();
-    }
-    if !payload.overview.summary.is_empty() {
-        writeln!(out, "\n### Summary Map\n```").ok();
-        for line in &payload.overview.summary {
-            writeln!(out, "{line}").ok();
-        }
-        writeln!(out, "```").ok();
-    }
-    writeln!(
-        out,
-        "\n## Retrieved Context ({} blocks)",
-        payload.blocks.len()
-    )
-    .ok();
 
-    let (primary, expanded) = split_blocks(&payload.blocks);
-    write_markdown_group(&mut out, "Primary Results", &primary);
-    write_markdown_group(&mut out, "Expanded Context", &expanded);
-
-    writeln!(out, "\n## User Query\n{}", payload.task).ok();
+        let (primary, expanded) = split_blocks(&payload.blocks);
+        write_markdown_group(&mut out, "Primary Results", &primary);
+        write_markdown_group(&mut out, "Expanded Context", &expanded);
+    }
+    if sections.query {
+        writeln!(out, "\n## User Query\n{}", payload.task).ok();
+    }
     out
 }
 
@@ -539,7 +577,7 @@ mod tests {
         let graph_b = GraphData {
             symbols: vec![SymbolRecord {
                 id: "sym_b".to_string(),
-                file_path: String::new(),
+                file_path: b_path.clone(),
                 name: "foo".to_string(),
                 kind: "definition".to_string(),
                 start_byte: 0,
@@ -557,7 +595,7 @@ mod tests {
             symbols: Vec::new(),
             references: vec![ReferenceRecord {
                 id: "ref_a".to_string(),
-                file_path: String::new(),
+                file_path: a_path.clone(),
                 name: "foo".to_string(),
                 start_byte: 0,
                 end_byte: 3,
@@ -612,6 +650,7 @@ mod tests {
                 task: "test".to_string(),
                 blocks: Vec::new(),
             },
+            PromptSections::all(),
         );
         assert!(
             xml.contains("<summary_map>"),

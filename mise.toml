@@ -2,6 +2,7 @@
 experimental = true
 
 [tools]
+"cargo:samply" = "latest"
 hk = "latest"
 pkl = "latest"
 rust = "1.92.0"

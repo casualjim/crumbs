@@ -7,7 +7,7 @@ use rusqlite::types::Value;
 use tempfile::TempDir;
 use text_chunking::Tokenizer;
 
-use crate::db::{ChunkRecord, GraphData, ReferenceRecord, SymbolRecord};
+use crate::db::{ChunkRecord, GraphData, ReferenceRecord, SymbolRecord, build_fts_text};
 use crate::graph::HistoryConfig;
 use crate::repository::Repository;
 use crate::search;
@@ -40,6 +40,7 @@ fn chunk_record(
         start_line: 1,
         end_line: 1,
         text: "hello world".to_string(),
+        fts_text: build_fts_text("hello world"),
         kind: "text".to_string(),
         ordinal: 0,
         tokens,
@@ -379,7 +380,7 @@ fn refresh_file_dependency_edges_should_include_multi_definitions() {
     let graph_a = GraphData {
         symbols: vec![SymbolRecord {
             id: "s1".to_string(),
-            file_path: String::new(),
+            file_path: "a.rs".to_string(),
             name: "X".to_string(),
             kind: "definition".to_string(),
             start_byte: 0,
@@ -395,7 +396,7 @@ fn refresh_file_dependency_edges_should_include_multi_definitions() {
     let graph_b = GraphData {
         symbols: vec![SymbolRecord {
             id: "s2".to_string(),
-            file_path: String::new(),
+            file_path: "b.rs".to_string(),
             name: "X".to_string(),
             kind: "definition".to_string(),
             start_byte: 0,
@@ -412,7 +413,7 @@ fn refresh_file_dependency_edges_should_include_multi_definitions() {
         symbols: Vec::new(),
         references: vec![ReferenceRecord {
             id: "r1".to_string(),
-            file_path: String::new(),
+            file_path: "c.rs".to_string(),
             name: "X".to_string(),
             start_byte: 0,
             end_byte: 1,

@@ -2,7 +2,7 @@ use eyre::{Result, eyre};
 use text_chunking::{FileMetadata, SemanticChunk};
 use uuid::Uuid;
 
-use crate::db::ChunkRecord;
+use crate::db::{ChunkRecord, build_fts_text};
 
 use super::super::batcher::BatchItem;
 use super::super::state::{PendingEof, PendingFile};
@@ -57,6 +57,7 @@ impl<'a> IndexProcessor<'a> {
             kind,
             chunk_hash,
         )?;
+        let fts_text = build_fts_text(&text);
         let record = ChunkRecord {
             id: existing_id
                 .clone()
@@ -68,6 +69,7 @@ impl<'a> IndexProcessor<'a> {
             start_line,
             end_line,
             text,
+            fts_text,
             kind: kind.to_string(),
             ordinal,
             tokens,

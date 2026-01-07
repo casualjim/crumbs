@@ -180,7 +180,21 @@ async fn main() -> Result<()> {
                 config::PromptFormat::Xml => assembly::output::PromptFormat::Xml,
                 config::PromptFormat::Markdown => assembly::output::PromptFormat::Markdown,
             };
-            let rendered = assembly::output::render_prompt(format, &payload);
+            let sections = if cmd.sections.is_empty() {
+                assembly::output::PromptSections::all()
+            } else {
+                let mut selected = assembly::output::PromptSections::none();
+                for section in &cmd.sections {
+                    match section {
+                        config::PromptSection::Structure => selected.structure = true,
+                        config::PromptSection::Summary => selected.summary = true,
+                        config::PromptSection::Context => selected.context = true,
+                        config::PromptSection::Query => selected.query = true,
+                    }
+                }
+                selected
+            };
+            let rendered = assembly::output::render_prompt(format, &payload, sections);
             print!("{rendered}");
         }
         Command::Config(cmd) => match &cmd.command {

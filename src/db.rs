@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use eyre::{Result, eyre};
+use charabia::Tokenize;
 
 use crate::repository::Repository;
 
@@ -116,6 +117,7 @@ impl Db {
           start_line INTEGER NOT NULL,
           end_line INTEGER NOT NULL,
           text TEXT NOT NULL,
+          fts_text TEXT NOT NULL,
           kind TEXT NOT NULL,
           ordinal INTEGER NOT NULL,
           tokens BLOB,
@@ -177,6 +179,7 @@ impl Db {
         );
 
         self.conn.execute_batch(&create_sql)?;
+        self.ensure_fts_text_column()?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS chunks_embedding_idx \
              ON chunks(libsql_vector_idx(embedding));",
@@ -187,22 +190,25 @@ impl Db {
 
     fn init_fts(&mut self) -> Result<()> {
         let fts_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5( \
-          text, content='chunks', content_rowid='rowid' \
+          fts_text, content='chunks', content_rowid='rowid' \
         ); \
         CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN \
-          INSERT INTO fts_chunks(rowid, text) VALUES (new.rowid, new.text); \
+          INSERT INTO fts_chunks(rowid, fts_text) VALUES (new.rowid, new.fts_text); \
         END; \
         CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN \
-          INSERT INTO fts_chunks(fts_chunks, rowid, text) VALUES('delete', old.rowid, old.text); \
+          INSERT INTO fts_chunks(fts_chunks, rowid, fts_text) VALUES('delete', old.rowid, old.fts_text); \
         END; \
         CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN \
-          INSERT INTO fts_chunks(fts_chunks, rowid, text) VALUES('delete', old.rowid, old.text); \
-          INSERT INTO fts_chunks(rowid, text) VALUES (new.rowid, new.text); \
+          INSERT INTO fts_chunks(fts_chunks, rowid, fts_text) VALUES('delete', old.rowid, old.fts_text); \
+          INSERT INTO fts_chunks(rowid, fts_text) VALUES (new.rowid, new.fts_text); \
         END;";
         if let Err(err) = self.conn.execute_batch(fts_sql) {
-            self.fts_loaded = false;
             tracing::warn!("failed to initialize FTS: {err}");
-            return Ok(());
+            if let Err(rebuild_err) = self.rebuild_fts_schema(fts_sql) {
+                self.fts_loaded = false;
+                tracing::warn!("failed to rebuild FTS schema: {rebuild_err}");
+                return Ok(());
+            }
         }
         if let Err(err) = self
             .conn
@@ -211,6 +217,41 @@ impl Db {
             tracing::warn!("failed to rebuild FTS index: {err}");
         }
         self.fts_loaded = true;
+        Ok(())
+    }
+
+    fn rebuild_fts_schema(&self, fts_sql: &str) -> Result<()> {
+        self.conn.execute_batch(
+            "DROP TRIGGER IF EXISTS chunks_ai; \
+             DROP TRIGGER IF EXISTS chunks_ad; \
+             DROP TRIGGER IF EXISTS chunks_au; \
+             DROP TABLE IF EXISTS fts_chunks;",
+        )?;
+        self.conn.execute_batch(fts_sql)?;
+        Ok(())
+    }
+
+    fn ensure_fts_text_column(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(chunks)")?;
+        let mut rows = stmt.query([])?;
+        let mut has_column = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "fts_text" {
+                has_column = true;
+                break;
+            }
+        }
+
+        if !has_column {
+            self.conn.execute(
+                "ALTER TABLE chunks ADD COLUMN fts_text TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+
+        self.conn
+            .execute("UPDATE chunks SET fts_text = text WHERE fts_text = ''", [])?;
         Ok(())
     }
 
@@ -364,12 +405,12 @@ impl Db {
         let embedding_json = encode_f32_json(embedding);
         let sql = format!(
             "INSERT INTO chunks \
-      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?))",
+      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, tokens, embedding) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?))",
             tokens_sql = tokens_sql,
         );
 
-        let mut params_vec = Vec::with_capacity(12);
+        let mut params_vec = Vec::with_capacity(13);
         params_vec.push(Value::Text(record.id.clone()));
         params_vec.push(Value::Text(record.file_path.clone()));
         params_vec.push(Value::Integer(record.start_byte as i64));
@@ -378,6 +419,7 @@ impl Db {
         params_vec.push(Value::Integer(record.start_line as i64));
         params_vec.push(Value::Integer(record.end_line as i64));
         params_vec.push(Value::Text(record.text.clone()));
+        params_vec.push(Value::Text(record.fts_text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Integer(record.ordinal as i64));
         if let Some(tokens_blob) = tokens_blob {
@@ -396,7 +438,12 @@ impl Db {
         Ok(())
     }
 
-    fn upsert_chunk_with_embedding(&self, record: &ChunkRecord, embedding: &[f32]) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn upsert_chunk_with_embedding(
+        &self,
+        record: &ChunkRecord,
+        embedding: &[f32],
+    ) -> Result<()> {
         self.ensure_file_exists(&record.file_path)?;
         if record.start_byte > record.end_byte {
             return Err(eyre!(
@@ -422,8 +469,8 @@ impl Db {
         let embedding_json = encode_f32_json(embedding);
         let sql = format!(
             "INSERT INTO chunks \
-      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?)) \
+      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, tokens, embedding) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?)) \
       ON CONFLICT(id) DO UPDATE SET \
         file_path = excluded.file_path, \
         start_byte = excluded.start_byte, \
@@ -432,6 +479,7 @@ impl Db {
         start_line = excluded.start_line, \
         end_line = excluded.end_line, \
         text = excluded.text, \
+        fts_text = excluded.fts_text, \
         kind = excluded.kind, \
         ordinal = excluded.ordinal, \
         tokens = excluded.tokens, \
@@ -439,7 +487,7 @@ impl Db {
             tokens_sql = tokens_sql,
         );
 
-        let mut params_vec = Vec::with_capacity(12);
+        let mut params_vec = Vec::with_capacity(13);
         params_vec.push(Value::Text(record.id.clone()));
         params_vec.push(Value::Text(record.file_path.clone()));
         params_vec.push(Value::Integer(record.start_byte as i64));
@@ -448,6 +496,7 @@ impl Db {
         params_vec.push(Value::Integer(record.start_line as i64));
         params_vec.push(Value::Integer(record.end_line as i64));
         params_vec.push(Value::Text(record.text.clone()));
+        params_vec.push(Value::Text(record.fts_text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Integer(record.ordinal as i64));
         if let Some(tokens_blob) = tokens_blob {
@@ -516,7 +565,7 @@ impl Db {
             let embed_sql = "vector32(?)";
 
             values_sql.push(format!(
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, {embed_sql})",
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, {embed_sql})",
                 tokens_sql = tokens_sql,
                 embed_sql = embed_sql
             ));
@@ -530,6 +579,7 @@ impl Db {
             params_vec.push(Value::Integer(record.start_line as i64));
             params_vec.push(Value::Integer(record.end_line as i64));
             params_vec.push(Value::Text(record.text.clone()));
+            params_vec.push(Value::Text(record.fts_text.clone()));
             params_vec.push(Value::Text(record.kind.clone()));
             params_vec.push(Value::Integer(record.ordinal as i64));
             if let Some(tokens_blob) = tokens_blob {
@@ -543,7 +593,7 @@ impl Db {
         }
 
         let sql = format!(
-            "INSERT INTO chunks (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, kind, ordinal, tokens, embedding) \
+            "INSERT INTO chunks (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, tokens, embedding) \
              VALUES {values} \
              ON CONFLICT(id) DO UPDATE SET \
                file_path = excluded.file_path, \
@@ -553,6 +603,7 @@ impl Db {
                start_line = excluded.start_line, \
                end_line = excluded.end_line, \
                text = excluded.text, \
+               fts_text = excluded.fts_text, \
                kind = excluded.kind, \
                ordinal = excluded.ordinal, \
                tokens = excluded.tokens, \
@@ -583,11 +634,11 @@ impl Db {
         let sql = format!(
             "UPDATE chunks SET \
            file_path = ?, start_byte = ?, end_byte = ?, chunk_hash = ?, start_line = ?, end_line = ?, \
-           text = ?, kind = ?, ordinal = ?, tokens = {tokens_sql} \
+           text = ?, fts_text = ?, kind = ?, ordinal = ?, tokens = {tokens_sql} \
            WHERE id = ?",
             tokens_sql = tokens_sql
         );
-        let mut params_vec = Vec::with_capacity(11);
+        let mut params_vec = Vec::with_capacity(12);
         params_vec.push(Value::Text(record.file_path.clone()));
         params_vec.push(Value::Integer(record.start_byte as i64));
         params_vec.push(Value::Integer(record.end_byte as i64));
@@ -595,6 +646,7 @@ impl Db {
         params_vec.push(Value::Integer(record.start_line as i64));
         params_vec.push(Value::Integer(record.end_line as i64));
         params_vec.push(Value::Text(record.text.clone()));
+        params_vec.push(Value::Text(record.fts_text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Integer(record.ordinal as i64));
         if let Some(tokens_blob) = tokens_blob {
@@ -620,6 +672,7 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
     fn insert_symbol(&self, record: &SymbolRecord) -> Result<()> {
         self.ensure_file_exists(&record.file_path)?;
         self.conn.execute(
@@ -642,6 +695,7 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
     fn insert_reference(&self, record: &ReferenceRecord) -> Result<()> {
         self.ensure_file_exists(&record.file_path)?;
         self.conn.execute(
@@ -663,6 +717,7 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
     fn link_reference_symbol(&self, reference_id: &str, symbol_id: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO reference_symbol_edges (reference_id, symbol_id) VALUES (?, ?)",
@@ -719,6 +774,7 @@ pub struct ChunkRecord {
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
+    pub fts_text: String,
     pub kind: String,
     pub ordinal: usize,
     pub tokens: Option<Vec<u32>>,
@@ -782,6 +838,124 @@ fn array_value_placeholder(count: usize) -> String {
         vars.push('?');
     }
     vars
+}
+
+pub(crate) fn build_fts_text(text: &str) -> String {
+    let terms = tokenize_for_fts(text);
+    if terms.is_empty() {
+        String::new()
+    } else {
+        terms.join(" ")
+    }
+}
+
+pub(crate) fn build_fts_query(text: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for term in tokenize_for_fts(text) {
+        if term.len() < 2 {
+            continue;
+        }
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+        if terms.len() >= 32 {
+            break;
+        }
+    }
+
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
+fn tokenize_for_fts(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for token in text.tokenize() {
+        if !token.is_word() {
+            continue;
+        }
+        let lemma = token.lemma();
+        if lemma.is_empty() {
+            continue;
+        }
+        terms.push(lemma.to_string());
+        for part in split_identifier(lemma) {
+            if part != lemma {
+                terms.push(part);
+            }
+        }
+    }
+    terms
+}
+
+fn split_identifier(token: &str) -> Vec<String> {
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Kind {
+        Lower,
+        Upper,
+        Digit,
+        Other,
+    }
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut prev_kind = None;
+
+    for ch in token.chars() {
+        let kind = if ch.is_ascii_lowercase() {
+            Kind::Lower
+        } else if ch.is_ascii_uppercase() {
+            Kind::Upper
+        } else if ch.is_ascii_digit() {
+            Kind::Digit
+        } else {
+            Kind::Other
+        };
+
+        if let Some(prev) = prev_kind {
+            let boundary = matches!(
+                (prev, kind),
+                (Kind::Lower, Kind::Upper)
+                    | (Kind::Lower, Kind::Digit)
+                    | (Kind::Upper, Kind::Digit)
+                    | (Kind::Digit, Kind::Lower)
+                    | (Kind::Digit, Kind::Upper)
+            );
+
+            if boundary && !current.is_empty() {
+                if prev == Kind::Upper && kind == Kind::Lower && current.len() > 1 {
+                    let last = current.pop().unwrap();
+                    if !current.is_empty() {
+                        parts.push(current.clone());
+                    }
+                    current.clear();
+                    current.push(last.to_ascii_lowercase());
+                } else {
+                    parts.push(current.clone());
+                    current.clear();
+                }
+            }
+        }
+
+        if kind == Kind::Other {
+            if !current.is_empty() {
+                parts.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch.to_ascii_lowercase());
+        }
+        prev_kind = Some(kind);
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
 }
 
 fn encode_u32_blob(tokens: &[u32]) -> Vec<u8> {
@@ -871,14 +1045,6 @@ impl Repository for Db {
         primary_language: Option<String>,
     ) -> Result<()> {
         self.ensure_file(file_path, file_size, primary_language.as_deref())
-    }
-
-    fn upsert_chunk_with_embedding(
-        &self,
-        record: &ChunkRecord,
-        embedding: &[f32],
-    ) -> Result<()> {
-        self.upsert_chunk_with_embedding(record, embedding)
     }
 
     fn upsert_chunks_with_embeddings(
@@ -1032,16 +1198,26 @@ impl Repository for Db {
                 let mut edge_values = Vec::with_capacity(graph.symbols.len());
                 let mut edge_params = Vec::with_capacity(graph.symbols.len() * 2);
                 for symbol in &graph.symbols {
+                    let symbol_file_path = if symbol.file_path.is_empty() {
+                        file_path
+                    } else {
+                        symbol.file_path.as_str()
+                    };
+                    let symbol_language = if symbol.language.is_empty() {
+                        language
+                    } else {
+                        symbol.language.as_str()
+                    };
                     values.push("(?, ?, ?, ?, ?, ?, ?)".to_string());
                     edge_values.push("(?, ?)".to_string());
                     params.push(Value::Text(symbol.id.clone()));
-                    params.push(Value::Text(file_path.to_string()));
+                    params.push(Value::Text(symbol_file_path.to_string()));
                     params.push(Value::Text(symbol.name.clone()));
                     params.push(Value::Text(symbol.kind.clone()));
                     params.push(Value::Integer(symbol.start_byte as i64));
                     params.push(Value::Integer(symbol.end_byte as i64));
-                    params.push(Value::Text(language.to_string()));
-                    edge_params.push(Value::Text(file_path.to_string()));
+                    params.push(Value::Text(symbol_language.to_string()));
+                    edge_params.push(Value::Text(symbol_file_path.to_string()));
                     edge_params.push(Value::Text(symbol.id.clone()));
                 }
 
@@ -1076,15 +1252,25 @@ impl Repository for Db {
                 let mut edge_values = Vec::with_capacity(graph.references.len());
                 let mut edge_params = Vec::with_capacity(graph.references.len() * 2);
                 for reference in &graph.references {
+                    let reference_file_path = if reference.file_path.is_empty() {
+                        file_path
+                    } else {
+                        reference.file_path.as_str()
+                    };
+                    let reference_language = if reference.language.is_empty() {
+                        language
+                    } else {
+                        reference.language.as_str()
+                    };
                     values.push("(?, ?, ?, ?, ?, ?)".to_string());
                     edge_values.push("(?, ?)".to_string());
                     params.push(Value::Text(reference.id.clone()));
-                    params.push(Value::Text(file_path.to_string()));
+                    params.push(Value::Text(reference_file_path.to_string()));
                     params.push(Value::Text(reference.name.clone()));
                     params.push(Value::Integer(reference.start_byte as i64));
                     params.push(Value::Integer(reference.end_byte as i64));
-                    params.push(Value::Text(language.to_string()));
-                    edge_params.push(Value::Text(file_path.to_string()));
+                    params.push(Value::Text(reference_language.to_string()));
+                    edge_params.push(Value::Text(reference_file_path.to_string()));
                     edge_params.push(Value::Text(reference.id.clone()));
                 }
 
@@ -1300,7 +1486,7 @@ impl Repository for Db {
             ));
         }
 
-        let Some(query) = Self::normalize_fts_query(query) else {
+        let Some(query) = build_fts_query(query) else {
             return Ok(Vec::new());
         };
 
@@ -1339,35 +1525,6 @@ impl Repository for Db {
         }
         Ok(results)
     }
-
-    fn normalize_fts_query(query: &str) -> Option<String> {
-        let mut out = String::with_capacity(query.len());
-        let mut last_space = true;
-    for ch in query.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch.to_ascii_lowercase());
-            last_space = false;
-        } else if ch.is_alphanumeric() {
-            for lowered in ch.to_lowercase() {
-                out.push(lowered);
-            }
-            last_space = false;
-        } else if !last_space {
-            out.push(' ');
-            last_space = true;
-        }
-    }
-
-    while out.ends_with(' ') {
-        out.pop();
-    }
-
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
 
     fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>> {
         if seeds.is_empty() || limit == 0 {
@@ -1690,6 +1847,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: "hello".to_string(),
+            fts_text: build_fts_text("hello"),
             kind: "text".to_string(),
             ordinal: 0,
             tokens: None,
@@ -1721,6 +1879,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: "broken".to_string(),
+            fts_text: build_fts_text("broken"),
             kind: "text".to_string(),
             ordinal: 0,
             tokens: None,
