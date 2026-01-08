@@ -1,8 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 use std::path::Path;
 
+use dark_light::Mode as DarkLightMode;
 use eyre::Result;
+use syntastica::Processor;
+use syntastica::language_set::SupportedLanguage;
+use syntastica::renderer::TerminalRenderer;
+use syntastica::theme::ResolvedTheme;
+use syntastica_parsers::{Lang, LanguageSetImpl};
 use text_chunking::languages;
 
 use crate::assembly::pipeline::{CandidateSource, ContextBlock};
@@ -105,14 +112,17 @@ pub async fn enrich_blocks(
         let end_line = line_from_i64(block.end_line);
 
         let mut symbol_names = BTreeSet::new();
-        for symbol in db.symbols_in_range(&block.file_path, block.start_byte, block.end_byte)? {
+        for symbol in db
+            .symbols_in_range(&block.file_path, block.start_byte, block.end_byte)
+            .await?
+        {
             symbol_names.insert(symbol.name);
         }
 
         let language = if let Some(cached) = language_cache.get(&block.file_path) {
             cached.clone()
         } else {
-            let detected = db.file_primary_language(&block.file_path)?;
+            let detected = db.file_primary_language(&block.file_path).await?;
             language_cache.insert(block.file_path.clone(), detected.clone());
             detected
         }
@@ -133,10 +143,23 @@ pub async fn enrich_blocks(
     Ok(enriched)
 }
 
-pub fn render_prompt(format: PromptFormat, payload: &PromptPayload, sections: PromptSections) -> String {
+pub fn render_prompt(
+    format: PromptFormat,
+    payload: &PromptPayload,
+    sections: PromptSections,
+    theme: Option<&str>,
+) -> String {
     match format {
         PromptFormat::Xml => render_xml(payload, sections),
-        PromptFormat::Markdown => render_markdown(payload, sections),
+        PromptFormat::Markdown => {
+            let markdown = render_markdown(payload, sections);
+            if std::io::stdout().is_terminal() {
+                let theme = resolve_theme(theme);
+                highlight_markdown(&markdown, &theme)
+            } else {
+                markdown
+            }
+        }
     }
 }
 
@@ -310,6 +333,38 @@ fn write_markdown_group(out: &mut String, label: &str, blocks: &[EnrichedBlock])
     }
 }
 
+fn highlight_markdown(markdown: &str, theme: &ResolvedTheme) -> String {
+    let language_set = LanguageSetImpl::new();
+    let Ok(lang) =
+        <Lang as SupportedLanguage<'_, LanguageSetImpl>>::for_name("markdown", &language_set)
+    else {
+        return markdown.to_string();
+    };
+    let mut processor = Processor::new(&language_set);
+    let mut renderer = TerminalRenderer::new(None);
+
+    match processor.process(markdown, lang) {
+        Ok(highlights) => syntastica::render(&highlights, &mut renderer, theme.clone()),
+        Err(_) => markdown.to_string(),
+    }
+}
+
+fn resolve_theme(theme: Option<&str>) -> ResolvedTheme {
+    let override_name = theme.unwrap_or("").trim();
+    if !override_name.is_empty() && override_name != "auto" {
+        if let Some(theme) = syntastica_themes::from_str(override_name) {
+            return theme;
+        }
+    }
+
+    match dark_light::detect() {
+        Ok(DarkLightMode::Light) => syntastica_themes::catppuccin::latte(),
+        Ok(DarkLightMode::Dark) => syntastica_themes::catppuccin::mocha(),
+        Ok(DarkLightMode::Unspecified) => syntastica_themes::catppuccin::mocha(),
+        Err(_) => syntastica_themes::catppuccin::mocha(),
+    }
+}
+
 fn split_blocks(blocks: &[EnrichedBlock]) -> (Vec<EnrichedBlock>, Vec<EnrichedBlock>) {
     let mut primary = Vec::new();
     let mut expanded = Vec::new();
@@ -346,7 +401,10 @@ fn write_cdata(out: &mut String, prefix: &str, text: &str, suffix: &str) {
     out.push('\n');
 }
 
-pub fn build_repository_overview(repo_root: &Path, db: &dyn Repository) -> RepositoryOverview {
+pub async fn build_repository_overview(
+    repo_root: &Path,
+    db: &dyn Repository,
+) -> RepositoryOverview {
     let name = repo_root
         .file_name()
         .and_then(|name| name.to_str())
@@ -354,7 +412,7 @@ pub fn build_repository_overview(repo_root: &Path, db: &dyn Repository) -> Repos
         .to_string();
     let structure = build_structure(repo_root, 2, 200);
     let tech_stack = detect_tech_stack(repo_root);
-    let summary = build_repository_summary(repo_root, db);
+    let summary = build_repository_summary(repo_root, db).await;
     RepositoryOverview {
         name,
         structure,
@@ -363,9 +421,9 @@ pub fn build_repository_overview(repo_root: &Path, db: &dyn Repository) -> Repos
     }
 }
 
-fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
+async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
     let mut lines = Vec::new();
-    let Ok(ranks) = db.file_dependency_pagerank(SUMMARY_LIMIT) else {
+    let Ok(ranks) = db.file_dependency_pagerank(SUMMARY_LIMIT).await else {
         return lines;
     };
     if ranks.is_empty() {
@@ -383,7 +441,7 @@ fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String
         if is_test_path(&display_path_value) {
             badges.push("test");
         }
-        if let Ok(commit_count) = db.file_commit_count(file_path) {
+        if let Ok(commit_count) = db.file_commit_count(file_path).await {
             if commit_count >= SUMMARY_HIGH_CHURN_COMMITS {
                 badges.push("high-churn");
             }
@@ -406,7 +464,10 @@ fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String
             display_path_value, badge_text, score
         ));
 
-        if let Ok(partners) = db.cochange_partners(file_path, SUMMARY_COCHANGE_LIMIT) {
+        if let Ok(partners) = db
+            .cochange_partners(file_path, SUMMARY_COCHANGE_LIMIT)
+            .await
+        {
             if !partners.is_empty() {
                 let items = partners
                     .into_iter()
@@ -557,8 +618,8 @@ mod tests {
 
     use crate::db::{Db, GraphData, ReferenceRecord, SymbolRecord};
 
-    #[test]
-    fn repository_summary_includes_pagerank_and_badges() -> Result<()> {
+    #[tokio::test]
+    async fn repository_summary_includes_pagerank_and_badges() -> Result<()> {
         let dir = TempDir::new()?;
         let repo_root = dir.path();
         let src_dir = repo_root.join("src");
@@ -570,7 +631,7 @@ mod tests {
         std::fs::write(&file_b, "fn foo() {}\n")?;
 
         let db_path = repo_root.join("context.db");
-        let db = Db::open(&db_path, Some(3))?;
+        let db = Db::open(&db_path, Some(3)).await?;
 
         let b_path = file_b.to_string_lossy().to_string();
         let b_size = std::fs::metadata(&file_b)?.len();
@@ -587,7 +648,8 @@ mod tests {
             references: Vec::new(),
             resolutions: Vec::new(),
         };
-        db.upsert_file_graph(&b_path, b_size, [0u8; 32], "rust", None, graph_b)?;
+        db.upsert_file_graph(&b_path, b_size, [0u8; 32], "rust", None, graph_b)
+            .await?;
 
         let a_path = file_a.to_string_lossy().to_string();
         let a_size = std::fs::metadata(&file_a)?.len();
@@ -603,16 +665,18 @@ mod tests {
             }],
             resolutions: Vec::new(),
         };
-        db.upsert_file_graph(&a_path, a_size, [1u8; 32], "rust", None, graph_a)?;
+        db.upsert_file_graph(&a_path, a_size, [1u8; 32], "rust", None, graph_a)
+            .await?;
 
         let mut commit_edges = Vec::new();
         for i in 0..12 {
             commit_edges.push((a_path.clone(), format!("c{i}")));
         }
         let cochange_edges = vec![(a_path.clone(), b_path.clone(), 3, 0.5)];
-        db.upsert_history_edges(&commit_edges, &cochange_edges)?;
+        db.upsert_history_edges(&commit_edges, &cochange_edges)
+            .await?;
 
-        match db.file_dependency_pagerank(1) {
+        match db.file_dependency_pagerank(1).await {
             Ok(ranks) => {
                 if ranks.is_empty() {
                     return Ok(());
@@ -621,7 +685,7 @@ mod tests {
             Err(_) => return Ok(()),
         }
 
-        let overview = build_repository_overview(repo_root, &db);
+        let overview = build_repository_overview(repo_root, &db).await;
         let summary = overview.summary.clone();
         assert!(!summary.is_empty(), "expected summary to be populated");
 
@@ -651,6 +715,7 @@ mod tests {
                 blocks: Vec::new(),
             },
             PromptSections::all(),
+            None,
         );
         assert!(
             xml.contains("<summary_map>"),

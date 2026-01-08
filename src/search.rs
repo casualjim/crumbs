@@ -13,6 +13,8 @@ use text_chunking::Tokenizer as ChunkTokenizer;
 use tiktoken_rs::{cl100k_base, o200k_base, p50k_base, p50k_edit, r50k_base};
 use tokenizers::Tokenizer as HfTokenizer;
 
+pub type ProgressCallback = dyn Fn(&'static str) + Send + Sync;
+
 #[derive(Clone)]
 pub struct SearchResult {
     pub id: String,
@@ -35,9 +37,6 @@ pub struct SearchConfig {
     pub min_score: f64,
     pub path_prefixes: Vec<String>,
     pub file_exts: Vec<String>,
-    pub decompose: bool,
-    pub rerank: bool,
-    pub rerank_min_score: f64,
 }
 
 impl SearchConfig {
@@ -48,9 +47,6 @@ impl SearchConfig {
             min_score: 0.25,
             path_prefixes: Vec::new(),
             file_exts: Vec::new(),
-            decompose: false,
-            rerank: true,
-            rerank_min_score: 0.25,
         }
     }
 
@@ -93,120 +89,105 @@ impl SearchConfig {
     }
 }
 
+pub struct SearchContext<'a> {
+    pub db: &'a dyn Repository,
+    pub embedder: &'a dyn EmbeddingProvider,
+    pub reranker: &'a dyn RerankingProvider,
+    pub tokenizer: &'a ChunkTokenizer,
+    pub progress: Option<&'a ProgressCallback>,
+}
+
 pub async fn search(
-    db: &dyn Repository,
-    embedder: &dyn EmbeddingProvider,
-    reranker: Option<&dyn RerankingProvider>,
-    tokenizer: &ChunkTokenizer,
+    ctx: &SearchContext<'_>,
     query: &str,
     config: SearchConfig,
 ) -> Result<Vec<SearchResult>> {
     let config = config.normalize();
-    let query_text = query;
-    let queries = if config.decompose {
-        split_query(query)
-    } else {
-        vec![query.to_string()]
-    };
-    let mut combined: HashMap<String, SearchResult> = HashMap::new();
-
-    for query in queries {
-        let results =
-            search_single(db, embedder, tokenizer, &query, config.limit, config.hybrid_weight)
-                .await?;
-        for result in results {
-            if !config.matches_path(&result.file_path) {
-                continue;
-            }
-            let id = result.id.clone();
-            match combined.get_mut(&id) {
-                Some(existing) => {
-                    if result.score > existing.score {
-                        *existing = result;
-                    }
-                }
-                None => {
-                    combined.insert(id, result);
-                }
-            }
-        }
-    }
-
-    let mut combined = combined.into_values().collect::<Vec<_>>();
-    combined.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    combined.retain(|item| item.score >= config.min_score);
+    report_progress(ctx.progress, "preparing query");
+    let mut combined = search_single(
+        ctx,
+        query,
+        config.limit,
+        config.hybrid_weight,
+    )
+    .await?
+    .into_iter()
+    .filter(|result| config.matches_path(&result.file_path))
+    .collect::<Vec<_>>();
     combined.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     combined.truncate(config.limit);
-    if config.rerank {
-        let reranker = reranker.ok_or_else(|| eyre!("reranker required but not configured"))?;
-        let documents: Vec<String> = combined.iter().map(|item| item.text.clone()).collect();
-        let scores = reranker
-            .rerank(query_text, &documents)
-            .await
-            .map_err(|err| eyre!("reranking failed: {err}"))?;
-        if scores.len() != combined.len() {
-            return Err(eyre!(
-                "reranker returned {} scores for {} results",
-                scores.len(),
-                combined.len()
-            ));
-        }
-        for (result, score) in combined.iter_mut().zip(scores.iter()) {
-            result.score = *score;
-        }
-        combined.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        combined.retain(|item| item.score >= config.rerank_min_score);
+    let documents: Vec<String> = combined.iter().map(|item| item.text.clone()).collect();
+    report_progress(ctx.progress, "reranking results");
+    let scores = ctx
+        .reranker
+        .rerank(query, &documents)
+        .await
+        .map_err(|err| eyre!("reranking failed: {err}"))?;
+    if scores.len() != combined.len() {
+        return Err(eyre!(
+            "reranker returned {} scores for {} results",
+            scores.len(),
+            combined.len()
+        ));
     }
+    for (result, score) in combined.iter_mut().zip(scores.iter()) {
+        result.score = *score;
+    }
+    combined.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    combined.retain(|item| item.score >= config.min_score);
     Ok(combined)
 }
 
 async fn search_single(
-    db: &dyn Repository,
-    embedder: &dyn EmbeddingProvider,
-    tokenizer: &ChunkTokenizer,
+    ctx: &SearchContext<'_>,
     query: &str,
     limit: usize,
     hybrid_weight: f32,
 ) -> Result<Vec<SearchResult>> {
-    let vector_results = if db.vss_loaded() {
-        let token_count = count_tokens(tokenizer, query)?;
+    let vector_future = async {
+        if !ctx.db.vss_loaded() {
+            return Ok::<Option<Vec<SearchRow>>, eyre::Report>(None);
+        }
+        report_progress(ctx.progress, "embedding query");
+        let token_count = count_tokens(ctx.tokenizer, query)?;
         let input = EmbeddingInput {
             text: query.to_string(),
             token_count,
         };
-        let output = embedder.embed(&[input]).await?;
+        let output = ctx.embedder.embed(&[input]).await?;
         let mut embeddings = output.embeddings;
         if embeddings.is_empty() {
             return Err(eyre!("embedder returned no embeddings for query"));
         }
-        Some(db.search(&embeddings.remove(0), limit)?)
-    } else {
-        None
+        report_progress(ctx.progress, "searching vector index");
+        Ok(Some(ctx.db.search(&embeddings.remove(0), limit).await?))
     };
 
-    let fts_results = if db.fts_loaded() {
-        match db.search_fts(query, limit) {
-            Ok(rows) => Some(rows),
+    let fts_future = async {
+        if !ctx.db.fts_loaded() {
+            return Ok::<Option<Vec<FtsRow>>, eyre::Report>(None);
+        }
+        report_progress(ctx.progress, "searching full-text");
+        match ctx.db.search_fts(query, limit).await {
+            Ok(rows) => Ok(Some(rows)),
             Err(err) => {
                 warn!("full-text search unavailable: {err}");
-                None
+                Ok(None)
             }
         }
-    } else {
-        None
     };
+
+    let (fts_results, vector_results) = tokio::join!(fts_future, vector_future);
+    let fts_results = fts_results?;
+    let vector_results = vector_results?;
 
     merge_results(vector_results, fts_results, limit, hybrid_weight)
 }
@@ -241,6 +222,12 @@ fn count_tokens(tokenizer: &ChunkTokenizer, text: &str) -> Result<usize> {
             .encode(text, false)
             .map(|encoding| encoding.len())
             .map_err(|err| eyre::eyre!("tokenizer encode failed: {err}")),
+    }
+}
+
+fn report_progress(progress: Option<&ProgressCallback>, message: &'static str) {
+    if let Some(callback) = progress {
+        callback(message);
     }
 }
 
@@ -347,27 +334,4 @@ fn merge_results(
 
 fn vector_score(distance: f64) -> f64 {
     (1.0 - (distance / 2.0)).clamp(0.0, 1.0)
-}
-
-fn split_query(query: &str) -> Vec<String> {
-    let cleaned = query
-        .replace(';', " and ")
-        .replace('\n', " and ")
-        .replace('\t', " ");
-    if !cleaned.contains(" and ") {
-        return vec![query.trim().to_string()];
-    }
-    let mut parts = Vec::new();
-    for part in cleaned.split(" and ") {
-        let trimmed = part.trim();
-        if trimmed.len() > 2 {
-            parts.push(trimmed.to_string());
-        }
-    }
-    if parts.is_empty() {
-        vec![query.trim().to_string()]
-    } else {
-        parts.truncate(4);
-        parts
-    }
 }

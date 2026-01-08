@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::embedding::EmbeddingProvider;
 use crate::graph::{HistoryConfig, index_history};
+use crate::progress;
 use crate::repository::Repository;
 use dashmap::DashMap;
 use eyre::{Result, eyre};
@@ -56,7 +57,26 @@ impl<'a> Indexer<'a> {
     }
 
     pub async fn index(self) -> Result<()> {
-        let existing_hashes = self.db.load_existing_hashes()?;
+        let progress = progress::spinner("indexing files");
+        let mut files_processed = 0usize;
+        let update_progress = |files_processed: usize, pending_batches: usize, stream_done: bool| {
+            if let Some(progress) = &progress {
+                let message = if stream_done {
+                    format!(
+                        "processed {files_processed} files; embedding {pending_batches} batches"
+                    )
+                } else if pending_batches > 0 {
+                    format!(
+                        "processed {files_processed} files; pending {pending_batches} batches"
+                    )
+                } else {
+                    format!("processed {files_processed} files")
+                };
+                progress.set_message(message);
+            }
+        };
+
+        let existing_hashes = self.db.load_existing_hashes().await?;
         let options = WalkOptions {
             max_chunk_size: self.config.max_chunk_size,
             tokenizer: self.config.tokenizer.clone(),
@@ -86,16 +106,30 @@ impl<'a> Indexer<'a> {
                 item = stream.next(), if !stream_done => {
                     match item {
                         Some(Ok(project_chunk)) => {
-                            match processor.handle_chunk(project_chunk)? {
+                            let file_done = matches!(
+                                &project_chunk.chunk,
+                                text_chunking::Chunk::EndOfFile { .. }
+                                    | text_chunking::Chunk::Delete { .. }
+                            );
+                            match processor.handle_chunk(project_chunk).await? {
                                 ProcessorOutput::Batch(batch_item) => {
                                     if embedder_service.enqueue(batch_item).await? {
                                         pending_batches = pending_batches.saturating_add(1);
+                                        update_progress(
+                                            files_processed,
+                                            pending_batches,
+                                            stream_done,
+                                        );
                                     }
                                 }
                                 ProcessorOutput::RemoveFile(file_path) => {
                                     embedder_service.remove_file(&file_path);
                                 }
                                 ProcessorOutput::None => {}
+                            }
+                            if file_done {
+                                files_processed = files_processed.saturating_add(1);
+                                update_progress(files_processed, pending_batches, stream_done);
                             }
                         }
                         Some(Err(err)) => {
@@ -106,6 +140,7 @@ impl<'a> Indexer<'a> {
                             if embedder_service.flush().await? {
                                 pending_batches = pending_batches.saturating_add(1);
                             }
+                            update_progress(files_processed, pending_batches, stream_done);
                         }
                     }
                 }
@@ -113,7 +148,10 @@ impl<'a> Indexer<'a> {
                     match result {
                         Some(Ok(result)) => {
                             pending_batches = pending_batches.saturating_sub(1);
-                            processor.apply_embeddings(result.items, result.embeddings)?;
+                            processor
+                                .apply_embeddings(result.items, result.embeddings)
+                                .await?;
+                            update_progress(files_processed, pending_batches, stream_done);
                         }
                         Some(Err(err)) => {
                             return Err(err);
@@ -138,9 +176,13 @@ impl<'a> Indexer<'a> {
             }
         }
 
-        processor.finish()?;
+        processor.finish().await?;
 
-        index_history(self.db, &self.config.repo_path, &self.config.history)?;
+        index_history(self.db, &self.config.repo_path, &self.config.history).await?;
+
+        if let Some(progress) = progress {
+            progress.finish_and_clear();
+        }
 
         Ok(())
     }

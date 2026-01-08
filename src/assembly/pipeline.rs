@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
+use std::sync::Arc;
 use text_chunking::Tokenizer;
 
 use super::{Arena, AssemblyContext, Handle};
@@ -166,11 +167,34 @@ where
         let budgeted = self.budget.budget(ctx, arena, refined).await?;
         self.assemble.assemble(ctx, arena, budgeted).await
     }
+
+    pub async fn run_with_progress<Notify>(
+        &self,
+        ctx: &AssemblyContext<'_>,
+        arena: &mut Arena,
+        input: Handle<QueryInput>,
+        mut notify: Notify,
+    ) -> Result<Handle<AssembledContext>>
+    where
+        Notify: FnMut(&'static str),
+    {
+        notify("retrieving candidates");
+        let candidates = self.retrieve.retrieve(ctx, arena, input).await?;
+        notify("expanding related files");
+        let expanded = self.expand.expand(ctx, arena, candidates).await?;
+        notify("fetching related chunks");
+        let refined = self.refine.refine(ctx, arena, expanded).await?;
+        notify("budgeting context");
+        let budgeted = self.budget.budget(ctx, arena, refined).await?;
+        notify("assembling prompt");
+        self.assemble.assemble(ctx, arena, budgeted).await
+    }
 }
 
 /// Default stage: retrieve candidates using embedding/FTS search.
 pub struct DefaultRetrieve {
     pub config: SearchConfig,
+    pub progress: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 #[async_trait(?Send)]
@@ -181,20 +205,24 @@ impl RetrieveCandidates for DefaultRetrieve {
         arena: &mut Arena,
         input: Handle<QueryInput>,
     ) -> Result<Handle<CandidateSet>> {
+        if let Some(progress) = &self.progress {
+            progress("loading tokenizer");
+        }
         let embedder = ctx
             .embedder
             .ok_or_else(|| eyre!("embedding provider required for retrieval"))?;
         let tokenizer = crate::parse_tokenizer(&ctx.config.embedding.tokenizer)?;
+        let progress = self.progress.as_ref().map(|progress| progress.as_ref());
         let query = arena.get(input);
-        let results = crate::search::search(
-            ctx.db,
+        let search_ctx = crate::search::SearchContext {
+            db: ctx.db,
             embedder,
-            ctx.reranker,
-            &tokenizer,
-            &query.text,
-            self.config.clone(),
-        )
-        .await?;
+            reranker: ctx.reranker,
+            tokenizer: &tokenizer,
+            progress,
+        };
+        let results =
+            crate::search::search(&search_ctx, &query.text, self.config.clone()).await?;
         let chunks = results
             .into_iter()
             .map(|result| CandidateChunk {
@@ -239,7 +267,7 @@ impl ExpandGraph for DefaultExpandGraph {
         let expanded = if seeds.is_empty() {
             Vec::new()
         } else {
-            ctx.db.cochange_neighbors(&seeds, self.max_expanded_files)?
+            ctx.db.cochange_neighbors(&seeds, self.max_expanded_files).await?
         };
 
         Ok(arena.insert(ExpandedCandidates {
@@ -283,7 +311,8 @@ impl RefineAst for DefaultRefineAst {
         if !expanded.expanded_files.is_empty() {
             let extra = ctx
                 .db
-                .chunks_for_files(&expanded.expanded_files, self.per_file_limit)?;
+                .chunks_for_files(&expanded.expanded_files, self.per_file_limit)
+                .await?;
             for row in extra {
                 blocks.push(ContextBlock {
                     id: row.id,
@@ -403,15 +432,29 @@ pub fn default_pipeline(
     DefaultBudgetAndMerge,
     DefaultAssembleContext,
 > {
+    default_pipeline_with_progress(config, budget, None)
+}
+
+pub fn default_pipeline_with_progress(
+    config: &AppConfig,
+    budget: BudgetOptions,
+    progress: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
+) -> AssemblyPipeline<
+    DefaultRetrieve,
+    DefaultExpandGraph,
+    DefaultRefineAst,
+    DefaultBudgetAndMerge,
+    DefaultAssembleContext,
+> {
     let mut search_config = SearchConfig::new(config.search.limit, config.search.hybrid_weight);
     search_config.min_score = config.search.min_score;
     search_config.path_prefixes = config.search.path_prefixes.clone();
     search_config.file_exts = config.search.file_exts.clone();
-    search_config.decompose = config.search.decompose;
-    search_config.rerank = config.search.rerank;
-    search_config.rerank_min_score = config.search.rerank_min_score;
     AssemblyPipeline::new(
-        DefaultRetrieve { config: search_config },
+        DefaultRetrieve {
+            config: search_config,
+            progress,
+        },
         DefaultExpandGraph {
             max_expanded_files: config.search.limit,
         },

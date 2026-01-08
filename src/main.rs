@@ -5,6 +5,7 @@ mod embedding;
 mod graph;
 mod indexer;
 mod logging;
+mod progress;
 mod reqwestx;
 mod repository;
 mod reranker;
@@ -49,7 +50,7 @@ async fn main() -> Result<()> {
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
 
             let embedder = build_embedder(&cfg.embedding)?;
-            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
             let index_config = IndexerConfig {
                 repo_path: project.repo_path.clone(),
                 max_chunk_size: cfg.chunking.max_chunk_size,
@@ -80,25 +81,20 @@ async fn main() -> Result<()> {
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
             let embedder = build_embedder(&cfg.embedding)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
-            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
-            let reranker = if cfg.search.rerank {
-                Some(build_reranker(&cfg)?)
-            } else {
-                None
-            };
-            let reranker_ref = reranker
-                .as_ref()
-                .map(|client| client as &dyn RerankingProvider);
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
+            let reranker = build_reranker(&cfg)?;
             let mut search_config =
                 search::SearchConfig::new(cfg.search.limit, cfg.search.hybrid_weight);
             search_config.path_prefixes = cfg.search.path_prefixes.clone();
             search_config.file_exts = cfg.search.file_exts.clone();
-            search_config.decompose = cfg.search.decompose;
-            search_config.rerank = cfg.search.rerank;
-            search_config.rerank_min_score = cfg.search.rerank_min_score;
-            let results =
-                search::search(&db, &embedder, reranker_ref, &tokenizer, &cmd.query, search_config)
-                    .await?;
+            let search_ctx = search::SearchContext {
+                db: &db,
+                embedder: &embedder,
+                reranker: &reranker,
+                tokenizer: &tokenizer,
+                progress: None,
+            };
+            let results = search::search(&search_ctx, &cmd.query, search_config).await?;
             for (idx, result) in results.iter().enumerate() {
                 let mut score_line = format!("score={:.4}", result.score);
                 if let Some(vector) = result.vector_score {
@@ -122,20 +118,19 @@ async fn main() -> Result<()> {
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
             let embedder = build_embedder(&cfg.embedding)?;
-            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim))?;
-            let reranker = if cfg.search.rerank {
-                Some(build_reranker(&cfg)?)
-            } else {
-                None
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
+            let reranker = build_reranker(&cfg)?;
+            let progress_watch = progress::watch_spinner("assembling prompt");
+            let (spinner, progress_tx) = match progress_watch {
+                Some((spinner, tx)) => (Some(spinner), Some(tx)),
+                None => (None, None),
             };
 
             let ctx = assembly::AssemblyContext {
                 repo_path: &project.repo_path,
                 db: &db,
                 embedder: Some(&embedder),
-                reranker: reranker
-                    .as_ref()
-                    .map(|client| client as &dyn RerankingProvider),
+                reranker: &reranker as &dyn RerankingProvider,
                 config: &cfg,
             };
 
@@ -155,22 +150,48 @@ async fn main() -> Result<()> {
             } else {
                 parse_tokenizer(&prompt_tokenizer_value)?
             };
+            let prompt_theme_value = cmd
+                .prompt
+                .theme
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| cfg.prompt.theme.clone());
+            let prompt_theme = if prompt_theme_value.trim().is_empty() {
+                None
+            } else {
+                Some(prompt_theme_value.as_str())
+            };
             let budget = assembly::pipeline::BudgetOptions {
                 max_tokens,
                 reserved_output_tokens: cmd.reserved_output_tokens,
                 tokenizer: Some(prompt_tokenizer),
             };
-            let pipeline = assembly::pipeline::default_pipeline(&cfg, budget);
+            let progress_callback = progress_tx.as_ref().map(|tx| {
+                let tx = tx.clone();
+                std::sync::Arc::new(move |message: &'static str| {
+                    let _ = tx.send(message);
+                }) as std::sync::Arc<dyn Fn(&'static str) + Send + Sync>
+            });
+            let pipeline =
+                assembly::pipeline::default_pipeline_with_progress(&cfg, budget, progress_callback);
             let mut arena = assembly::Arena::new();
             let input = arena.insert(assembly::pipeline::QueryInput {
                 text: cmd.task.clone(),
             });
-            let handle = pipeline.run(&ctx, &mut arena, input).await?;
+            let progress = progress_tx.clone();
+            let handle = pipeline
+                .run_with_progress(&ctx, &mut arena, input, |message| {
+                    if let Some(progress) = &progress {
+                        let _ = progress.send(message);
+                    }
+                })
+                .await?;
             let assembled = arena.get(handle);
 
             let enriched =
                 assembly::output::enrich_blocks(&project.repo_path, &db, &assembled.blocks).await?;
-            let overview = assembly::output::build_repository_overview(&project.repo_path, &db);
+            let overview =
+                assembly::output::build_repository_overview(&project.repo_path, &db).await;
             let payload = assembly::output::PromptPayload {
                 overview,
                 task: cmd.task.clone(),
@@ -194,7 +215,10 @@ async fn main() -> Result<()> {
                 }
                 selected
             };
-            let rendered = assembly::output::render_prompt(format, &payload, sections);
+            let rendered = assembly::output::render_prompt(format, &payload, sections, prompt_theme);
+            if let Some(spinner) = spinner {
+                spinner.finish_and_clear();
+            }
             print!("{rendered}");
         }
         Command::Config(cmd) => match &cmd.command {

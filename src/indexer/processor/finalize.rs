@@ -7,7 +7,7 @@ use super::super::state::{PendingEof, PendingFile};
 use super::IndexProcessor;
 
 impl<'a> IndexProcessor<'a> {
-    pub(crate) fn apply_embeddings(
+    pub(crate) async fn apply_embeddings(
         &mut self,
         batch: Vec<BatchMeta>,
         embeddings: Vec<Vec<f32>>,
@@ -41,7 +41,8 @@ impl<'a> IndexProcessor<'a> {
 
         if !records.is_empty() {
             self.db
-                .upsert_chunks_with_embeddings(&records, &embed_values)?;
+                .upsert_chunks_with_embeddings(&records, &embed_values)
+                .await?;
             for (file_path, chunk_id) in pending {
                 if let Some(entry) = self.state.pending.get_mut(&file_path) {
                     entry.pending_embeddings.remove(&chunk_id);
@@ -50,10 +51,10 @@ impl<'a> IndexProcessor<'a> {
             }
         }
 
-        self.try_finalize_files(touched)
+        self.try_finalize_files(touched).await
     }
 
-    pub(super) fn try_finalize_files(
+    pub(super) async fn try_finalize_files(
         &mut self,
         file_paths: impl IntoIterator<Item = String>,
     ) -> Result<()> {
@@ -89,8 +90,9 @@ impl<'a> IndexProcessor<'a> {
                 entry.file_size,
                 eof.content_hash,
                 eof.primary_language.clone(),
-            )?;
-            self.db.delete_missing_chunks(&file_path, &keep_ids)?;
+            )
+            .await?;
+            self.db.delete_missing_chunks(&file_path, &keep_ids).await?;
             self.state.pending_eof.remove(&file_path);
         }
 

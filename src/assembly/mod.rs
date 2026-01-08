@@ -16,7 +16,7 @@ pub struct AssemblyContext<'a> {
     pub repo_path: &'a Path,
     pub db: &'a dyn Repository,
     pub embedder: Option<&'a dyn EmbeddingProvider>,
-    pub reranker: Option<&'a dyn crate::reranker::RerankingProvider>,
+    pub reranker: &'a dyn crate::reranker::RerankingProvider,
     #[allow(dead_code)]
     pub config: &'a AppConfig,
 }

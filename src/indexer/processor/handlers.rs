@@ -9,15 +9,15 @@ use super::super::state::{PendingEof, PendingFile};
 use super::IndexProcessor;
 
 impl<'a> IndexProcessor<'a> {
-    pub(super) fn handle_delete(&mut self, file_path: &str) -> Result<()> {
-        self.db.delete_file(file_path)?;
+    pub(super) async fn handle_delete(&mut self, file_path: &str) -> Result<()> {
+        self.db.delete_file(file_path).await?;
         self.state.pending.remove(file_path);
         self.state.pending_eof.remove(file_path);
         self.observed_graphs.remove(file_path);
         Ok(())
     }
 
-    pub(super) fn handle_content_chunk(
+    pub(super) async fn handle_content_chunk(
         &mut self,
         file_path: String,
         file_size: u64,
@@ -41,7 +41,8 @@ impl<'a> IndexProcessor<'a> {
         entry.file_size = file_size;
         if !entry.file_row_ensured {
             self.db
-                .ensure_file_row(&file_path, file_size, None)?;
+                .ensure_file_row(&file_path, file_size, None)
+                .await?;
             entry.file_row_ensured = true;
         }
 
@@ -50,13 +51,16 @@ impl<'a> IndexProcessor<'a> {
             eyre!("missing token counts for chunk; configure tokenizer to provide tokens")
         })?;
 
-        let existing_id = self.db.find_chunk_id(
-            &file_path,
-            start_byte,
-            end_byte,
-            kind,
-            chunk_hash,
-        )?;
+        let existing_id = self
+            .db
+            .find_chunk_id(
+                &file_path,
+                start_byte,
+                end_byte,
+                kind,
+                chunk_hash,
+            )
+            .await?;
         let fts_text = build_fts_text(&text);
         let record = ChunkRecord {
             id: existing_id
@@ -86,7 +90,7 @@ impl<'a> IndexProcessor<'a> {
             entry.chunks[idx].clone()
         };
         if is_existing {
-            self.db.update_chunk_without_embedding(&record)?;
+            self.db.update_chunk_without_embedding(&record).await?;
             return Ok(None);
         }
 
@@ -101,7 +105,7 @@ impl<'a> IndexProcessor<'a> {
         Ok(Some(batch_item))
     }
 
-    pub(super) fn handle_eof(
+    pub(super) async fn handle_eof(
         &mut self,
         file_size: u64,
         file_path: &str,
@@ -126,14 +130,16 @@ impl<'a> IndexProcessor<'a> {
         let observed = self.observed_graphs.remove(file_path);
 
         if let Some((_, observed)) = observed {
-            self.db.upsert_file_graph(
+            self.db
+                .upsert_file_graph(
                 file_path,
                 entry.file_size,
                 hash,
                 &observed.language,
                 primary_language.clone(),
                 observed.graph,
-            )?;
+                )
+                .await?;
         }
 
         self.state.pending_eof.insert(
@@ -143,7 +149,7 @@ impl<'a> IndexProcessor<'a> {
                 primary_language: primary_language.clone(),
             },
         );
-        self.try_finalize_files(vec![file_path.to_string()])
+        self.try_finalize_files(vec![file_path.to_string()]).await
     }
 
 }

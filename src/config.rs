@@ -5,13 +5,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use confique::Config as _;
 use confique::Layer as _;
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 const DEFAULT_DATABASE_NAME: &str = "context.db";
 
-#[derive(confique::Config, Debug, Clone)]
+#[derive(confique::Config, Debug, Clone, Serialize)]
 pub struct AppConfig {
     #[config(nested)]
     pub embedding: Embedding,
@@ -22,6 +22,7 @@ pub struct AppConfig {
     #[config(nested)]
     pub history: History,
     #[config(default = {})]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, Project>,
     #[config(nested)]
     pub search: SearchOptions,
@@ -29,7 +30,7 @@ pub struct AppConfig {
     pub prompt: Prompting,
 }
 
-#[derive(confique::Config, Debug, Clone)]
+#[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Embedding {
     #[config(default = "https://api.deepinfra.com/v1/openai", env = "EMBEDDER_URL")]
@@ -45,6 +46,7 @@ pub struct Embedding {
         long = "embedder-api-key",
         help = "Embedding API key (or set in secrets)"
     )))]
+    #[serde(skip_serializing)]
     pub api_key: Option<SecretString>,
     #[config(default = "Qwen/Qwen3-Embedding-0.6B", env = "EMBEDDER_MODEL")]
     #[config(layer_attr(arg(
@@ -53,10 +55,7 @@ pub struct Embedding {
         help = "Embedding model name"
     )))]
     pub model: String,
-    #[config(
-        default = "hf:Qwen/Qwen3-Embedding-0.6B",
-        env = "EMBEDDER_TOKENIZER"
-    )]
+    #[config(default = "hf:Qwen/Qwen3-Embedding-0.6B", env = "EMBEDDER_TOKENIZER")]
     #[config(layer_attr(arg(
         id = "embedder_tokenizer",
         long = "embedder-tokenizer",
@@ -128,7 +127,7 @@ pub struct Embedding {
     pub tokens_per_minute: u32,
 }
 
-#[derive(confique::Config, Debug, Clone)]
+#[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Reranker {
     #[config(default = "https://api.deepinfra.com/v1", env = "RERANKER_URL")]
@@ -144,6 +143,7 @@ pub struct Reranker {
         long = "reranker-api-key",
         help = "Reranker API key (or set in secrets)"
     )))]
+    #[serde(skip_serializing)]
     pub api_key: Option<SecretString>,
     #[config(default = "Qwen/Qwen3-Reranker-0.6B", env = "RERANKER_MODEL")]
     #[config(layer_attr(arg(
@@ -172,10 +172,11 @@ pub struct Reranker {
         long = "reranker-instruction",
         help = "Optional reranker instruction/prompt"
     )))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
 }
 
-#[derive(confique::Config, Debug, Clone)]
+#[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Chunking {
     #[config(default = 1500, env = "CONTEXT_MAX_CHUNK_SIZE")]
@@ -198,14 +199,14 @@ pub struct Chunking {
     pub large_file_threads: usize,
 }
 
-#[derive(confique::Config, Debug, Clone, Deserialize)]
+#[derive(confique::Config, Debug, Clone, Deserialize, Serialize)]
 pub struct Project {
     pub repo: PathBuf,
     pub data_dir: Option<PathBuf>,
     pub database: Option<PathBuf>,
 }
 
-#[derive(confique::Config, Debug, Clone)]
+#[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct History {
     #[config(default = 10240, env = "CONTEXT_HISTORY_DEPTH")]
@@ -247,13 +248,13 @@ pub struct History {
     pub path_specs: String,
 }
 
-#[derive(confique::Config, Debug, Clone)]
+#[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct SearchOptions {
     #[config(default = 10, env = "CONTEXT_SEARCH_LIMIT")]
     #[config(layer_attr(arg(long = "limit", help = "Max results to return")))]
     pub limit: usize,
-    #[config(default = 0.25, env = "CONTEXT_SEARCH_MIN_SCORE")]
+    #[config(default = 0.4, env = "CONTEXT_SEARCH_MIN_SCORE")]
     #[config(layer_attr(arg(
         long = "min-score",
         help = "Minimum score to include in results (0.0-1.0)"
@@ -279,27 +280,9 @@ pub struct SearchOptions {
         help = "Restrict results to file extensions (comma-separated)"
     )))]
     pub file_exts: Vec<String>,
-    #[config(default = false, env = "CONTEXT_SEARCH_DECOMPOSE")]
-    #[config(layer_attr(arg(
-        long = "decompose",
-        help = "Split multi-part queries on conjunctions"
-    )))]
-    pub decompose: bool,
-    #[config(default = true, env = "CONTEXT_SEARCH_RERANK")]
-    #[config(layer_attr(arg(
-        long = "rerank",
-        help = "Apply model-based reranking"
-    )))]
-    pub rerank: bool,
-    #[config(default = 0.25, env = "CONTEXT_SEARCH_RERANK_MIN_SCORE")]
-    #[config(layer_attr(arg(
-        long = "rerank-min-score",
-        help = "Minimum reranker score to include in results (0.0-1.0)"
-    )))]
-    pub rerank_min_score: f64,
 }
 
-#[derive(confique::Config, Debug, Clone)]
+#[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Prompting {
     #[config(default = "", env = "CONTEXT_PROMPT_TOKENIZER")]
@@ -309,6 +292,13 @@ pub struct Prompting {
         help = "Tokenizer for prompt budgeting (defaults to embedding tokenizer)"
     )))]
     pub tokenizer: String,
+    #[config(default = "", env = "CONTEXT_PROMPT_THEME")]
+    #[config(layer_attr(arg(
+        id = "prompt_theme",
+        long = "prompt-theme",
+        help = "Syntax highlighting theme (auto or syntastica theme name)"
+    )))]
+    pub theme: String,
 }
 
 #[derive(Parser)]
@@ -554,8 +544,8 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
     }
 
     let config = builder
-        .file("/etc/context/secrets.toml")
         .file("/etc/context/config.toml")
+        .file("/etc/context/secrets.toml")
         .load()
         .map_err(|e| eyre::eyre!(e.to_string()))?;
 
@@ -670,66 +660,15 @@ pub struct InitResult {
     pub wrote_secrets: bool,
 }
 
-const DEFAULT_CONFIG_TOML: &str = r#"# context configuration
-
-[embedding]
-# Default embedder uses DeepInfra's OpenAI-compatible endpoint.
-url = "https://api.deepinfra.com/v1/openai"
-model = "Qwen/Qwen3-Embedding-0.6B"
-tokenizer = "hf:Qwen/Qwen3-Embedding-0.6B"
-dialect = "deepinfra"
-timeout_seconds = 10
-embedding_dim = 1024
-context_length = 32768
-max_batch_size = 15
-workers = 5
-requests_per_minute = 1000
-max_concurrent_requests = 300
-tokens_per_minute = 1000000
-
-[reranker]
-url = "https://api.deepinfra.com/v1"
-model = "Qwen/Qwen3-Reranker-0.6B"
-dialect = "deepinfra"
-timeout_seconds = 10
-# instruction = ""
-
-[chunking]
-max_chunk_size = 1500
-overlap = 0.2
-max_parallel = 4
-max_file_size = 5242880
-large_file_threads = 4
-
-[history]
-depth = 10240
-commit_size_limit_ratio = 1.0
-multi_parents = false
-issue_regex = "(#\\d+)"
-# commit_exclude_regex = ""
-# author_exclude_regex = ""
-# path_specs = ""
-
-# Project definitions live under [projects.<name>].
-# Example:
-# [projects.example]
-# repo = "/path/to/repo"
-# # data_dir = "/path/to/data"
-# # database = "context.db"
-
-[search]
-limit = 10
-min_score = 0.25
-hybrid_weight = 0.6
-# path_prefixes = ["src/"]
-# file_exts = ["rs"]
-# decompose = false
-rerank = true
-rerank_min_score = 0.25
-
-[prompt]
-# tokenizer = "" # defaults to embedding tokenizer
-"#;
+fn default_config_toml() -> eyre::Result<String> {
+    let config = AppConfig::builder().load()?;
+    let toml = toml_edit::ser::to_string_pretty(&config)
+        .map_err(|err| eyre::eyre!("failed to serialize default config: {err}"))?;
+    let mut rendered = String::from("# context configuration\n\n");
+    rendered.push_str(toml.trim_end());
+    rendered.push('\n');
+    Ok(rendered)
+}
 
 const DEFAULT_SECRETS_TOML: &str = r#"# Secrets for context
 # You can also set EMBEDDER_API_KEY in your environment instead.
@@ -754,7 +693,8 @@ pub fn init_config(init: &InitCli) -> eyre::Result<InitResult> {
     let config_path = root.join("config.toml");
     let secrets_path = root.join("secrets.toml");
 
-    let wrote_config = write_default_file(&config_path, DEFAULT_CONFIG_TOML, init.force)?;
+    let default_config = default_config_toml()?;
+    let wrote_config = write_default_file(&config_path, &default_config, init.force)?;
     let wrote_secrets = write_default_file(&secrets_path, DEFAULT_SECRETS_TOML, init.force)?;
 
     Ok(InitResult {
@@ -909,9 +849,7 @@ fn validate_config(config: &AppConfig) -> eyre::Result<()> {
         return Err(eyre::eyre!("embedder requests_per_minute must be > 0"));
     }
     if config.embedding.max_concurrent_requests == 0 {
-        return Err(eyre::eyre!(
-            "embedder max_concurrent_requests must be > 0"
-        ));
+        return Err(eyre::eyre!("embedder max_concurrent_requests must be > 0"));
     }
     if config.embedding.tokens_per_minute == 0 {
         return Err(eyre::eyre!("embedder tokens_per_minute must be > 0"));
@@ -936,11 +874,6 @@ fn validate_config(config: &AppConfig) -> eyre::Result<()> {
     }
     if !(0.0..=1.0).contains(&config.search.min_score) {
         return Err(eyre::eyre!("search min_score must be in [0.0, 1.0]"));
-    }
-    if !(0.0..=1.0).contains(&config.search.rerank_min_score) {
-        return Err(eyre::eyre!(
-            "search rerank_min_score must be in [0.0, 1.0]"
-        ));
     }
     if !(0.0..=1.0).contains(&config.search.hybrid_weight) {
         return Err(eyre::eyre!("hybrid_weight must be in [0.0, 1.0]"));
@@ -1165,12 +1098,10 @@ mod tests {
                 hybrid_weight: 0.6,
                 path_prefixes: Vec::new(),
                 file_exts: Vec::new(),
-                decompose: false,
-                rerank: false,
-                rerank_min_score: 0.25,
             },
             prompt: Prompting {
                 tokenizer: String::new(),
+                theme: String::new(),
             },
         };
 
@@ -1264,12 +1195,10 @@ mod tests {
                 hybrid_weight: 0.6,
                 path_prefixes: Vec::new(),
                 file_exts: Vec::new(),
-                decompose: false,
-                rerank: false,
-                rerank_min_score: 0.25,
             },
             prompt: Prompting {
                 tokenizer: String::new(),
+                theme: String::new(),
             },
         };
 

@@ -42,7 +42,7 @@ pub struct HistoryConfig {
     pub path_specs: Vec<String>,
 }
 
-pub(crate) fn index_history(
+pub(crate) async fn index_history(
     db: &dyn Repository,
     repo_path: &Path,
     config: &HistoryConfig,
@@ -55,7 +55,7 @@ pub(crate) fn index_history(
         return Ok(());
     }
 
-    let known_files = db.list_files()?;
+    let known_files = db.list_files().await?;
     if known_files.is_empty() {
         return Ok(());
     }
@@ -139,7 +139,7 @@ pub(crate) fn index_history(
         .collect();
     cochange_edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    db.upsert_history_edges(&commit_edges, &cochange_edges)?;
+    db.upsert_history_edges(&commit_edges, &cochange_edges).await?;
     info!(
         "history indexing complete: commits={}, cochanges={}",
         commit_edges.len(),
@@ -351,7 +351,7 @@ mod tests {
         write_fixture_repo(dir.path())?;
 
         let db_path = dir.path().join("context.db");
-        let db = Db::open(&db_path, Some(embedding_dim))?;
+        let db = Db::open(&db_path, Some(embedding_dim)).await?;
 
         let config = IndexerConfig {
             repo_path: dir.path().to_path_buf(),
@@ -378,13 +378,16 @@ mod tests {
         let indexer = Indexer::new(&db, embedder, config);
         indexer.index().await?;
 
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let symbols: i64 =
-            conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get::<_, i64>(0))?;
-        let references: i64 =
-            conn.query_row("SELECT COUNT(*) FROM symbol_references", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
+        let test_db = libsql::Builder::new_local(&db_path).build().await?;
+        let conn = test_db.connect()?;
+        let mut rows = conn.query("SELECT COUNT(*) FROM symbols", ()).await?;
+        let row = rows.next().await?.ok_or_else(|| eyre::eyre!("missing row"))?;
+        let symbols: i64 = row.get(0)?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM symbol_references", ())
+            .await?;
+        let row = rows.next().await?.ok_or_else(|| eyre::eyre!("missing row"))?;
+        let references: i64 = row.get(0)?;
 
         assert!(symbols > 0, "expected symbols to be populated");
         assert!(references > 0, "expected references to be populated");

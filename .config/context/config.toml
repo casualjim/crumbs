@@ -46,12 +46,13 @@ issue_regex = "(#\\d+)"
 
 [search]
 limit = 10
-min_score = 0.25
+min_score = 0.4
 hybrid_weight = 0.6
 # path_prefixes = ["src/"]
 # file_exts = ["rs"]
 # decompose = false
 rerank = true
+rerank_min_score = 0.4
 
 [prompt]
 # tokenizer = "" # defaults to embedding tokenizer

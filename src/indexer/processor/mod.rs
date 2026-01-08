@@ -37,7 +37,10 @@ impl<'a> IndexProcessor<'a> {
         }
     }
 
-    pub(crate) fn handle_chunk(&mut self, project_chunk: ProjectChunk) -> Result<ProcessorOutput> {
+    pub(crate) async fn handle_chunk(
+        &mut self,
+        project_chunk: ProjectChunk,
+    ) -> Result<ProcessorOutput> {
         let ProjectChunk {
             file_path,
             chunk,
@@ -45,15 +48,19 @@ impl<'a> IndexProcessor<'a> {
         } = project_chunk;
         match chunk {
             Chunk::Delete { file_path } => {
-                self.handle_delete(&file_path)?;
+                self.handle_delete(&file_path).await?;
                 Ok(ProcessorOutput::RemoveFile(file_path))
             }
             Chunk::Semantic(chunk) => {
-                let item = self.handle_content_chunk(file_path, file_size, chunk, "semantic")?;
+                let item = self
+                    .handle_content_chunk(file_path, file_size, chunk, "semantic")
+                    .await?;
                 Ok(item.map_or(ProcessorOutput::None, ProcessorOutput::Batch))
             }
             Chunk::Text(chunk) => {
-                let item = self.handle_content_chunk(file_path, file_size, chunk, "text")?;
+                let item = self
+                    .handle_content_chunk(file_path, file_size, chunk, "text")
+                    .await?;
                 Ok(item.map_or(ProcessorOutput::None, ProcessorOutput::Batch))
             }
             Chunk::EndOfFile {
@@ -62,16 +69,17 @@ impl<'a> IndexProcessor<'a> {
                 file_metadata,
                 ..
             } => {
-                self.handle_eof(file_size, &file_path, content_hash, file_metadata)?;
+                self.handle_eof(file_size, &file_path, content_hash, file_metadata)
+                    .await?;
                 Ok(ProcessorOutput::None)
             }
         }
     }
 
-    pub(crate) fn finish(&mut self) -> Result<()> {
+    pub(crate) async fn finish(&mut self) -> Result<()> {
         if !self.state.pending_eof.is_empty() {
             let remaining = self.state.pending_eof.keys().cloned().collect::<Vec<_>>();
-            self.try_finalize_files(remaining)?;
+            self.try_finalize_files(remaining).await?;
         }
 
         if !self.state.pending.is_empty() {
