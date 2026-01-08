@@ -1180,47 +1180,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
-name = "context"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "bytes",
- "charabia",
- "clap 4.5.54",
- "confique",
- "cupido",
- "dark-light",
- "dirs",
- "eyre",
- "futures",
- "http 1.4.0",
- "indicatif 0.18.3",
- "libsql",
- "pin-project-lite",
- "reqwest 0.13.1",
- "secrecy",
- "serde",
- "serde_json",
- "syntastica",
- "syntastica-parsers",
- "syntastica-queries",
- "syntastica-themes",
- "tempfile",
- "text-chunking",
- "tiktoken-rs",
- "tokenizers",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "toml_edit 0.22.27",
- "tracing",
- "tracing-subscriber",
- "tree-sitter",
- "uuid",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1312,6 +1271,47 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "crumbs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "charabia",
+ "clap 4.5.54",
+ "confique",
+ "cupido",
+ "dark-light",
+ "dirs",
+ "eyre",
+ "futures",
+ "http 1.4.0",
+ "indicatif 0.18.3",
+ "libsql",
+ "pin-project-lite",
+ "reqwest 0.13.1",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "syntastica",
+ "syntastica-parsers",
+ "syntastica-queries",
+ "syntastica-themes",
+ "tempfile",
+ "text-chunking",
+ "tiktoken-rs",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml_edit 0.22.27",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "uuid",
+]
 
 [[package]]
 name = "crunchy"

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-const DEFAULT_DATABASE_NAME: &str = "context.db";
+const DEFAULT_DATABASE_NAME: &str = "crumbs.db";
 
 #[derive(confique::Config, Debug, Clone, Serialize)]
 pub struct AppConfig {
@@ -179,19 +179,19 @@ pub struct Reranker {
 #[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Chunking {
-    #[config(default = 1500, env = "CONTEXT_MAX_CHUNK_SIZE")]
+    #[config(default = 1500, env = "CRUMBS_MAX_CHUNK_SIZE")]
     #[config(layer_attr(arg(long = "max-chunk-size", help = "Max characters/tokens per chunk")))]
     pub max_chunk_size: usize,
-    #[config(default = 0.2, env = "CONTEXT_CHUNK_OVERLAP")]
+    #[config(default = 0.2, env = "CRUMBS_CHUNK_OVERLAP")]
     #[config(layer_attr(arg(long = "overlap", help = "Chunk overlap ratio (0.0-1.0)")))]
     pub overlap: f32,
-    #[config(default = 4, env = "CONTEXT_MAX_PARALLEL")]
+    #[config(default = 4, env = "CRUMBS_MAX_PARALLEL")]
     #[config(layer_attr(arg(long = "max-parallel", help = "Max files to chunk in parallel")))]
     pub max_parallel: usize,
-    #[config(default = 5_242_880, env = "CONTEXT_MAX_FILE_SIZE")]
+    #[config(default = 5_242_880, env = "CRUMBS_MAX_FILE_SIZE")]
     #[config(layer_attr(arg(long = "max-file-size", help = "Max file size (bytes) to index")))]
     pub max_file_size: u64,
-    #[config(default = 4, env = "CONTEXT_LARGE_FILE_THREADS")]
+    #[config(default = 4, env = "CRUMBS_LARGE_FILE_THREADS")]
     #[config(layer_attr(arg(
         long = "large-file-threads",
         help = "Threads to use for large file chunking"
@@ -209,37 +209,37 @@ pub struct Project {
 #[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct History {
-    #[config(default = 10240, env = "CONTEXT_HISTORY_DEPTH")]
+    #[config(default = 10240, env = "CRUMBS_HISTORY_DEPTH")]
     #[config(layer_attr(arg(long = "history-depth", help = "Max commit history depth")))]
     pub depth: u32,
-    #[config(default = 1.0, env = "CONTEXT_HISTORY_COMMIT_SIZE_LIMIT_RATIO")]
+    #[config(default = 1.0, env = "CRUMBS_HISTORY_COMMIT_SIZE_LIMIT_RATIO")]
     #[config(layer_attr(arg(
         long = "history-commit-size-limit-ratio",
         help = "Ignore commits touching too many files (ratio)"
     )))]
     pub commit_size_limit_ratio: f32,
-    #[config(default = false, env = "CONTEXT_HISTORY_MULTI_PARENTS")]
+    #[config(default = false, env = "CRUMBS_HISTORY_MULTI_PARENTS")]
     #[config(layer_attr(arg(long = "history-multi-parents", help = "Include merge commits")))]
     pub multi_parents: bool,
-    #[config(default = "(#\\d+)", env = "CONTEXT_HISTORY_ISSUE_REGEX")]
+    #[config(default = "(#\\d+)", env = "CRUMBS_HISTORY_ISSUE_REGEX")]
     #[config(layer_attr(arg(
         long = "history-issue-regex",
         help = "Issue/PR regex for commit messages"
     )))]
     pub issue_regex: String,
-    #[config(env = "CONTEXT_HISTORY_COMMIT_EXCLUDE_REGEX")]
+    #[config(env = "CRUMBS_HISTORY_COMMIT_EXCLUDE_REGEX")]
     #[config(layer_attr(arg(
         long = "history-commit-exclude-regex",
         help = "Exclude commits matching regex"
     )))]
     pub commit_exclude_regex: Option<String>,
-    #[config(env = "CONTEXT_HISTORY_AUTHOR_EXCLUDE_REGEX")]
+    #[config(env = "CRUMBS_HISTORY_AUTHOR_EXCLUDE_REGEX")]
     #[config(layer_attr(arg(
         long = "history-author-exclude-regex",
         help = "Exclude authors matching regex"
     )))]
     pub author_exclude_regex: Option<String>,
-    #[config(default = "", env = "CONTEXT_HISTORY_PATHS")]
+    #[config(default = "", env = "CRUMBS_HISTORY_PATHS")]
     #[config(layer_attr(arg(
         long = "history-pathspec",
         value_delimiter = ',',
@@ -251,29 +251,29 @@ pub struct History {
 #[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct SearchOptions {
-    #[config(default = 10, env = "CONTEXT_SEARCH_LIMIT")]
+    #[config(default = 10, env = "CRUMBS_SEARCH_LIMIT")]
     #[config(layer_attr(arg(long = "limit", help = "Max results to return")))]
     pub limit: usize,
-    #[config(default = 0.4, env = "CONTEXT_SEARCH_MIN_SCORE")]
+    #[config(default = 0.4, env = "CRUMBS_SEARCH_MIN_SCORE")]
     #[config(layer_attr(arg(
         long = "min-score",
         help = "Minimum score to include in results (0.0-1.0)"
     )))]
     pub min_score: f64,
-    #[config(default = 0.6, env = "CONTEXT_HYBRID_WEIGHT")]
+    #[config(default = 0.6, env = "CRUMBS_HYBRID_WEIGHT")]
     #[config(layer_attr(arg(
         long = "hybrid-weight",
         help = "Weight for hybrid scoring (0=FTS, 1=vector)"
     )))]
     pub hybrid_weight: f32,
-    #[config(default = [], env = "CONTEXT_SEARCH_PATH_PREFIX")]
+    #[config(default = [], env = "CRUMBS_SEARCH_PATH_PREFIX")]
     #[config(layer_attr(arg(
         long = "path-prefix",
         value_delimiter = ',',
         help = "Restrict results to file path prefixes (comma-separated)"
     )))]
     pub path_prefixes: Vec<String>,
-    #[config(default = [], env = "CONTEXT_SEARCH_FILE_EXT")]
+    #[config(default = [], env = "CRUMBS_SEARCH_FILE_EXT")]
     #[config(layer_attr(arg(
         long = "file-ext",
         value_delimiter = ',',
@@ -285,14 +285,14 @@ pub struct SearchOptions {
 #[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Prompting {
-    #[config(default = "", env = "CONTEXT_PROMPT_TOKENIZER")]
+    #[config(default = "", env = "CRUMBS_PROMPT_TOKENIZER")]
     #[config(layer_attr(arg(
         id = "prompt_tokenizer",
         long = "prompt-tokenizer",
         help = "Tokenizer for prompt budgeting (defaults to embedding tokenizer)"
     )))]
     pub tokenizer: String,
-    #[config(default = "", env = "CONTEXT_PROMPT_THEME")]
+    #[config(default = "", env = "CRUMBS_PROMPT_THEME")]
     #[config(layer_attr(arg(
         id = "prompt_theme",
         long = "prompt-theme",
@@ -303,7 +303,7 @@ pub struct Prompting {
 
 #[derive(Parser)]
 #[command(
-    name = "context",
+    name = "crumbs",
     version,
     about = "Codebase indexer and context retrieval for LLM prompts",
     long_about = "Index a Git repo into a local database (chunks, embeddings, graphs, git history) \
@@ -370,7 +370,7 @@ pub struct SearchCli {
 pub struct InitCli {
     #[arg(
         long = "local",
-        help = "Write config under <repo>/.config/context instead of the user config dir"
+        help = "Write config under <repo>/.config/crumbs instead of the user config dir"
     )]
     pub local: bool,
     #[arg(long = "force", help = "Overwrite existing config files")]
@@ -613,7 +613,7 @@ pub struct ConfigSetCli {
     pub value: String,
     #[arg(
         long = "local",
-        help = "Write to <repo>/.config/context/config.toml instead of user config"
+        help = "Write to <repo>/.config/crumbs/config.toml instead of user config"
     )]
     pub local: bool,
 }
@@ -651,16 +651,16 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
     if let Ok(cwd) = std::env::current_dir() {
         let base = find_git_root(&cwd).unwrap_or(cwd);
         let local_root = base.join(".config");
-        let local_root_config = local_root.join("context.toml");
+        let local_root_config = local_root.join("crumbs.toml");
         if local_root_config.exists() {
             builder = builder.file(local_root_config);
         }
-        let local_root_secrets = local_root.join("context.secrets.toml");
+        let local_root_secrets = local_root.join("crumbs.secrets.toml");
         if local_root_secrets.exists() {
             builder = builder.file(local_root_secrets);
         }
 
-        let local_dir = local_root.join("context");
+        let local_dir = local_root.join("crumbs");
         let local_dir_secrets = local_dir.join("secrets.toml");
         if local_dir_secrets.exists() {
             builder = builder.file(local_dir_secrets);
@@ -673,7 +673,7 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
 
     // Optional XDG config (subdirectory only).
     if let Some(dir) = dirs::config_dir() {
-        let xdg_dir = dir.join("context");
+        let xdg_dir = dir.join("crumbs");
         let xdg_secrets = xdg_dir.join("secrets.toml");
         if xdg_secrets.exists() {
             builder = builder.file(xdg_secrets);
@@ -684,11 +684,11 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
         }
     }
 
-    // macOS: also prefer ~/.config/context/* (non-standard but requested).
+    // macOS: also prefer ~/.config/crumbs/* (non-standard but requested).
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs::home_dir() {
-            let macos_dir = home.join(".config/context");
+            let macos_dir = home.join(".config/crumbs");
             let macos_secrets = macos_dir.join("secrets.toml");
             if macos_secrets.exists() {
                 builder = builder.file(macos_secrets);
@@ -701,8 +701,8 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
     }
 
     let config = builder
-        .file("/etc/context/config.toml")
-        .file("/etc/context/secrets.toml")
+        .file("/etc/crumbs/config.toml")
+        .file("/etc/crumbs/secrets.toml")
         .load()
         .map_err(|e| eyre::eyre!(e.to_string()))?;
 
@@ -781,11 +781,11 @@ fn build_resolved_project(
     } else if prefer_os_data_root(&repo_path) {
         let base = dirs::data_dir()
             .ok_or_else(|| eyre::eyre!("unable to resolve XDG data directory"))?
-            .join("context")
+            .join("crumbs")
             .join(name);
         canonical_or_existing(base)?
     } else {
-        repo_path.join(".config").join("context")
+        repo_path.join(".config").join("crumbs")
     };
 
     fs::create_dir_all(&data_dir)?;
@@ -821,13 +821,13 @@ fn default_config_toml() -> eyre::Result<String> {
     let config = AppConfig::builder().load()?;
     let toml = toml_edit::ser::to_string_pretty(&config)
         .map_err(|err| eyre::eyre!("failed to serialize default config: {err}"))?;
-    let mut rendered = String::from("# context configuration\n\n");
+    let mut rendered = String::from("# crumbs configuration\n\n");
     rendered.push_str(toml.trim_end());
     rendered.push('\n');
     Ok(rendered)
 }
 
-const DEFAULT_SECRETS_TOML: &str = r#"# Secrets for context
+const DEFAULT_SECRETS_TOML: &str = r#"# Secrets for crumbs
 # You can also set EMBEDDER_API_KEY in your environment instead.
 
 [embedding]
@@ -841,7 +841,7 @@ pub fn init_config(init: &InitCli) -> eyre::Result<InitResult> {
     let root = if init.local {
         let cwd = std::env::current_dir()?;
         let repo_root = find_git_root(&cwd).unwrap_or(cwd);
-        repo_root.join(".config").join("context")
+        repo_root.join(".config").join("crumbs")
     } else {
         default_config_root()?
     };
@@ -912,13 +912,13 @@ fn write_default_file(path: &Path, contents: &str, force: bool) -> eyre::Result<
 fn default_config_root() -> eyre::Result<PathBuf> {
     let base =
         dirs::config_dir().ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))?;
-    Ok(base.join("context"))
+    Ok(base.join("crumbs"))
 }
 
 fn local_config_root() -> eyre::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     let repo_root = find_git_root(&cwd).unwrap_or(cwd);
-    Ok(repo_root.join(".config").join("context"))
+    Ok(repo_root.join(".config").join("crumbs"))
 }
 
 fn parse_toml_value(raw: &str) -> Item {
@@ -966,7 +966,7 @@ fn resolve_config_write_path(config_file: Option<&Path>) -> eyre::Result<PathBuf
 }
 
 fn existing_user_config_path() -> Option<PathBuf> {
-    let standard = dirs::config_dir().map(|dir| dir.join("context").join("config.toml"));
+    let standard = dirs::config_dir().map(|dir| dir.join("crumbs").join("config.toml"));
     if let Some(path) = standard
         && path.exists()
     {
@@ -976,7 +976,7 @@ fn existing_user_config_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs::home_dir() {
-            let path = home.join(".config").join("context").join("config.toml");
+            let path = home.join(".config").join("crumbs").join("config.toml");
             if path.exists() {
                 return Some(path);
             }
@@ -1061,17 +1061,17 @@ fn prefer_os_data_root(repo_root: &Path) -> bool {
 fn local_config_present(repo_root: &Path) -> bool {
     let local_root = repo_root.join(".config");
     let candidates = [
-        local_root.join("context.toml"),
-        local_root.join("context.secrets.toml"),
-        local_root.join("context").join("config.toml"),
-        local_root.join("context").join("secrets.toml"),
+        local_root.join("crumbs.toml"),
+        local_root.join("crumbs.secrets.toml"),
+        local_root.join("crumbs").join("config.toml"),
+        local_root.join("crumbs").join("secrets.toml"),
     ];
     candidates.iter().any(|path| path.exists())
 }
 
 fn user_config_present() -> bool {
     if let Some(dir) = dirs::config_dir() {
-        let base = dir.join("context");
+        let base = dir.join("crumbs");
         return base.join("config.toml").exists() || base.join("secrets.toml").exists();
     }
     false
@@ -1081,7 +1081,7 @@ fn macos_alt_config_present() -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs::home_dir() {
-            let base = home.join(".config").join("context");
+            let base = home.join(".config").join("crumbs");
             return base.join("config.toml").exists() || base.join("secrets.toml").exists();
         }
     }
@@ -1089,8 +1089,8 @@ fn macos_alt_config_present() -> bool {
 }
 
 fn etc_config_present() -> bool {
-    Path::new("/etc/context/config.toml").exists()
-        || Path::new("/etc/context/secrets.toml").exists()
+    Path::new("/etc/crumbs/config.toml").exists()
+        || Path::new("/etc/crumbs/secrets.toml").exists()
 }
 
 fn ensure_repo_data_gitignore(
@@ -1139,7 +1139,7 @@ fn ensure_repo_data_gitignore(
         updated.push('\n');
         fs::write(ignore_path, updated)?;
     } else {
-        let mut contents = String::from("# context data\n");
+        let mut contents = String::from("# crumbs data\n");
         contents.push_str(&lines.join("\n"));
         contents.push('\n');
         fs::write(ignore_path, contents)?;
@@ -1291,7 +1291,7 @@ mod tests {
     #[test]
     fn resolve_project_uses_repo_config_dir_when_local_config_exists() -> eyre::Result<()> {
         let dir = TempDir::new()?;
-        let local_config_dir = dir.path().join(".config").join("context");
+        let local_config_dir = dir.path().join(".config").join("crumbs");
         fs::create_dir_all(&local_config_dir)?;
         fs::write(local_config_dir.join("config.toml"), "")?;
         fs::create_dir_all(dir.path().join(".git"))?;
@@ -1362,7 +1362,7 @@ mod tests {
         let resolved = resolve_project_for_cwd(&config, dir.path(), Some("example"))?;
         assert!(
             resolved.database_path.starts_with(&local_config_dir),
-            "expected db path to be under repo .config/context"
+            "expected db path to be under repo .config/crumbs"
         );
         assert!(
             local_config_dir.join(".gitignore").exists(),

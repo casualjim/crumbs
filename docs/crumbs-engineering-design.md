@@ -1,4 +1,4 @@
-# Context Engineering Design for GPT-5.2 + GPT-5.2-Codex
+# Crumbs Context Engineering Design for GPT-5.2 + GPT-5.2-Codex
 
 Status: Draft
 Last updated: 2026-01-08
@@ -92,7 +92,7 @@ Each retrieved block must include:
 This is the default format. It is human-readable Markdown with lightweight XML tags wrapping only the grouped payloads that must stay together (structure map, summary map, each context block, user query). Tags are **not** used as section titles and there is no full XML document.
 
 ````text
-## Repository: context
+## Repository: crumbs
 Tech stack: Node.js, Rust
 
 ### Summary Map
@@ -192,7 +192,7 @@ When multiple chunks overlap:
 
 ## Proposed design
 1. **Context prompt output**
-   - Add a `context prompt` subcommand that emits the canonical Markdown + XML tags payload.
+   - Add a `crumbs prompt` subcommand that emits the canonical Markdown + XML tags payload.
 
 2. **Scope-aware retrieval and expansion**
    - Accept scope, includes, excludes, and pins as inputs.

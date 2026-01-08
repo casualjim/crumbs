@@ -139,7 +139,7 @@ mod tests {
         let dir = TempDir::new()?;
         write_fixture_repo(dir.path())?;
 
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
         let db = Db::open(&db_path, Some(embedding_dim)).await?;
 
         let config = IndexerConfig {

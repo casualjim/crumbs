@@ -1,10 +1,10 @@
-# context
+# crumbs
 
-`context` is a Git-repo indexer and semantic search tool. It builds a local index
+`crumbs` is a Git-repo indexer and semantic search tool. It builds a local index
 of your codebase (chunks + embeddings + symbol/reference graph + git history
 co-change edges) so queries can be answered with high-signal code context. The
 design target is model-ready prompt context assembly (see
-`docs/context-engineering-design.md`), and the current code provides the
+`docs/crumbs-engineering-design.md`), and the current code provides the
 indexing + retrieval foundation for that pipeline.
 
 ## What it does
@@ -27,7 +27,7 @@ indexing + retrieval foundation for that pipeline.
 
 1) Create config and secrets files:
 ```
-context init
+crumbs init
 ```
 
 2) Set your embedder API key (or put it in `secrets.toml`):
@@ -37,42 +37,39 @@ export EMBEDDER_API_KEY="..."
 
 3) Build the index:
 ```
-context index
+crumbs index
 ```
 
 4) Run a search:
 ```
-context search "add numbers"
+crumbs search "add numbers"
 ```
 
 Optional: create a repo-local config in the current repo:
 ```
-context init --local
+crumbs init --local
 ```
 
 Optional: assemble prompt-ready context:
 ```
-context prompt "refactor the search pipeline"
+crumbs prompt "refactor the search pipeline"
 ```
 
-Optional: choose Markdown output for readability:
-```
-context prompt --format markdown "refactor the search pipeline"
-```
+Output is Markdown with lightweight XML tags by default.
 
 Optional: set prompt token budgets:
 ```
-context prompt --max-tokens 400000 --reserved-output-tokens 4000 "refactor the search pipeline"
+crumbs prompt --max-tokens 400000 --reserved-output-tokens 4000 "refactor the search pipeline"
 ```
 
 Optional: use a separate tokenizer for prompt budgeting:
 ```
-context prompt --prompt-tokenizer tiktoken:o200k_base "refactor the search pipeline"
+crumbs prompt --prompt-tokenizer tiktoken:o200k_base "refactor the search pipeline"
 ```
 
 Optional: retrieval tweaks (filters, decomposition, rerank):
 ```
-context prompt --path-prefix src/ --file-ext rs --decompose --rerank "refactor the search pipeline"
+crumbs prompt --path-prefix src/ --file-ext rs --decompose --rerank "refactor the search pipeline"
 ```
 
 ## Configuration
@@ -80,17 +77,17 @@ context prompt --path-prefix src/ --file-ext rs --decompose --rerank "refactor t
 Config is loaded in this order (later files override earlier):
 - `--config-file <path>` (if provided)
 - Per-repo overrides (optional):
-  - `.config/context.toml`
-  - `.config/context.secrets.toml`
-  - `.config/context/config.toml`
-  - `.config/context/secrets.toml`
+  - `.config/crumbs.toml`
+  - `.config/crumbs.secrets.toml`
+  - `.config/crumbs/config.toml`
+  - `.config/crumbs/secrets.toml`
 - OS config dir (recommended default):
-  - macOS: `~/Library/Application Support/context/{config,secrets}.toml`
-  - Windows: `%APPDATA%\\context\\{config,secrets}.toml`
-  - Linux: `${XDG_CONFIG_HOME}/context/{config,secrets}.toml` or `~/.config/context/{config,secrets}.toml`
-- macOS also checks `~/.config/context/{config,secrets}.toml`
+  - macOS: `~/Library/Application Support/crumbs/{config,secrets}.toml`
+  - Windows: `%APPDATA%\\crumbs\\{config,secrets}.toml`
+  - Linux: `${XDG_CONFIG_HOME}/crumbs/{config,secrets}.toml` or `~/.config/crumbs/{config,secrets}.toml`
+- macOS also checks `~/.config/crumbs/{config,secrets}.toml`
 - System config:
-  - `/etc/context/{config,secrets}.toml`
+  - `/etc/crumbs/{config,secrets}.toml`
 
 Minimal config example (projects are optional):
 ```
@@ -130,7 +127,7 @@ issue_regex = "(#\\d+)"
 [projects.example]
 repo = "/path/to/repo"
 # data_dir = "/path/to/data"
-# database = "context.db"
+# database = "crumbs.db"
 
 [search]
 limit = 10

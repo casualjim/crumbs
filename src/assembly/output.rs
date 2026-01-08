@@ -699,7 +699,7 @@ mod tests {
         std::fs::write(&file_a, "fn call_foo() { foo(); }\n")?;
         std::fs::write(&file_b, "fn foo() {}\n")?;
 
-        let db_path = repo_root.join("context.db");
+        let db_path = repo_root.join("crumbs.db");
         let db = Db::open(&db_path, Some(3)).await?;
 
         let b_path = file_b.to_string_lossy().to_string();

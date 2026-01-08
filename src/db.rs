@@ -2003,7 +2003,7 @@ mod tests {
     #[tokio::test]
     async fn db_enforces_embedding_dim() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
 
         let _db = Db::open(&db_path, Some(2)).await?;
         let mismatch = Db::open(&db_path, Some(3)).await;
@@ -2014,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn db_rejects_chunk_without_file_row() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
         let db = Db::open(&db_path, Some(2)).await?;
 
         let record = ChunkRecord {
@@ -2043,7 +2043,7 @@ mod tests {
     #[tokio::test]
     async fn db_rejects_chunk_with_inverted_bounds() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
         let db = Db::open(&db_path, Some(2)).await?;
         let hash = [0u8; 32];
 
@@ -2075,7 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn db_rejects_symbol_without_file_row() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
         let db = Db::open(&db_path, Some(2)).await?;
 
         let record = SymbolRecord {
@@ -2099,7 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn db_rejects_reference_without_file_row() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
         let db = Db::open(&db_path, Some(2)).await?;
 
         let record = ReferenceRecord {
@@ -2122,7 +2122,7 @@ mod tests {
     #[tokio::test]
     async fn db_rejects_reference_symbol_links_for_missing_ids() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
         let db = Db::open(&db_path, Some(2)).await?;
 
         let result = db.link_reference_symbol("missing-ref", "missing-sym").await;
@@ -2137,7 +2137,7 @@ mod tests {
     #[tokio::test]
     async fn db_delete_file_cleans_cross_file_reference_edges() -> Result<()> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("context.db");
+        let db_path = dir.path().join("crumbs.db");
         let db = Db::open(&db_path, Some(2)).await?;
         let hash = [0u8; 32];
 

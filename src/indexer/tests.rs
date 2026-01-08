@@ -19,7 +19,7 @@ fn make_hash(byte: u8) -> [u8; 32] {
 
 async fn setup_db() -> (Db, TempDir) {
     let dir = TempDir::new().expect("tempdir");
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let db = Db::open(&db_path, Some(2))
         .await
         .expect("db open");
@@ -49,7 +49,7 @@ fn chunk_record(
 }
 
 async fn query_updated_at(dir: &TempDir, file_path: &str) -> String {
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let db = Builder::new_local(db_path).build().await.expect("open db");
     let conn = db.connect().expect("open conn");
     let mut rows = conn
@@ -64,7 +64,7 @@ async fn query_updated_at(dir: &TempDir, file_path: &str) -> String {
 }
 
 async fn query_tokens(dir: &TempDir, chunk_id: &str) -> Vec<i32> {
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let db = Builder::new_local(db_path).build().await.expect("open db");
     let conn = db.connect().expect("open conn");
     let mut rows = conn
@@ -106,7 +106,7 @@ async fn end_to_end_index_and_search() -> Result<()> {
     let dir = TempDir::new()?;
     write_fixture_repo(dir.path())?;
 
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let db = Db::open(&db_path, Some(embedding_dim)).await?;
     let tokenizer = Tokenizer::Tiktoken("cl100k_base".to_string());
     let config = IndexerConfig {
@@ -196,7 +196,7 @@ async fn unchanged_file_graph_should_not_bump_updated_at() {
 async fn replace_history_edges_should_preserve_existing_edges() {
     let (db, dir) = setup_db().await;
     insert_files(&db, &["a.rs", "b.rs"]).await;
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let test_db = Builder::new_local(db_path.clone()).build().await.expect("open db");
     let conn = test_db.connect().expect("open conn");
     conn.execute(
@@ -235,7 +235,7 @@ async fn replace_history_edges_should_preserve_existing_edges() {
 async fn refresh_file_dependency_edges_should_preserve_existing_edges() {
     let (db, dir) = setup_db().await;
     insert_files(&db, &["a.rs", "b.rs"]).await;
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let test_db = Builder::new_local(db_path.clone()).build().await.expect("open db");
     let conn = test_db.connect().expect("open conn");
     conn.execute(
@@ -354,7 +354,7 @@ async fn replace_file_graph_should_preserve_unmentioned_symbols() {
         .await
         .expect("graph replace");
 
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let test_db = Builder::new_local(db_path).build().await.expect("open db");
     let conn = test_db.connect().expect("open conn");
     let mut rows = conn
@@ -396,7 +396,7 @@ async fn replace_file_graph_should_preserve_unmentioned_references() {
         .await
         .expect("graph replace");
 
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let test_db = Builder::new_local(db_path).build().await.expect("open db");
     let conn = test_db.connect().expect("open conn");
     let mut rows = conn
@@ -469,7 +469,7 @@ async fn refresh_file_dependency_edges_should_include_multi_definitions() {
         .await
         .expect("update deps");
 
-    let db_path = dir.path().join("context.db");
+    let db_path = dir.path().join("crumbs.db");
     let test_db = Builder::new_local(&db_path).build().await.expect("open db");
     let conn = test_db.connect().expect("open conn");
     let mut rows = conn
