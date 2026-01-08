@@ -10,6 +10,14 @@ use crate::config::AppConfig;
 use crate::embedding::EmbeddingProvider;
 use crate::repository::Repository;
 
+#[derive(Clone, Debug, Default)]
+pub struct SelectionOptions {
+    pub scope_paths: Vec<String>,
+    pub explicit_includes: Vec<String>,
+    pub explicit_excludes: Vec<String>,
+    pub pinned_items: Vec<String>,
+}
+
 /// Shared context available to all stages in the assembly pipeline.
 pub struct AssemblyContext<'a> {
     #[allow(dead_code)]
@@ -19,6 +27,7 @@ pub struct AssemblyContext<'a> {
     pub reranker: &'a dyn crate::reranker::RerankingProvider,
     #[allow(dead_code)]
     pub config: &'a AppConfig,
+    pub selection: SelectionOptions,
 }
 
 /// Typed handle into the arena.

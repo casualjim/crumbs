@@ -1,239 +1,181 @@
 # Context Engineering Design for GPT-5.2 + GPT-5.2-Codex
 
 Status: Draft
-Last updated: 2026-01-05
+Last updated: 2026-01-08
 Owners: TBD
 
 ## Summary
-This design doc specifies the output format for assembled code context that will be included in agent prompts. It defines the structure, metadata, and formatting requirements for GPT-5.2-Codex (primary), Gemini 3 Pro, and Claude Sonnet 4.5. The doc also maps these requirements to current capabilities and identifies gaps in the assembly pipeline.
+This design doc specifies how assembled **code context** is produced and serialized for downstream callers. It covers retrieval, expansion, deduplication, token budgeting, and **Markdown-first output with lightweight XML tags** for GPT-5.2-Codex (primary), Claude Sonnet 4.5, and Gemini 3 Pro.
 
-**Scope:** This tool is a **stateless context generator**. It does not store conversation state and does not call LLMs. It accepts conversation history or pre-compacted summaries as input, performs retrieval/budgeting/assembly, and outputs a prompt-ready payload. Compaction, long-term memory, and evaluation tooling live in separate tools/services.
+**Scope:** This tool is a **stateless context generator**. It does not store conversation state and does not call LLMs. It accepts inputs (query, scope, explicit includes/excludes, model limits), performs retrieval/expansion/budgeting, and outputs a prompt-ready **context payload**. Instruction authoring, agent UX, compaction, and evaluation tooling live elsewhere.
 
 ## Goals
-- Deliver high-signal, model-ready context for GPT-5.2 and GPT-5.2-Codex.
-- Use retrieval, graph expansion, and token budgeting to fit within model context limits.
+- Deliver high-signal, model-ready context payloads for GPT-5.2 and GPT-5.2-Codex.
+- Use retrieval + expansion + token budgeting to fit within model limits.
 - Support long-horizon coding workflows by accepting pre-compacted inputs.
-- Provide repeatable quality via evaluation, model snapshot pinning, and telemetry.
+- Produce a **Markdown-first** output that is readable by humans and reliably parsable via lightweight XML tags.
 
 ## Non-goals
 - Building a UI/UX for human review (CLI-first is fine).
 - Training or fine-tuning models.
 - Replacing upstream embedding or vector DB providers.
 - Long-term memory, conversation state storage, or compaction.
-- Initiating LLM calls (this tool only prepares prompt context).
+- Initiating LLM calls (this tool only prepares context).
+- Authoring or injecting system/developer instructions (caller-supplied).
 
-## External best practices (OpenAI)
+## Design principles
+- **Markdown-first, flat structure:** headings for humans; XML tags wrap the grouped payloads that must stay together.
+- **Explicit scope and intent:** retrieval respects scope, includes, and excludes.
+- **Deterministic trimming:** budget-driven, repeatable selection and truncation.
+- **Transparent provenance:** include source and reason in block headers when available.
 
-### Model capabilities and controls
-- GPT-5.2 supports a very large context window (400,000 tokens) and long outputs (128,000 tokens); budgets must be explicit to avoid overrun.
-- GPT-5.2 exposes controls for reasoning effort and verbosity; set these per task (e.g., low reasoning + low verbosity for simple tasks, higher for complex).
-- GPT-5.2-Codex improves long-horizon coding (larger changes, multi-file edits) and includes improved context compaction.
+## Inputs (contract)
+The context generator receives:
+- **query**: the user request or task statement.
+- **scope**: one or more scope selectors (current file, workspace, repo, remote repo).
+- **explicit_includes**: files, symbols, or paths that must be included if possible.
+- **explicit_excludes**: paths or patterns that must not be included.
+- **pinned_items**: blocks that should survive trimming if possible.
+- **model_limits**: max input tokens, max output tokens, and tokenizer ID.
+- **repo_map** (optional): tree summary or module map provided by caller.
 
-### Prompt structure and instruction hierarchy
-- Use clear instruction hierarchy (system/developer/user) and keep prompts structured with explicit formatting.
-- Put instructions at the beginning of prompts and separate instruction vs. context with clear delimiters.
-- Ask for specific output formats and provide examples when needed.
-- GPT-family models respond best to precise, explicit instructions; keep ambiguity low.
+## Retrieval, expansion, and selection
+Retrieval and expansion are **integral** to context assembly. Selection is a staged process:
 
-### Retrieval (RAG) and chunking
-- Use embeddings to retrieve relevant snippets and augment prompts with only the most relevant chunks.
-- Start with practical chunking defaults (around 800 tokens with 400 overlap) and tune per repo and language.
-- Prefer hybrid retrieval (vector + keyword) and metadata filters to reduce noise.
+1. **Apply scope**
+   - Reject candidates outside the allowed scope set.
 
-### Context window management and compaction
-- Out of scope for this tool; handled by a separate compaction/memory service.
+2. **Seed with explicit includes**
+   - Add explicitly requested files/symbols first.
+   - If an explicit include is missing, emit a warning in the output.
 
-### Prompt caching
-- Use prompt caching by placing static instruction prefixes at the start of requests (caching uses the longest matching prefix).
-- Keep dynamic, per-request content after the stable prefix for maximum cache hits.
+3. **Primary retrieval**
+   - Hybrid search (vector + keyword), filtered by scope and excludes.
 
-### Evaluation and model stability
-- Out of scope for this tool; handled by a separate eval/telemetry service.
+4. **Expansion**
+   - Expand from primary hits via dependencies, graph neighbors, or co-change.
+   - Expansion never crosses explicit excludes or scope boundaries.
 
-## Context output format specification
+5. **Rank and order**
+   - Base ordering: explicit includes > pinned > primary retrieval > expansion.
+   - Within each tier: relevance score, then file locality, then graph proximity.
 
-This section defines how assembled context should be formatted for consumption by AI agents.
+6. **Deduplicate**
+   - Identity = (file_path, start_line, end_line).
+   - Keep highest scoring occurrence; prefer explicit > pinned > primary > expanded.
 
-### Target models and format preferences
-
-**Primary: GPT-5.2-Codex**
-- Prefers XML tags for major sections: `<context>`, `<file>`, `<metadata>`
-- File references: absolute or workspace-relative paths with single line numbers (`src/app.py:42`, not ranges)
-- Supports `#Lline` syntax for GitHub-style references
-- Minimal verbosity; flat structure preferred over deep nesting
-- Code blocks in fenced markdown with language info strings
-
-**Secondary: Claude Sonnet 4.5**
-- Requires XML tags for reliable parsing
-- Custom tag names encouraged (semantic naming)
-- Supports nested structures for complex hierarchies
-- Explicit references to tags in instructions improve reliability
-
-**Tertiary: Gemini 3 Pro**
-- Supports XML-like tags with PTCF pattern
-- Standard tags: `<CONTEXT>`, `<CODE>`, `<METADATA>`
-- Instructions should follow context in long prompts
-
-### Metadata schema for code blocks
-
-Each retrieved code block must include:
+## Metadata schema for context blocks
+Each retrieved block must include:
 
 **Required fields:**
-- `file_path`: Absolute or repo-relative path
-- `start_line`: Starting line number (1-indexed)
-- `end_line`: Ending line number (inclusive)
-- `relevance`: Score between 0.0-1.0 indicating retrieval relevance
-- `source`: One of `primary`, `expanded`, `cochange`, `dependency`
-- `language`: Programming language for syntax context
+- `file_path`: absolute or repo-relative path
+- `start_line`: starting line number (1-indexed)
+- `end_line`: ending line number (inclusive)
+- `relevance`: 0.0-1.0 score for retrieval relevance
+- `source`: `explicit`, `pinned`, `primary`, `expanded`
+- `scope`: scope selector that admitted this block
+- `language`: programming language
 
 **Optional fields:**
-- `symbols`: List of function/class names defined in the block
-- `token_count`: Number of tokens in the code content
-- `last_modified`: Git timestamp of last change
-- `commit_sha`: Most recent commit affecting these lines
-- `author`: Primary author from git blame
+- `symbols`: list of function/class names in the block
+- `token_count`: token count of the block content
+- `reason`: short label explaining inclusion (e.g., explicit_include, dependency_neighbor)
+- `last_modified`: git timestamp of last change
+- `commit_sha`: most recent commit affecting these lines
+- `author`: primary author from git blame
 
-### Context assembly structure
+**Serialization notes:**
+- `file_path` is rendered as `path:` in Markdown output.
+- `start_line` and `end_line` are rendered as `Lines: start-end`.
 
-The assembled prompt should have these sections in order:
+## Canonical output format (Markdown + XML tags)
+This is the default format. It is human-readable Markdown with lightweight XML tags wrapping only the grouped payloads that must stay together (structure map, summary map, each context block, user query). Tags are **not** used as section titles and there is no full XML document.
 
-```xml
-<system>
-  <!-- Static instructions, forms cacheable prefix -->
-  <role>You are an expert coding assistant...</role>
-  <constraints>
-    - Only use code from provided context
-    - Cite file:line for all references
-    - Do not invent or hallucinate code
-  </constraints>
-</system>
+````text
+## Repository: context
+Tech stack: Node.js, Rust
 
-<repository_overview>
-  <!-- Semi-static repo information, part of cacheable prefix -->
-  <name>project-name</name>
-  <structure>
-    src/
-      api/
-      models/
-      utils/
-    tests/
-  </structure>
-  <tech_stack>Python 3.11, FastAPI, PostgreSQL</tech_stack>
-</repository_overview>
-
-<code_context>
-  <!-- Dynamic per-query retrieved context -->
-  <retrieved_files count="5" total_tokens="2400">
-    <file>
-      <path>src/utils/auth.py</path>
-      <lines start="42" end="67"/>
-      <relevance>0.92</relevance>
-      <source>primary</source>
-      <language>python</language>
-      <symbols>authenticate, validate_token</symbols>
-      <content><![CDATA[
-def authenticate(username: str, password: str) -> bool:
-    """Authenticate user credentials."""
-    # implementation
-]]></content>
-    </file>
-  </retrieved_files>
-
-  <expanded_files count="2" total_tokens="800">
-    <file>
-      <path>src/models/user.py</path>
-      <lines start="10" end="45"/>
-      <relevance>0.76</relevance>
-      <source>cochange</source>
-      <symbols>User, get_by_username</symbols>
-      <content><![CDATA[
-class User:
-    # implementation
-]]></content>
-    </file>
-  </expanded_files>
-</code_context>
-
-<user_query>
-  <!-- The actual user request -->
-  How does authentication work in this codebase?
-</user_query>
+### Summary Map
+<SUMMARY_MAP>
 ```
-
-### Alternative flat format (Codex-optimized)
-
-For GPT-5.2-Codex, a flatter Markdown structure may perform equally well:
-
-    ## Repository: project-name
-    Tech stack: Python 3.11, FastAPI, PostgreSQL
-
-    ## Retrieved Context (5 files, 2400 tokens)
-
-    ### Primary Results
-
-    **src/utils/auth.py:42-67** (relevance: 0.92)
-    Symbols: `authenticate`, `validate_token`
-
-    ```python
-    def authenticate(username: str, password: str) -> bool:
-        """Authenticate user credentials."""
-        # implementation
-    ```
-
-    ### Expanded Context (2 files, 800 tokens)
-
-    **src/models/user.py:10-45** (relevance: 0.76, source: cochange)
-    Symbols: `User`, `get_by_username`
-
-    ```python
-    class User:
-        # implementation
-    ```
-
-### Token budget allocation
-
-For GPT-5.2 with 400K context window:
-
+...tree...
 ```
-Total context:    400,000 tokens
-Reserved output:    4,000 tokens
-Available input:  396,000 tokens
+</SUMMARY_MAP>
 
-Allocation:
-  System prompt:       2,000 tokens (static, cached)
-  Repo overview:       1,000 tokens (semi-static, cached)
-  User query:            500 tokens (dynamic)
-  Retrieved context: 392,500 tokens (dynamic, trimmed to fit)
+## Warnings
+<WARNINGS>
+- explicit include not found: src/missing.rs
+</WARNINGS>
+
+## Retrieved Context (4 blocks)
+
+### Primary Results
+
+<BLOCK>
+path: src/config.rs
+Lines: 29-115
+relevance: 0.9737
+source: primary
+reason: retrieval
+language: Rust
+symbols: Embedding, api_key, context_length, ...
+```rust
+// ...
 ```
+</BLOCK>
 
-Budget enforcement:
-1. Sort candidates by relevance score (descending)
-2. For ties, prefer same-file locality
-3. For ties, prefer direct dependencies over co-change neighbors
-4. Accumulate tokens until budget exhausted
-5. Truncate remaining candidates
+<BLOCK>
+path: src/embedding.rs
+Lines: 111-184
+relevance: 0.8918
+source: primary
+reason: retrieval
+language: Rust
+symbols: EmbedApiResponse, EmbeddingProvider, ...
+```rust
+// ...
+```
+</BLOCK>
 
-### File reference format
+## User Query
+<USER_QUERY>
+We're adding a new embedding model with fastembed for local embedding
+</USER_QUERY>
+````
 
-When agents reference files in their responses:
+## Token budgeting and trimming
+Budgeting is **parameterized by model limits** provided by the caller.
 
-**Accepted formats:**
-- `src/app.py:42` - workspace-relative with line
-- `/home/user/repo/src/app.py:42` - absolute with line
-- `src/app.py#L42` - GitHub-style reference
-- `a/src/app.py:42` or `b/src/app.py:42` - diff prefix
+Definitions:
+- `input_budget = model_max_input_tokens - reserved_output_tokens`
+- `reserved_output_tokens` is task-dependent and caller-supplied.
 
-**Not accepted:**
-- `file://` URIs
-- `vscode://` URIs
-- Line ranges like `:42-50` (Codex limitation)
+Trimming rules (in order):
+1. Never drop explicit includes or pinned blocks if any budget remains.
+2. Drop lowest-relevance expanded blocks first.
+3. If still over budget, trim oversized blocks by reducing line span.
+4. If still over budget, drop lowest-relevance primary blocks.
+5. Emit a warning in the output if any explicit include could not fit.
 
-### Deduplication strategy
+## File reference format (context payload)
+Prefer **repo-relative** file paths, but absolute paths are allowed when needed.
 
+Accepted formats:
+- `src/app.py`
+- `/home/user/repo/src/app.py`
+- `src/app.py:42` or `/home/user/repo/src/app.py:42` (single line)
+- `src/app.py#L42` or `/home/user/repo/src/app.py#L42` (GitHub-style)
+- `Lines: 42-115` (line span, paired with the file path)
+- `a/src/app.py:42` or `b/src/app.py:42` (diff prefix)
+
+Not accepted:
+- `file://` or `vscode://` URIs
+
+## Deduplication strategy
 When multiple chunks overlap:
-1. Compute chunk identity as `(file_path, start_line, end_line)`
+1. Identity = `(file_path, start_line, end_line)`
 2. Keep highest-scoring occurrence of each identity
-3. If scores equal, prefer `primary` > `expanded` > `cochange`
+3. If scores equal, prefer `explicit` > `pinned` > `primary` > `expanded`
 4. If still tied, keep first occurrence
 
 ## Current capabilities in this repo
@@ -244,134 +186,38 @@ When multiple chunks overlap:
 - Assembly pipeline stages (retrieve, expand, refine, budget, assemble), but not wired to a CLI or API (`src/assembly/*`).
 
 ## Gap analysis (best practice -> current state -> gap)
-- Model-aware prompt assembly: no CLI/API that assembles prompts or model-ready payloads.
-- Token budgeting: no tokenizer-based budgeting for GPT-5.2 context size or output limits.
-- Retrieval quality: no query rewriting, reranking, or metadata filtering; no retrieval evals.
-- Prompt caching: no concept of stable prefix or cache key handling.
-- Code-specific context layers: no repo map, dependency map, or change-focused context packaging.
-
-## Detailed gap map
-
-### Retrieval
-Already:
-- Vector + FTS hybrid retrieval with weighting.
-- Git co-change expansion to pull related files.
-
-Gaps:
-- Query rewriting and decomposition (multi-part requests).
-- Metadata filters (language, path prefix, recency, module tag, ownership).
-- Reranking with a cross-encoder or lightweight heuristic.
-- De-duplication by semantic similarity (not just byte ranges).
-- Retrieval eval harness and regression tracking.
-
-### Assembly and prompt output
-Already:
-- Pipeline stages for retrieval, expansion, refinement, budget, and assembly exist in code.
-- Basic `ContextBlock` and `AssembledContext` types defined.
-
-Gaps:
-- No user-facing `context prompt` command or API endpoint.
-- No XML or Markdown serialization of assembled context.
-- No metadata enrichment (symbols, tokens, git info) in output.
-- No stable prompt prefix generation for caching.
-- No repo overview/map generation for context header.
-- No output format selection (XML vs Markdown vs JSON).
-
-### Token budgeting
-Already:
-- Embedding client enforces input context length.
-
-Gaps:
-- No model-aware token counting for prompt assembly.
-- No explicit budget slices (instructions, user task, retrieved context, output headroom).
-- No dynamic trimming or ordering by token cost.
-
-### Context window management
-Out of scope for this tool. A separate compaction/memory service should:
-- Store conversation state or summaries.
-- Provide pre-compacted inputs and budgets.
-- Refresh stale context blocks as needed.
-
-### Model controls and tooling
-Out of scope for this tool. A downstream caller should:
-- Choose model-specific reasoning/verbosity controls.
-- Integrate tool calls (e.g., file search) if desired.
-
-### Prompt caching
-Already:
-- None.
-
-Gaps:
-- No stable prefix generation to maximize cache hits.
-- No caching diagnostics or cache hit metrics.
-
-### Code context layers
-Already:
-- Graph extraction for symbols and references.
-- Git history co-change graph.
-- File path and byte range tracking in chunks.
-
-Gaps:
-- No line number extraction (only byte offsets currently).
-- No symbol extraction from chunks (function/class names).
-- No repo map or directory tree generation for overview section.
-- No dependency graph serialization for prompt inclusion.
-- No change-focused context packaging (diff-aware context).
-- No file importance or ownership weighting from git history.
-- No last-modified timestamps or commit SHA tracking per chunk.
-
-### Evaluation and observability
-Out of scope for this tool. A separate eval/telemetry service should:
-- Track retrieval precision and prompt quality.
-- Provide regression tests and quality gates.
+- **Scope semantics:** Scope is path-prefix based only; no named scopes (current file/workspace/multi-repo).
+- **Explicit includes/pins:** File-path includes/pins supported; symbol-level includes not yet supported.
+- **Budget trimming:** Line-span trimming is prefix-only; no middle-window or symbol-aware trimming.
 
 ## Proposed design
-1. **Prompt assembly API**
-   - New `context prompt` subcommand that outputs a model-ready payload.
-   - Standard prompt template sections: system/developer instructions, task statement, constraints, retrieved context blocks, and file metadata.
+1. **Context prompt output**
+   - Add a `context prompt` subcommand that emits the canonical Markdown + XML tags payload.
 
-2. **Token budgeting and ordering**
-   - Tokenize using the target model’s tokenizer.
-   - Allocate budgets for: instructions, task, retrieval blocks, and output headroom.
-   - Prefer ordering by relevance score, then by file locality and graph proximity.
+2. **Scope-aware retrieval and expansion**
+   - Accept scope, includes, excludes, and pins as inputs.
+   - Enforce precedence: explicit > pinned > primary > expanded.
 
-3. **Retrieval quality upgrades**
-   - Add query rewriting and query decomposition for multi-part tasks.
-   - Add reranking (cross-encoder or lightweight scoring) for top-N candidates.
-   - Support metadata filters: language, path, recency, repo area, or issue tag.
+3. **Budgeting and trimming**
+   - Tokenize using the caller-provided tokenizer.
+   - Enforce `input_budget` with deterministic trimming rules.
 
-4. **Prompt caching support**
-   - Treat the instruction prefix and repo summary as the cacheable prefix.
-   - Keep per-request dynamic blocks after the prefix to maximize cache hits.
-
-5. **Integration points (external tools)**
-   - Compaction/memory tool provides conversation summaries and budgets.
-   - Downstream caller selects model controls and tool integrations.
-   - Eval/telemetry service measures retrieval quality and regressions.
+4. **Block provenance**
+   - Emit per-block provenance fields (source, reason) in the block header.
 
 ## Roadmap
-- **M1 (Output format + metadata):** Implement XML/Markdown serialization, metadata enrichment (line numbers, symbols, git info), repo overview generation.
-- **M2 (Prompt assembly + budgets):** Implement `context prompt` CLI command, token budgeting with tiktoken, deduplication, ordering strategy.
-- **M3 (Retrieval upgrades):** Query rewriting, metadata filters, reranking.
-- **M4 (Compaction + state):** Conversation state + compaction routines.
-- **M5 (Evals + caching):** Eval harness, prompt caching guidance, telemetry.
+- **M1 (Output + block headers):** Implemented (Markdown + XML tags with per-block provenance).
+- **M2 (Selection inputs):** Implemented (path-prefix scope, includes, excludes, pins).
+- **M3 (Budgeting):** Implemented (token budget + line-span trimming).
 
 ## Open questions
-- How should prompt-budget tokenization relate to `embedding.tokenizer` (same tokenizer vs model-specific budgeting tokenizer)?
-- Should we support all three output formats (XML, Markdown, JSON) or prioritize one?
-- How to handle line number extraction from byte offsets for non-UTF8 files?
-- Should symbol extraction use tree-sitter for all languages or heuristics?
-- What's the optimal repo overview detail level (full tree vs summary)?
-- How to detect tech stack automatically (parse package files vs heuristics)?
-- Should deduplication be exact (line numbers) or fuzzy (overlapping ranges)?
-- Do we standardize on a single embedding model, or allow per-project overrides?
-- What storage format should hold conversation state and compaction artifacts?
+- How should scope be expressed for multi-repo workspaces (labeling, precedence)?
+- What is the best trimming strategy for large files (top-N symbols vs. contiguous spans)?
+- Should relevance be normalized per retrieval method or globally?
 
 ## References
 - OpenAI GPT-5.2 prompting guide (cookbook.openai.com/examples/gpt-5/gpt-5-2_prompting_guide)
 - GPT-5.2-Codex system prompt (github.com/openai/codex)
-- Claude Sonnet 4.5 XML tag documentation (docs.anthropic.com)
-- Gemini 3 Pro structured prompting guide (ai.google.dev/gemini-api)
 - Context engineering best practices (github.com/Meirtz/Awesome-Context-Engineering)
 - RAG context window management patterns
 - Repository-level code generation research (arXiv, Springer)

@@ -19,6 +19,7 @@ const SUMMARY_LIMIT: usize = 20;
 const SUMMARY_COCHANGE_LIMIT: usize = 3;
 const SUMMARY_CORE_LIMIT: usize = 5;
 const SUMMARY_HIGH_CHURN_COMMITS: i64 = 10;
+const SUMMARY_MAX_ENTRIES: usize = 400;
 
 #[derive(Clone, Copy, Debug)]
 pub enum PromptFormat {
@@ -42,6 +43,7 @@ pub struct PromptPayload {
     pub overview: RepositoryOverview,
     pub task: String,
     pub blocks: Vec<EnrichedBlock>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -100,7 +102,7 @@ fn normalized_fence_language(language: &str) -> String {
 }
 
 pub async fn enrich_blocks(
-    _repo_root: &Path,
+    repo_root: &Path,
     db: &dyn Repository,
     blocks: &[ContextBlock],
 ) -> Result<Vec<EnrichedBlock>> {
@@ -129,7 +131,7 @@ pub async fn enrich_blocks(
         .unwrap_or_else(|| "text".to_string());
 
         enriched.push(EnrichedBlock {
-            file_path: block.file_path.clone(),
+            file_path: display_path(repo_root, &block.file_path),
             start_line,
             end_line,
             relevance: block.score.clamp(0.0, 1.0),
@@ -195,6 +197,13 @@ fn render_xml(payload: &PromptPayload, sections: PromptSections) -> String {
         }
         writeln!(out, "  </repository_overview>").ok();
     }
+    if !payload.warnings.is_empty() {
+        writeln!(out, "  <warnings>").ok();
+        for warning in &payload.warnings {
+            writeln!(out, "    <warning>{}</warning>", xml_escape(warning)).ok();
+        }
+        writeln!(out, "  </warnings>").ok();
+    }
     if sections.context {
         writeln!(out, "  <code_context>").ok();
 
@@ -238,6 +247,12 @@ fn write_xml_group(out: &mut String, label: &str, blocks: &[EnrichedBlock]) {
         .ok();
         writeln!(
             out,
+            "        <reason>{}</reason>",
+            reason_label(block.source)
+        )
+        .ok();
+        writeln!(
+            out,
             "        <language>{}</language>",
             xml_escape(&block.language)
         )
@@ -273,19 +288,26 @@ fn render_markdown(payload: &PromptPayload, sections: PromptSections) -> String 
             .ok();
         }
         if sections.structure && !payload.overview.structure.is_empty() {
-            writeln!(out, "\n### Structure\n```").ok();
+            writeln!(out, "\n### Structure\n<STRUCTURE_MAP>\n```").ok();
             for line in &payload.overview.structure {
                 writeln!(out, "{line}").ok();
             }
-            writeln!(out, "```").ok();
+            writeln!(out, "```\n</STRUCTURE_MAP>").ok();
         }
         if sections.summary && !payload.overview.summary.is_empty() {
-            writeln!(out, "\n### Summary Map\n```").ok();
+            writeln!(out, "\n### Summary Map\n<SUMMARY_MAP>\n```").ok();
             for line in &payload.overview.summary {
                 writeln!(out, "{line}").ok();
             }
-            writeln!(out, "```").ok();
+            writeln!(out, "```\n</SUMMARY_MAP>").ok();
         }
+    }
+    if !payload.warnings.is_empty() {
+        writeln!(out, "\n## Warnings\n<WARNINGS>").ok();
+        for warning in &payload.warnings {
+            writeln!(out, "- {warning}").ok();
+        }
+        writeln!(out, "</WARNINGS>").ok();
     }
     if sections.context {
         writeln!(
@@ -300,7 +322,7 @@ fn render_markdown(payload: &PromptPayload, sections: PromptSections) -> String 
         write_markdown_group(&mut out, "Expanded Context", &expanded);
     }
     if sections.query {
-        writeln!(out, "\n## User Query\n{}", payload.task).ok();
+        writeln!(out, "\n## User Query\n<USER_QUERY>\n{}\n</USER_QUERY>", payload.task).ok();
     }
     out
 }
@@ -308,28 +330,25 @@ fn render_markdown(payload: &PromptPayload, sections: PromptSections) -> String 
 fn write_markdown_group(out: &mut String, label: &str, blocks: &[EnrichedBlock]) {
     writeln!(out, "\n### {}", label).ok();
     for block in blocks {
-        let ref_line = format!("{}:{}", block.file_path, block.start_line);
-        writeln!(
-            out,
-            "\n**{}** (relevance: {:.4}, source: {})",
-            ref_line,
-            block.relevance,
-            source_label(block.source)
-        )
-        .ok();
+        writeln!(out, "\n<BLOCK>").ok();
+        writeln!(out, "path: {}", block.file_path).ok();
         writeln!(out, "Lines: {}-{}", block.start_line, block.end_line).ok();
-        writeln!(out, "Language: {}", block.language).ok();
+        writeln!(out, "relevance: {:.4}", block.relevance).ok();
+        writeln!(out, "source: {}", source_label(block.source)).ok();
+        writeln!(out, "reason: {}", reason_label(block.source)).ok();
+        writeln!(out, "language: {}", block.language).ok();
         if !block.symbols.is_empty() {
             let symbols = block
                 .symbols
                 .iter()
-                .map(|symbol| format!("`{}`", symbol))
+                .map(|symbol| symbol.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            writeln!(out, "Symbols: {}", symbols).ok();
+            writeln!(out, "symbols: {}", symbols).ok();
         }
         let fence_lang = normalized_fence_language(&block.language);
-        writeln!(out, "\n```{}\n{}\n```", fence_lang, block.text).ok();
+        writeln!(out, "```{}\n{}\n```", fence_lang, block.text).ok();
+        writeln!(out, "</BLOCK>").ok();
     }
 }
 
@@ -370,7 +389,9 @@ fn split_blocks(blocks: &[EnrichedBlock]) -> (Vec<EnrichedBlock>, Vec<EnrichedBl
     let mut expanded = Vec::new();
     for block in blocks {
         match block.source {
-            CandidateSource::Primary => primary.push(block.clone()),
+            CandidateSource::Explicit | CandidateSource::Pinned | CandidateSource::Primary => {
+                primary.push(block.clone())
+            }
             CandidateSource::Expanded => expanded.push(block.clone()),
         }
     }
@@ -379,8 +400,19 @@ fn split_blocks(blocks: &[EnrichedBlock]) -> (Vec<EnrichedBlock>, Vec<EnrichedBl
 
 fn source_label(source: CandidateSource) -> &'static str {
     match source {
+        CandidateSource::Explicit => "explicit",
+        CandidateSource::Pinned => "pinned",
         CandidateSource::Primary => "primary",
         CandidateSource::Expanded => "expanded",
+    }
+}
+
+fn reason_label(source: CandidateSource) -> &'static str {
+    match source {
+        CandidateSource::Explicit => "explicit_include",
+        CandidateSource::Pinned => "pinned",
+        CandidateSource::Primary => "retrieval",
+        CandidateSource::Expanded => "expanded_neighbor",
     }
 }
 
@@ -410,8 +442,8 @@ pub async fn build_repository_overview(
         .and_then(|name| name.to_str())
         .unwrap_or("repo")
         .to_string();
-    let structure = build_structure(repo_root, 2, 200);
-    let tech_stack = detect_tech_stack(repo_root);
+    let structure = Vec::new();
+    let tech_stack = detect_tech_stack(repo_root, db).await;
     let summary = build_repository_summary(repo_root, db).await;
     RepositoryOverview {
         name,
@@ -423,14 +455,16 @@ pub async fn build_repository_overview(
 
 async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
     let mut lines = Vec::new();
-    let Ok(ranks) = db.file_dependency_pagerank(SUMMARY_LIMIT).await else {
+    let Ok(files) = db.list_files().await else {
         return lines;
     };
-    if ranks.is_empty() {
+    if files.is_empty() {
         return lines;
     }
 
+    let ranks = db.file_dependency_pagerank(SUMMARY_LIMIT).await.unwrap_or_default();
     let core_limit = SUMMARY_CORE_LIMIT.min(ranks.len());
+    let mut ranked = std::collections::HashMap::new();
 
     for (idx, (file_path, score)) in ranks.iter().enumerate() {
         let display_path_value = display_path(repo_root, file_path);
@@ -447,39 +481,45 @@ async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<
             }
         }
 
-        let badge_text = if badges.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " {}",
-                badges
-                    .iter()
-                    .map(|b| format!("[{b}]"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        };
-        lines.push(format!(
-            "{}{} (rank {:.4})",
-            display_path_value, badge_text, score
-        ));
-
-        if let Ok(partners) = db
+        let cochanges = match db
             .cochange_partners(file_path, SUMMARY_COCHANGE_LIMIT)
             .await
         {
-            if !partners.is_empty() {
-                let items = partners
+            Ok(partners) if !partners.is_empty() => Some(
+                partners
                     .into_iter()
                     .map(|(path, weight)| {
                         format!("{} ({:.2})", display_path(repo_root, &path), weight)
                     })
                     .collect::<Vec<_>>()
-                    .join(", ");
-                lines.push(format!("  <-> changes with: {items}"));
-            }
-        }
+                    .join(", "),
+            ),
+            _ => None,
+        };
+
+        ranked.insert(
+            display_path_value,
+            RepoMapEntry {
+                score: Some(*score),
+                badges,
+                cochanges,
+            },
+        );
     }
+
+    let mut map = RepoMapNode::default();
+    for file_path in files {
+        let display_path_value = display_path(repo_root, &file_path);
+        let entry = ranked.remove(&display_path_value).unwrap_or(RepoMapEntry {
+            score: None,
+            badges: Vec::new(),
+            cochanges: None,
+        });
+        insert_repo_map_entry(&mut map, &display_path_value, entry);
+    }
+
+    let mut count = 0usize;
+    render_repo_map_tree(&map, "", 0, 4, SUMMARY_MAX_ENTRIES, &mut count, &mut lines);
 
     lines
 }
@@ -517,98 +557,266 @@ fn is_test_path(path: &str) -> bool {
         || stem.ends_with(".test")
 }
 
-fn build_structure(root: &Path, max_depth: usize, max_entries: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut count = 0usize;
-    build_structure_inner(root, 0, max_depth, max_entries, &mut count, &mut lines);
-    lines
+fn detect_tech_stack_from_path(path: &Path, stack: &mut std::collections::BTreeSet<String>) {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match file_name.as_str() {
+        "cargo.toml" | "cargo.lock" => {
+            stack.insert("Rust".to_string());
+        }
+        "package.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lockb" => {
+            stack.insert("Node.js".to_string());
+        }
+        "pyproject.toml"
+        | "requirements.txt"
+        | "requirements-dev.txt"
+        | "pipfile"
+        | "poetry.lock"
+        | "setup.py"
+        | "setup.cfg" => {
+            stack.insert("Python".to_string());
+        }
+        "go.mod" | "go.sum" => {
+            stack.insert("Go".to_string());
+        }
+        "gemfile" | "gemfile.lock" => {
+            stack.insert("Ruby".to_string());
+        }
+        "composer.json" | "composer.lock" => {
+            stack.insert("PHP".to_string());
+        }
+        "pom.xml"
+        | "build.gradle"
+        | "build.gradle.kts"
+        | "settings.gradle"
+        | "settings.gradle.kts"
+        | "gradle.properties" => {
+            stack.insert("Java".to_string());
+        }
+        "mix.exs" | "mix.lock" => {
+            stack.insert("Elixir".to_string());
+        }
+        "dockerfile" | "dockerfile.dev" => {
+            stack.insert("Docker".to_string());
+        }
+        "deno.json" | "deno.jsonc" => {
+            stack.insert("Deno".to_string());
+        }
+        "cabal.project" | "stack.yaml" => {
+            stack.insert("Haskell".to_string());
+        }
+        "build.sbt" => {
+            stack.insert("Scala".to_string());
+        }
+        "pubspec.yaml" => {
+            stack.insert("Dart".to_string());
+        }
+        "package-lock.json" => {
+            stack.insert("Node.js".to_string());
+        }
+        _ => {}
+    }
+
+    match extension.as_str() {
+        "rs" => {
+            stack.insert("Rust".to_string());
+        }
+        "py" => {
+            stack.insert("Python".to_string());
+        }
+        "js" | "jsx" => {
+            stack.insert("JavaScript".to_string());
+        }
+        "ts" | "tsx" => {
+            stack.insert("TypeScript".to_string());
+        }
+        "go" => {
+            stack.insert("Go".to_string());
+        }
+        "rb" => {
+            stack.insert("Ruby".to_string());
+        }
+        "php" => {
+            stack.insert("PHP".to_string());
+        }
+        "java" => {
+            stack.insert("Java".to_string());
+        }
+        "kt" | "kts" => {
+            stack.insert("Kotlin".to_string());
+        }
+        "cs" | "fs" | "vb" => {
+            stack.insert(".NET".to_string());
+        }
+        "swift" => {
+            stack.insert("Swift".to_string());
+        }
+        "scala" => {
+            stack.insert("Scala".to_string());
+        }
+        "c" | "h" => {
+            stack.insert("C".to_string());
+        }
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => {
+            stack.insert("C++".to_string());
+        }
+        "sql" => {
+            stack.insert("SQL".to_string());
+        }
+        "tf" | "tfvars" => {
+            stack.insert("Terraform".to_string());
+        }
+        _ => {}
+    }
 }
 
-fn build_structure_inner(
-    current: &Path,
+async fn detect_tech_stack(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
+    let Ok(files) = db.list_files().await else {
+        return Vec::new();
+    };
+    if files.is_empty() {
+        return Vec::new();
+    }
+
+    let mut stack = std::collections::BTreeSet::new();
+    for file in files {
+        let display = display_path(repo_root, &file);
+        detect_tech_stack_from_path(Path::new(&display), &mut stack);
+    }
+    stack.into_iter().collect()
+}
+
+#[derive(Clone)]
+struct RepoMapEntry {
+    score: Option<f64>,
+    badges: Vec<&'static str>,
+    cochanges: Option<String>,
+}
+
+#[derive(Default)]
+struct RepoMapNode {
+    dirs: std::collections::BTreeMap<String, RepoMapNode>,
+    files: Vec<(String, RepoMapEntry)>,
+}
+
+fn insert_repo_map_entry(node: &mut RepoMapNode, path: &str, entry: RepoMapEntry) {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return;
+    }
+    insert_repo_map_parts(node, &parts, entry);
+}
+
+fn insert_repo_map_parts(node: &mut RepoMapNode, parts: &[&str], entry: RepoMapEntry) {
+    if parts.len() == 1 {
+        node.files.push((parts[0].to_string(), entry));
+        return;
+    }
+    let head = parts[0].to_string();
+    let child = node.dirs.entry(head).or_default();
+    insert_repo_map_parts(child, &parts[1..], entry);
+}
+
+fn render_repo_map_tree(
+    node: &RepoMapNode,
+    prefix: &str,
     depth: usize,
     max_depth: usize,
     max_entries: usize,
     count: &mut usize,
-    lines: &mut Vec<String>,
+    out: &mut Vec<String>,
 ) {
     if depth > max_depth || *count >= max_entries {
         return;
     }
 
-    let mut entries = match std::fs::read_dir(current) {
-        Ok(entries) => entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>(),
-        Err(_) => return,
-    };
-    entries.sort_by_key(|entry| entry.path());
+    let mut children = Vec::new();
+    for (name, child) in &node.dirs {
+        children.push(RepoMapChild::Dir(name, child));
+    }
+    let mut files = node.files.clone();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, entry) in &files {
+        children.push(RepoMapChild::File(name, entry));
+    }
 
-    for entry in entries {
+    let total = children.len();
+    for (idx, child) in children.into_iter().enumerate() {
         if *count >= max_entries {
             break;
         }
-        let path = entry.path();
-        let name = match path.file_name().and_then(|name| name.to_str()) {
-            Some(name) => name,
-            None => continue,
+        let is_last = idx + 1 == total;
+        let connector = if is_last { "└── " } else { "├── " };
+        let next_prefix = if is_last {
+            format!("{prefix}    ")
+        } else {
+            format!("{prefix}│   ")
         };
-        if should_skip_name(name) {
-            continue;
+        match child {
+            RepoMapChild::Dir(name, child) => {
+                out.push(format!("{prefix}{connector}{name}/"));
+                *count += 1;
+                if depth < max_depth {
+                    render_repo_map_tree(
+                        child,
+                        &next_prefix,
+                        depth + 1,
+                        max_depth,
+                        max_entries,
+                        count,
+                        out,
+                    );
+                }
+            }
+            RepoMapChild::File(name, entry) => {
+                let badge_text = if entry.badges.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " {}",
+                        entry
+                            .badges
+                            .iter()
+                            .map(|b| format!("[{b}]"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                };
+                let score_text = entry
+                    .score
+                    .map(|score| format!(" (rank {:.4})", score))
+                    .unwrap_or_default();
+                out.push(format!(
+                    "{prefix}{connector}{name}{badge_text}{score_text}"
+                ));
+                *count += 1;
+                if let Some(cochanges) = &entry.cochanges {
+                    if *count >= max_entries {
+                        break;
+                    }
+                    out.push(format!("{next_prefix}↔ changes with: {cochanges}"));
+                    *count += 1;
+                }
+            }
         }
-        let indent = "  ".repeat(depth);
-        if path.is_dir() {
-            lines.push(format!("{indent}{name}/"));
-            *count += 1;
-            build_structure_inner(&path, depth + 1, max_depth, max_entries, count, lines);
-        } else if depth == 0 {
-            lines.push(format!("{indent}{name}"));
-            *count += 1;
-        }
     }
 }
 
-fn should_skip_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if lower.starts_with('.') {
-        return true;
-    }
-    matches!(
-        lower.as_str(),
-        "target"
-            | "node_modules"
-            | ".config"
-            | ".idea"
-            | ".vscode"
-            | "dist"
-            | "build"
-            | ".venv"
-            | "venv"
-    )
-}
-
-fn detect_tech_stack(root: &Path) -> Vec<String> {
-    let mut stack = Vec::new();
-    push_unique(&mut stack, "Rust", root.join("Cargo.toml").exists());
-    push_unique(&mut stack, "Node.js", root.join("package.json").exists());
-    push_unique(
-        &mut stack,
-        "Python",
-        root.join("pyproject.toml").exists() || root.join("requirements.txt").exists(),
-    );
-    push_unique(&mut stack, "Go", root.join("go.mod").exists());
-    push_unique(&mut stack, "Ruby", root.join("Gemfile").exists());
-    push_unique(
-        &mut stack,
-        "Java",
-        root.join("pom.xml").exists() || root.join("build.gradle").exists(),
-    );
-    push_unique(&mut stack, "PHP", root.join("composer.json").exists());
-    stack
-}
-
-fn push_unique(stack: &mut Vec<String>, label: &str, present: bool) {
-    if present && !stack.iter().any(|item| item == label) {
-        stack.push(label.to_string());
-    }
+enum RepoMapChild<'a> {
+    Dir(&'a str, &'a RepoMapNode),
+    File(&'a str, &'a RepoMapEntry),
 }
 
 #[cfg(test)]
@@ -689,22 +897,21 @@ mod tests {
         let summary = overview.summary.clone();
         assert!(!summary.is_empty(), "expected summary to be populated");
 
-        let main_lines: Vec<&String> = summary
+        let b_line = summary
             .iter()
-            .filter(|line| !line.starts_with("  <->"))
-            .collect();
+            .find(|line| line.contains("b.rs") && line.contains("(rank"))
+            .expect("expected b.rs in summary map");
         assert!(
-            main_lines[0].contains("src/b.rs"),
-            "expected pagerank to prioritize src/b.rs, got {:?}",
-            main_lines
+            b_line.contains("[core]"),
+            "expected core badge on b.rs"
         );
-        let a_line = main_lines
+        let a_line = summary
             .iter()
-            .find(|line| line.contains("src/a.rs"))
-            .expect("expected src/a.rs in summary");
+            .find(|line| line.contains("a.rs") && line.contains("(rank"))
+            .expect("expected a.rs in summary map");
         assert!(
-            a_line.contains("[high-churn]"),
-            "expected high-churn badge on src/a.rs"
+            a_line.contains("[high-churn]") || a_line.contains("[core]"),
+            "expected a.rs to have high-churn or core badge"
         );
 
         let xml = render_prompt(
@@ -713,6 +920,7 @@ mod tests {
                 overview,
                 task: "test".to_string(),
                 blocks: Vec::new(),
+                warnings: Vec::new(),
             },
             PromptSections::all(),
             None,

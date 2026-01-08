@@ -2,6 +2,8 @@
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use text_chunking::Tokenizer;
 
@@ -17,27 +19,32 @@ pub struct QueryInput {
 /// Initial retrieval candidates (e.g., vector/fts hits).
 pub struct CandidateSet {
     pub chunks: Vec<CandidateChunk>,
+    pub warnings: Vec<String>,
 }
 
 /// Expanded candidate set after graph/history expansion.
 pub struct ExpandedCandidates {
     pub chunks: Vec<CandidateChunk>,
     pub expanded_files: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// AST-refined blocks (structured code blocks).
 pub struct AstBlocks {
     pub blocks: Vec<ContextBlock>,
+    pub warnings: Vec<String>,
 }
 
 /// Budgeted/merged blocks ready for prompt assembly.
 pub struct BudgetedBlocks {
     pub blocks: Vec<ContextBlock>,
+    pub warnings: Vec<String>,
 }
 
 /// Final assembled context payload.
 pub struct AssembledContext {
     pub blocks: Vec<ContextBlock>,
+    pub warnings: Vec<String>,
 }
 
 /// A candidate chunk returned from retrieval.
@@ -57,6 +64,8 @@ pub struct CandidateChunk {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateSource {
+    Explicit,
+    Pinned,
     Primary,
     Expanded,
 }
@@ -221,10 +230,79 @@ impl RetrieveCandidates for DefaultRetrieve {
             tokenizer: &tokenizer,
             progress,
         };
+        let mut warnings = Vec::new();
+        let mut chunks: Vec<CandidateChunk> = Vec::new();
+
+        let per_file_limit = self.config.limit.max(1);
+        if !ctx.selection.explicit_includes.is_empty() {
+            let include_paths = resolve_input_paths(ctx.repo_path, &ctx.selection.explicit_includes);
+            let rows = ctx
+                .db
+                .chunks_for_files(&include_paths, per_file_limit)
+                .await?;
+            let found: HashSet<String> =
+                rows.iter().map(|row| row.file_path.clone()).collect();
+            for path in &include_paths {
+                if !found.contains(path) {
+                    warnings.push(format!(
+                        "explicit include not found: {}",
+                        normalize_path(ctx.repo_path, path)
+                    ));
+                }
+            }
+            for row in rows {
+                chunks.push(CandidateChunk {
+                    id: row.id,
+                    file_path: row.file_path,
+                    start_byte: row.start_byte,
+                    end_byte: row.end_byte,
+                    chunk_hash: row.chunk_hash,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
+                    text: row.text,
+                    score: 1.0,
+                    source: CandidateSource::Explicit,
+                });
+            }
+        }
+
+        if !ctx.selection.pinned_items.is_empty() {
+            let pinned_paths = resolve_input_paths(ctx.repo_path, &ctx.selection.pinned_items);
+            let rows = ctx
+                .db
+                .chunks_for_files(&pinned_paths, per_file_limit)
+                .await?;
+            let found: HashSet<String> =
+                rows.iter().map(|row| row.file_path.clone()).collect();
+            for path in &pinned_paths {
+                if !found.contains(path) {
+                    warnings.push(format!(
+                        "pinned item not found: {}",
+                        normalize_path(ctx.repo_path, path)
+                    ));
+                }
+            }
+            for row in rows {
+                chunks.push(CandidateChunk {
+                    id: row.id,
+                    file_path: row.file_path,
+                    start_byte: row.start_byte,
+                    end_byte: row.end_byte,
+                    chunk_hash: row.chunk_hash,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
+                    text: row.text,
+                    score: 1.0,
+                    source: CandidateSource::Pinned,
+                });
+            }
+        }
+
         let results =
             crate::search::search(&search_ctx, &query.text, self.config.clone()).await?;
-        let chunks = results
+        let mut retrieved = results
             .into_iter()
+            .filter(|result| is_allowed_path(ctx.repo_path, &ctx.selection, &result.file_path))
             .map(|result| CandidateChunk {
                 id: result.id,
                 file_path: result.file_path,
@@ -238,7 +316,8 @@ impl RetrieveCandidates for DefaultRetrieve {
                 source: CandidateSource::Primary,
             })
             .collect();
-        Ok(arena.insert(CandidateSet { chunks }))
+        chunks.append(&mut retrieved);
+        Ok(arena.insert(CandidateSet { chunks, warnings }))
     }
 }
 
@@ -264,15 +343,19 @@ impl ExpandGraph for DefaultExpandGraph {
             }
         }
 
-        let expanded = if seeds.is_empty() {
+        let mut expanded = if seeds.is_empty() {
             Vec::new()
         } else {
             ctx.db.cochange_neighbors(&seeds, self.max_expanded_files).await?
         };
+        if !expanded.is_empty() {
+            expanded.retain(|path| is_allowed_path(ctx.repo_path, &ctx.selection, path));
+        }
 
         Ok(arena.insert(ExpandedCandidates {
             chunks: candidates.chunks.clone(),
             expanded_files: expanded,
+            warnings: candidates.warnings.clone(),
         }))
     }
 }
@@ -329,7 +412,10 @@ impl RefineAst for DefaultRefineAst {
             }
         }
 
-        Ok(arena.insert(AstBlocks { blocks }))
+        Ok(arena.insert(AstBlocks {
+            blocks,
+            warnings: expanded.warnings.clone(),
+        }))
     }
 }
 
@@ -346,17 +432,20 @@ pub struct DefaultBudgetAndMerge {
 impl BudgetAndMerge for DefaultBudgetAndMerge {
     async fn budget(
         &self,
-        _ctx: &AssemblyContext<'_>,
+        ctx: &AssemblyContext<'_>,
         arena: &mut Arena,
         input: Handle<AstBlocks>,
     ) -> Result<Handle<BudgetedBlocks>> {
         let blocks = arena.get(input);
         let mut ordered = blocks.blocks.clone();
         ordered.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
+            source_rank(a.source)
+                .cmp(&source_rank(b.source))
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| a.file_path.cmp(&b.file_path))
                 .then_with(|| a.start_byte.cmp(&b.start_byte))
         });
@@ -371,6 +460,7 @@ impl BudgetAndMerge for DefaultBudgetAndMerge {
             .map(|limit| limit.saturating_sub(self.reserved_output_tokens));
         let mut seen = std::collections::HashSet::new();
         let mut limited = Vec::new();
+        let mut warnings = blocks.warnings.clone();
         let mut bytes = 0usize;
         let mut tokens = 0usize;
 
@@ -378,29 +468,80 @@ impl BudgetAndMerge for DefaultBudgetAndMerge {
             if !seen.insert(block.id.clone()) {
                 continue;
             }
+            let mut candidate = block.clone();
+            let mut block_tokens = 0usize;
+
             if let Some(counter) = token_counter.as_ref() {
-                let block_tokens = counter.count(&block.text)?;
+                block_tokens = counter.count(&candidate.text)?;
                 if let Some(max_tokens) = token_budget {
                     if tokens + block_tokens > max_tokens {
-                        continue;
+                        if candidate.source == CandidateSource::Expanded {
+                            continue;
+                        }
+                        if let Some(trimmed) = trim_block_to_tokens(
+                            &candidate,
+                            max_tokens.saturating_sub(tokens),
+                            counter,
+                        )? {
+                            candidate = trimmed;
+                            block_tokens = counter.count(&candidate.text)?;
+                        } else {
+                            if candidate.source == CandidateSource::Explicit
+                                || candidate.source == CandidateSource::Pinned
+                            {
+                                warnings.push(format!(
+                                    "{} dropped due to token budget: {}",
+                                    source_label(candidate.source),
+                                    normalize_path(ctx.repo_path, &candidate.file_path)
+                                ));
+                            }
+                            continue;
+                        }
                     }
                 }
-                tokens += block_tokens;
             }
-            let next_bytes = bytes + block.text.len();
+
+            let mut next_bytes = bytes + candidate.text.len();
             if let Some(max) = self.max_bytes
                 && next_bytes > max
             {
-                continue;
+                if candidate.source == CandidateSource::Expanded {
+                    continue;
+                }
+                if let Some(trimmed) =
+                    trim_block_to_bytes(&candidate, max.saturating_sub(bytes))
+                {
+                    candidate = trimmed;
+                    next_bytes = bytes + candidate.text.len();
+                    if let Some(counter) = token_counter.as_ref() {
+                        block_tokens = counter.count(&candidate.text)?;
+                    }
+                } else {
+                    if candidate.source == CandidateSource::Explicit
+                        || candidate.source == CandidateSource::Pinned
+                    {
+                        warnings.push(format!(
+                            "{} dropped due to byte budget: {}",
+                            source_label(candidate.source),
+                            normalize_path(ctx.repo_path, &candidate.file_path)
+                        ));
+                    }
+                    continue;
+                }
             }
-            limited.push(block.clone());
+
+            tokens = tokens.saturating_add(block_tokens);
+            limited.push(candidate);
             bytes = next_bytes;
             if limited.len() >= self.max_blocks {
                 break;
             }
         }
 
-        Ok(arena.insert(BudgetedBlocks { blocks: limited }))
+        Ok(arena.insert(BudgetedBlocks {
+            blocks: limited,
+            warnings,
+        }))
     }
 }
 
@@ -418,6 +559,7 @@ impl AssembleContext for DefaultAssembleContext {
         let blocks = arena.get(input);
         Ok(arena.insert(AssembledContext {
             blocks: blocks.blocks.clone(),
+            warnings: blocks.warnings.clone(),
         }))
     }
 }
@@ -503,9 +645,147 @@ impl TokenCounter {
     }
 }
 
+fn resolve_input_paths(repo_root: &Path, inputs: &[String]) -> Vec<String> {
+    inputs
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let path = Path::new(value);
+            if path.is_absolute() {
+                value.clone()
+            } else {
+                repo_root
+                    .join(path)
+                    .to_string_lossy()
+                    .to_string()
+            }
+        })
+        .collect()
+}
+
+fn normalize_path(repo_root: &Path, file_path: &str) -> String {
+    let path = Path::new(file_path);
+    if path.is_absolute() {
+        if let Ok(stripped) = path.strip_prefix(repo_root) {
+            if let Some(rel) = stripped.to_str() {
+                if !rel.is_empty() {
+                    return rel.replace('\\', "/");
+                }
+            }
+        }
+    }
+    file_path.replace('\\', "/")
+}
+
+fn matches_any(path: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let prefix = trimmed.trim_end_matches('/');
+        if path == prefix || path.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_allowed_path(
+    repo_root: &Path,
+    selection: &super::SelectionOptions,
+    file_path: &str,
+) -> bool {
+    let normalized = normalize_path(repo_root, file_path);
+    if !selection.scope_paths.is_empty()
+        && !matches_any(&normalized, &selection.scope_paths)
+        && !matches_any(file_path, &selection.scope_paths)
+    {
+        return false;
+    }
+    if !selection.explicit_excludes.is_empty()
+        && (matches_any(&normalized, &selection.explicit_excludes)
+            || matches_any(file_path, &selection.explicit_excludes))
+    {
+        return false;
+    }
+    true
+}
+
+fn trim_block_to_tokens(
+    block: &ContextBlock,
+    max_tokens: usize,
+    counter: &TokenCounter,
+) -> Result<Option<ContextBlock>> {
+    if max_tokens == 0 {
+        return Ok(None);
+    }
+    let mut acc = String::new();
+    let mut end_line = block.start_line.saturating_sub(1);
+    for (idx, line) in block.text.lines().enumerate() {
+        let candidate = if acc.is_empty() {
+            line.to_string()
+        } else {
+            format!("{acc}\n{line}")
+        };
+        if counter.count(&candidate)? > max_tokens {
+            break;
+        }
+        acc = candidate;
+        end_line = block.start_line + idx as i64;
+    }
+    if acc.is_empty() {
+        return Ok(None);
+    }
+    let mut trimmed = block.clone();
+    trimmed.text = acc;
+    trimmed.end_line = end_line;
+    trimmed.end_byte = block.start_byte + trimmed.text.len() as i64;
+    Ok(Some(trimmed))
+}
+
+fn trim_block_to_bytes(block: &ContextBlock, max_bytes: usize) -> Option<ContextBlock> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let mut acc = String::new();
+    let mut end_line = block.start_line.saturating_sub(1);
+    for (idx, line) in block.text.lines().enumerate() {
+        let candidate = if acc.is_empty() {
+            line.to_string()
+        } else {
+            format!("{acc}\n{line}")
+        };
+        if candidate.len() > max_bytes {
+            break;
+        }
+        acc = candidate;
+        end_line = block.start_line + idx as i64;
+    }
+    if acc.is_empty() {
+        return None;
+    }
+    let mut trimmed = block.clone();
+    trimmed.text = acc;
+    trimmed.end_line = end_line;
+    trimmed.end_byte = block.start_byte + trimmed.text.len() as i64;
+    Some(trimmed)
+}
+
+fn source_label(source: CandidateSource) -> &'static str {
+    match source {
+        CandidateSource::Explicit => "explicit",
+        CandidateSource::Pinned => "pinned",
+        CandidateSource::Primary => "primary",
+        CandidateSource::Expanded => "expanded",
+    }
+}
+
 fn source_rank(source: CandidateSource) -> u8 {
     match source {
-        CandidateSource::Primary => 0,
-        CandidateSource::Expanded => 1,
+        CandidateSource::Explicit => 0,
+        CandidateSource::Pinned => 1,
+        CandidateSource::Primary => 2,
+        CandidateSource::Expanded => 3,
     }
 }

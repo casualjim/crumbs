@@ -414,6 +414,34 @@ pub struct PromptCli {
         help = "Sections to include: structure,summary,context,query (comma-separated or repeated). Omit for all sections."
     )]
     pub sections: Vec<PromptSection>,
+    #[arg(
+        long = "scope",
+        value_delimiter = ',',
+        num_args = 1..,
+        help = "Limit retrieval/expansion to repo-relative path prefixes"
+    )]
+    pub scope: Vec<String>,
+    #[arg(
+        long = "include",
+        value_delimiter = ',',
+        num_args = 1..,
+        help = "Explicit include paths (repo-relative or absolute)"
+    )]
+    pub include: Vec<String>,
+    #[arg(
+        long = "exclude",
+        value_delimiter = ',',
+        num_args = 1..,
+        help = "Exclude path prefixes from retrieval/expansion"
+    )]
+    pub exclude: Vec<String>,
+    #[arg(
+        long = "pin",
+        value_delimiter = ',',
+        num_args = 1..,
+        help = "Pinned paths to force include (repo-relative or absolute)"
+    )]
+    pub pin: Vec<String>,
     #[arg(value_name = "TASK", help = "Task or question to build context for")]
     pub task: String,
 }

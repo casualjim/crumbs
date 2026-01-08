@@ -132,6 +132,12 @@ async fn main() -> Result<()> {
                 embedder: Some(&embedder),
                 reranker: &reranker as &dyn RerankingProvider,
                 config: &cfg,
+                selection: assembly::SelectionOptions {
+                    scope_paths: cmd.scope.clone(),
+                    explicit_includes: cmd.include.clone(),
+                    explicit_excludes: cmd.exclude.clone(),
+                    pinned_items: cmd.pin.clone(),
+                },
             };
 
             let max_tokens = if cmd.max_tokens == 0 {
@@ -196,6 +202,7 @@ async fn main() -> Result<()> {
                 overview,
                 task: cmd.task.clone(),
                 blocks: enriched,
+                warnings: assembled.warnings.clone(),
             };
             let format = match cmd.format {
                 config::PromptFormat::Xml => assembly::output::PromptFormat::Xml,

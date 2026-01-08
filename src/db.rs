@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use libsql::{Builder, Connection, Database, Value, params, params_from_iter};
-use eyre::{Result, eyre};
 use charabia::Tokenize;
+use eyre::{Result, eyre};
+use libsql::{Builder, Connection, Database, Value, params, params_from_iter};
 
 use crate::repository::Repository;
 
@@ -40,10 +40,7 @@ impl Db {
         let existing_dim: Option<String> = {
             let mut rows = self
                 .conn
-                .query(
-                    "SELECT value FROM meta WHERE key = 'embedding_dim'",
-                    (),
-                )
+                .query("SELECT value FROM meta WHERE key = 'embedding_dim'", ())
                 .await?;
             if let Some(row) = rows.next().await? {
                 Some(row.get::<String>(0)?)
@@ -238,11 +235,11 @@ impl Db {
     async fn rebuild_fts_schema(&self, fts_sql: &str) -> Result<()> {
         self.conn
             .execute_batch(
-            "DROP TRIGGER IF EXISTS chunks_ai; \
+                "DROP TRIGGER IF EXISTS chunks_ai; \
              DROP TRIGGER IF EXISTS chunks_ad; \
              DROP TRIGGER IF EXISTS chunks_au; \
              DROP TABLE IF EXISTS fts_chunks;",
-        )
+            )
             .await?;
         self.conn.execute_batch(fts_sql).await?;
         Ok(())
@@ -482,7 +479,11 @@ impl Db {
         self.conn
             .execute(
                 "INSERT INTO file_chunk_edges (file_path, chunk_id, ordinal) VALUES (?, ?, ?)",
-                params![record.file_path.as_str(), record.id.as_str(), record.ordinal as i32],
+                params![
+                    record.file_path.as_str(),
+                    record.id.as_str(),
+                    record.ordinal as i32
+                ],
             )
             .await?;
 
@@ -561,11 +562,15 @@ impl Db {
 
             self.conn
                 .execute(
-                "INSERT INTO file_chunk_edges (file_path, chunk_id, ordinal) VALUES (?, ?, ?) \
+                    "INSERT INTO file_chunk_edges (file_path, chunk_id, ordinal) VALUES (?, ?, ?) \
                  ON CONFLICT(file_path, chunk_id) DO UPDATE SET ordinal = excluded.ordinal",
-                params![record.file_path.as_str(), record.id.as_str(), record.ordinal as i32],
-            )
-            .await?;
+                    params![
+                        record.file_path.as_str(),
+                        record.id.as_str(),
+                        record.ordinal as i32
+                    ],
+                )
+                .await?;
             Ok(())
         })
         .await?;
@@ -724,7 +729,11 @@ impl Db {
             .execute(
                 "INSERT INTO file_chunk_edges (file_path, chunk_id, ordinal) VALUES (?, ?, ?) \
                  ON CONFLICT(file_path, chunk_id) DO UPDATE SET ordinal = excluded.ordinal",
-                params![record.file_path.as_str(), record.id.as_str(), record.ordinal as i32],
+                params![
+                    record.file_path.as_str(),
+                    record.id.as_str(),
+                    record.ordinal as i32
+                ],
             )
             .await?;
         Ok(())
@@ -823,7 +832,6 @@ impl Db {
             }
         }
     }
-
 }
 
 #[derive(Clone)]
@@ -1079,9 +1087,7 @@ impl Repository for Db {
                  LIMIT 1",
             )
             .await?;
-        let mut rows = stmt
-            .query(params![kind, chunk_hash.to_vec()])
-            .await?;
+        let mut rows = stmt.query(params![kind, chunk_hash.to_vec()]).await?;
         if let Some(row) = rows.next().await? {
             Ok(Some(row.get::<String>(0)?))
         } else {
@@ -1133,7 +1139,10 @@ impl Repository for Db {
             return self.clear_file_chunks(file_path).await;
         }
 
-        let placeholders = "?,".repeat(keep_ids.len()).trim_end_matches(',').to_string();
+        let placeholders = "?,"
+            .repeat(keep_ids.len())
+            .trim_end_matches(',')
+            .to_string();
         let delete_edges = format!(
             "DELETE FROM file_chunk_edges WHERE file_path = ? AND chunk_id NOT IN ({})",
             placeholders
@@ -1506,24 +1515,26 @@ impl Repository for Db {
     ) -> Result<()> {
         self.with_transaction(|| async {
             for (file_path, commit_id) in file_commit_edges {
-                self.conn.execute(
-                    "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?) \
+                self.conn
+                    .execute(
+                        "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?) \
                      ON CONFLICT(file_path, commit_id) DO NOTHING",
-                    params![file_path.as_str(), commit_id.as_str()],
-                )
-                .await?;
+                        params![file_path.as_str(), commit_id.as_str()],
+                    )
+                    .await?;
             }
 
             for (src, dst, commit_count, weight) in cochange_edges {
-                self.conn.execute(
-                    "INSERT INTO file_cochange_edges \
+                self.conn
+                    .execute(
+                        "INSERT INTO file_cochange_edges \
                      (src_path, dst_path, commit_count, weight) VALUES (?, ?, ?, ?) \
                      ON CONFLICT(src_path, dst_path) DO UPDATE SET \
                        commit_count = excluded.commit_count, \
                        weight = excluded.weight",
-                    params![src.as_str(), dst.as_str(), commit_count, weight],
-                )
-                .await?;
+                        params![src.as_str(), dst.as_str(), commit_count, weight],
+                    )
+                    .await?;
             }
 
             Ok(())
@@ -1560,7 +1571,11 @@ impl Repository for Db {
 
         let stmt = self.conn.prepare(sql).await?;
         let mut rows = stmt
-            .query(params![query_json.as_str(), query_json.as_str(), limit as i64])
+            .query(params![
+                query_json.as_str(),
+                query_json.as_str(),
+                limit as i64
+            ])
             .await?;
         let mut results = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -1672,11 +1687,7 @@ impl Repository for Db {
         Ok(results)
     }
 
-    async fn cochange_partners(
-        &self,
-        file_path: &str,
-        limit: usize,
-    ) -> Result<Vec<(String, f64)>> {
+    async fn cochange_partners(&self, file_path: &str, limit: usize) -> Result<Vec<(String, f64)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1695,7 +1706,9 @@ impl Repository for Db {
       LIMIT ?";
 
         let stmt = self.conn.prepare(sql).await?;
-        let mut rows = stmt.query(params![file_path, file_path, limit as i64]).await?;
+        let mut rows = stmt
+            .query(params![file_path, file_path, limit as i64])
+            .await?;
         let mut results = Vec::new();
         while let Some(row) = rows.next().await? {
             let path: String = row.get::<String>(0)?;
@@ -1768,13 +1781,15 @@ impl Repository for Db {
        GROUP BY src_path, dst_path";
 
         self.with_transaction(|| async {
-            self.conn.execute(
-                "DELETE FROM file_dependency_edges WHERE src_path = ? OR dst_path = ?",
-                params![file_path, file_path],
-            )
-            .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM file_dependency_edges WHERE src_path = ? OR dst_path = ?",
+                    params![file_path, file_path],
+                )
+                .await?;
             self.conn.execute(sql_src, params![file_path]).await?;
-            self.conn.execute(sql_dst, params![file_path, file_path, file_path])
+            self.conn
+                .execute(sql_dst, params![file_path, file_path, file_path])
                 .await?;
             Ok(())
         })
@@ -1848,10 +1863,8 @@ impl Repository for Db {
             ranks.clone_from_slice(&next);
         }
 
-        let mut scored: Vec<(String, f64)> = index_to_path
-            .into_iter()
-            .zip(ranks.into_iter())
-            .collect();
+        let mut scored: Vec<(String, f64)> =
+            index_to_path.into_iter().zip(ranks.into_iter()).collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         if scored.len() > limit {
             scored.truncate(limit);
@@ -1912,17 +1925,18 @@ impl Repository for Db {
         start_byte: i64,
         end_byte: i64,
     ) -> Result<Vec<SymbolRecord>> {
-        let stmt = self.conn.prepare(
-            "SELECT id, file_path, name, kind, start_byte, end_byte, language
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT id, file_path, name, kind, start_byte, end_byte, language
        FROM symbols
        WHERE file_path = ?
          AND start_byte < ?
          AND end_byte > ?
        ORDER BY start_byte ASC",
-        ).await?;
-        let mut rows = stmt
-            .query(params![file_path, end_byte, start_byte])
+            )
             .await?;
+        let mut rows = stmt.query(params![file_path, end_byte, start_byte]).await?;
         let mut symbols = Vec::new();
         while let Some(row) = rows.next().await? {
             symbols.push(SymbolRecord {
@@ -2070,9 +2084,7 @@ mod tests {
         let db_path = dir.path().join("context.db");
         let db = Db::open(&db_path, Some(2)).await?;
 
-        let result = db
-            .link_reference_symbol("missing-ref", "missing-sym")
-            .await;
+        let result = db.link_reference_symbol("missing-ref", "missing-sym").await;
 
         assert!(
             result.is_err(),
@@ -2111,8 +2123,7 @@ mod tests {
 
         db.insert_symbol(&symbol).await?;
         db.insert_reference(&reference).await?;
-        db.link_reference_symbol(&reference.id, &symbol.id)
-            .await?;
+        db.link_reference_symbol(&reference.id, &symbol.id).await?;
 
         db.delete_file("a.rs").await?;
 
