@@ -7,16 +7,20 @@ Owners: TBD
 ## Summary
 This design doc specifies the output format for assembled code context that will be included in agent prompts. It defines the structure, metadata, and formatting requirements for GPT-5.2-Codex (primary), Gemini 3 Pro, and Claude Sonnet 4.5. The doc also maps these requirements to current capabilities and identifies gaps in the assembly pipeline.
 
+**Scope:** This tool is a **stateless context generator**. It does not store conversation state and does not call LLMs. It accepts conversation history or pre-compacted summaries as input, performs retrieval/budgeting/assembly, and outputs a prompt-ready payload. Compaction, long-term memory, and evaluation tooling live in separate tools/services.
+
 ## Goals
 - Deliver high-signal, model-ready context for GPT-5.2 and GPT-5.2-Codex.
 - Use retrieval, graph expansion, and token budgeting to fit within model context limits.
-- Support long-horizon coding workflows with compaction and conversation state.
+- Support long-horizon coding workflows by accepting pre-compacted inputs.
 - Provide repeatable quality via evaluation, model snapshot pinning, and telemetry.
 
 ## Non-goals
 - Building a UI/UX for human review (CLI-first is fine).
 - Training or fine-tuning models.
 - Replacing upstream embedding or vector DB providers.
+- Long-term memory, conversation state storage, or compaction.
+- Initiating LLM calls (this tool only prepares prompt context).
 
 ## External best practices (OpenAI)
 
@@ -37,15 +41,14 @@ This design doc specifies the output format for assembled code context that will
 - Prefer hybrid retrieval (vector + keyword) and metadata filters to reduce noise.
 
 ### Context window management and compaction
-- Use conversation state to avoid resending full history; compact long conversations as they grow.
-- Compaction should preserve user intent while summarizing assistant/tool messages to reclaim space; use the compaction endpoint when possible.
+- Out of scope for this tool; handled by a separate compaction/memory service.
 
 ### Prompt caching
 - Use prompt caching by placing static instruction prefixes at the start of requests (caching uses the longest matching prefix).
 - Keep dynamic, per-request content after the stable prefix for maximum cache hits.
 
 ### Evaluation and model stability
-- Pin model snapshots and maintain evals to detect regressions across model updates.
+- Out of scope for this tool; handled by a separate eval/telemetry service.
 
 ## Context output format specification
 
@@ -243,11 +246,8 @@ When multiple chunks overlap:
 ## Gap analysis (best practice -> current state -> gap)
 - Model-aware prompt assembly: no CLI/API that assembles prompts or model-ready payloads.
 - Token budgeting: no tokenizer-based budgeting for GPT-5.2 context size or output limits.
-- Context window management: no compaction, summarization, or conversation state support.
 - Retrieval quality: no query rewriting, reranking, or metadata filtering; no retrieval evals.
 - Prompt caching: no concept of stable prefix or cache key handling.
-- Tool integration: no native support for OpenAI tools like file search, nor model-specific controls (verbosity/reasoning effort).
-- Eval/observability: no regression suite for retrieval quality, prompt correctness, or tool latency.
 - Code-specific context layers: no repo map, dependency map, or change-focused context packaging.
 
 ## Detailed gap map
@@ -287,22 +287,15 @@ Gaps:
 - No dynamic trimming or ordering by token cost.
 
 ### Context window management
-Already:
-- None.
-
-Gaps:
-- No conversation state storage or session model.
-- No compaction, summarization, or state refresh strategy.
-- No periodic refresh of stale context blocks.
+Out of scope for this tool. A separate compaction/memory service should:
+- Store conversation state or summaries.
+- Provide pre-compacted inputs and budgets.
+- Refresh stale context blocks as needed.
 
 ### Model controls and tooling
-Already:
-- Provider dialect support for embeddings (OpenAI-compatible).
-
-Gaps:
-- No support for GPT-5.2 reasoning effort / verbosity in configuration.
-- No first-class integration for OpenAI file search or tool calls.
-- No policy for model snapshot pinning and rotation.
+Out of scope for this tool. A downstream caller should:
+- Choose model-specific reasoning/verbosity controls.
+- Integrate tool calls (e.g., file search) if desired.
 
 ### Prompt caching
 Already:
@@ -328,13 +321,9 @@ Gaps:
 - No last-modified timestamps or commit SHA tracking per chunk.
 
 ### Evaluation and observability
-Already:
-- None.
-
-Gaps:
-- No eval suite for retrieval correctness or prompt quality.
-- No quality gates for context packing and token utilization.
-- No telemetry for retrieval precision, context hit rate, or model response outcomes.
+Out of scope for this tool. A separate eval/telemetry service should:
+- Track retrieval precision and prompt quality.
+- Provide regression tests and quality gates.
 
 ## Proposed design
 1. **Prompt assembly API**
@@ -351,23 +340,14 @@ Gaps:
    - Add reranking (cross-encoder or lightweight scoring) for top-N candidates.
    - Support metadata filters: language, path, recency, repo area, or issue tag.
 
-4. **Context window management**
-   - Introduce conversation state storage.
-   - Add compaction using summaries or OpenAI’s compaction endpoint.
-   - Maintain stable “core context” and refresh variable context blocks.
-
-5. **Prompt caching support**
+4. **Prompt caching support**
    - Treat the instruction prefix and repo summary as the cacheable prefix.
    - Keep per-request dynamic blocks after the prefix to maximize cache hits.
 
-6. **Model controls & tool integration**
-   - Expose GPT-5.2 reasoning effort and verbosity controls in config/CLI.
-   - Provide optional use of OpenAI file search for large repos.
-
-7. **Evaluation and observability**
-   - Add a retrieval eval harness (golden queries with expected files).
-   - Add prompt regression tests with model snapshots pinned.
-   - Log retrieval precision, token budgets, and context hit rate.
+5. **Integration points (external tools)**
+   - Compaction/memory tool provides conversation summaries and budgets.
+   - Downstream caller selects model controls and tool integrations.
+   - Eval/telemetry service measures retrieval quality and regressions.
 
 ## Roadmap
 - **M1 (Output format + metadata):** Implement XML/Markdown serialization, metadata enrichment (line numbers, symbols, git info), repo overview generation.

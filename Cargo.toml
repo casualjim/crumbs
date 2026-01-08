@@ -12,7 +12,6 @@ clap = { version = "4", features = ["derive", "env"] }
 confique = { version = "0.4.0", features = ["toml", "json5", "yaml"] }
 cupido = "0.3.5"
 dirs = "6"
-dashmap = "6"
 eyre = "0.6"
 futures = "0.3"
 http = "1"
@@ -28,7 +27,7 @@ syntastica = "0.6.1"
 syntastica-parsers = { version = "0.6.1", features = ["most"] }
 syntastica-themes = "0.6.1"
 dark-light = "2"
-text-chunking = { version = "0.1.6", registry = "forgejo" }
+text-chunking = { version = "0.2.1", registry = "forgejo" }
 tiktoken-rs = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"

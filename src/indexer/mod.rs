@@ -1,6 +1,5 @@
 mod batcher;
 mod embedder;
-mod observer;
 mod processor;
 mod state;
 
@@ -11,14 +10,12 @@ use crate::embedding::EmbeddingProvider;
 use crate::graph::{HistoryConfig, index_history};
 use crate::progress;
 use crate::repository::Repository;
-use dashmap::DashMap;
 use eyre::{Result, eyre};
 use futures::StreamExt;
-use text_chunking::{Tokenizer, WalkOptions, walk_project_with_observer};
+use text_chunking::{Tokenizer, WalkOptions, walk_project};
 use tokio_util::sync::CancellationToken;
 
 use self::embedder::EmbedderService;
-use self::observer::{GraphObserver, ObservedGraph};
 use self::processor::{IndexProcessor, ProcessorOutput};
 
 pub struct IndexerConfig {
@@ -88,10 +85,8 @@ impl<'a> Indexer<'a> {
             cancel_token: self.config.cancel_token.clone(),
         };
 
-        let observed_graphs: Arc<DashMap<String, ObservedGraph>> = Arc::new(DashMap::new());
-        let observer = Arc::new(GraphObserver::new(observed_graphs.clone()));
-        let mut stream = walk_project_with_observer(&self.config.repo_path, options, observer);
-        let mut processor = IndexProcessor::new(self.db, observed_graphs);
+        let mut stream = walk_project(&self.config.repo_path, options);
+        let mut processor = IndexProcessor::new(self.db);
         let (mut embedder_service, mut result_rx) = EmbedderService::new(
             Arc::clone(&self.embedder),
             self.config.max_tokens,

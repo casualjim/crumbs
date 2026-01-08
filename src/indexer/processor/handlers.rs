@@ -1,8 +1,9 @@
+use blake3::Hasher;
 use eyre::{Result, eyre};
 use text_chunking::{FileMetadata, SemanticChunk};
 use uuid::Uuid;
 
-use crate::db::{ChunkRecord, build_fts_text};
+use crate::db::{ChunkRecord, GraphData, ReferenceRecord, SymbolRecord, build_fts_text};
 
 use super::super::batcher::BatchItem;
 use super::super::state::{PendingEof, PendingFile};
@@ -13,7 +14,6 @@ impl<'a> IndexProcessor<'a> {
         self.db.delete_file(file_path).await?;
         self.state.pending.remove(file_path);
         self.state.pending_eof.remove(file_path);
-        self.observed_graphs.remove(file_path);
         Ok(())
     }
 
@@ -32,7 +32,9 @@ impl<'a> IndexProcessor<'a> {
             end_line,
             text,
             tokens,
+            metadata,
         } = chunk;
+        let file_path_value = file_path.clone();
         let entry = self
             .state
             .pending
@@ -89,6 +91,61 @@ impl<'a> IndexProcessor<'a> {
             entry.chunk_index.insert(chunk_id.clone(), idx);
             entry.chunks[idx].clone()
         };
+
+        if kind == "semantic" {
+            let language = metadata
+                .language
+                .trim()
+                .to_string();
+            if !language.is_empty() {
+                entry.graph_language = Some(language.clone());
+            }
+            let graph_language = entry
+                .graph_language
+                .as_deref()
+                .unwrap_or("text")
+                .to_string();
+            for name in metadata.definitions {
+                let id = stable_id(
+                    &file_path_value,
+                    "definition",
+                    start_byte,
+                    end_byte,
+                    &name,
+                );
+                if entry.symbol_ids.insert(id.clone()) {
+                    entry.symbols.push(SymbolRecord {
+                        id,
+                        file_path: file_path_value.clone(),
+                        name,
+                        kind: "definition".to_string(),
+                        start_byte,
+                        end_byte,
+                        language: graph_language.clone(),
+                    });
+                }
+            }
+            for name in metadata.references {
+                let id = stable_id(
+                    &file_path_value,
+                    "reference",
+                    start_byte,
+                    end_byte,
+                    &name,
+                );
+                if entry.reference_ids.insert(id.clone()) {
+                    entry.references.push(ReferenceRecord {
+                        id,
+                        file_path: file_path_value.clone(),
+                        name,
+                        start_byte,
+                        end_byte,
+                        language: graph_language.clone(),
+                    });
+                }
+            }
+        }
+
         if is_existing {
             self.db.update_chunk_without_embedding(&record).await?;
             return Ok(None);
@@ -127,20 +184,26 @@ impl<'a> IndexProcessor<'a> {
             .or_insert_with(|| PendingFile::new(file_size));
         entry.file_size = file_size;
 
-        let observed = self.observed_graphs.remove(file_path);
-
-        if let Some((_, observed)) = observed {
-            self.db
-                .upsert_file_graph(
+        let graph_language = entry
+            .graph_language
+            .clone()
+            .or_else(|| primary_language.clone())
+            .unwrap_or_else(|| "text".to_string());
+        let graph = GraphData {
+            symbols: entry.symbols.clone(),
+            references: entry.references.clone(),
+            resolutions: Vec::new(),
+        };
+        self.db
+            .upsert_file_graph(
                 file_path,
                 entry.file_size,
                 hash,
-                &observed.language,
+                &graph_language,
                 primary_language.clone(),
-                observed.graph,
-                )
-                .await?;
-        }
+                graph,
+            )
+            .await?;
 
         self.state.pending_eof.insert(
             file_path.to_string(),
@@ -152,4 +215,26 @@ impl<'a> IndexProcessor<'a> {
         self.try_finalize_files(vec![file_path.to_string()]).await
     }
 
+}
+
+fn stable_id(
+    file_path: &str,
+    kind: &str,
+    start_byte: usize,
+    end_byte: usize,
+    name: &str,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(file_path.as_bytes());
+    hasher.update(kind.as_bytes());
+    hasher.update(&start_byte.to_le_bytes());
+    hasher.update(&end_byte.to_le_bytes());
+    hasher.update(name.as_bytes());
+    let hash = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in hash.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
 }

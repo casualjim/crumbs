@@ -1,22 +1,17 @@
 mod finalize;
 mod handlers;
 
-use std::sync::Arc;
-
-use dashmap::DashMap;
 use eyre::{Result, eyre};
 use text_chunking::{Chunk, ProjectChunk};
 
 use crate::repository::Repository;
 
 use super::batcher::BatchItem;
-use super::observer::ObservedGraph;
 use super::state::IndexerState;
 
 pub(crate) struct IndexProcessor<'a> {
     db: &'a dyn Repository,
     state: IndexerState,
-    observed_graphs: Arc<DashMap<String, ObservedGraph>>,
 }
 
 pub(crate) enum ProcessorOutput {
@@ -26,14 +21,10 @@ pub(crate) enum ProcessorOutput {
 }
 
 impl<'a> IndexProcessor<'a> {
-    pub(crate) fn new(
-        db: &'a dyn Repository,
-        observed_graphs: Arc<DashMap<String, ObservedGraph>>,
-    ) -> Self {
+    pub(crate) fn new(db: &'a dyn Repository) -> Self {
         Self {
             db,
             state: IndexerState::new(),
-            observed_graphs,
         }
     }
 
