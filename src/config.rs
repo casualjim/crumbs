@@ -328,6 +328,8 @@ pub enum Command {
     Search(SearchCli),
     #[command(about = "Assemble prompt-ready context for a task")]
     Prompt(PromptCli),
+    #[command(about = "Analyze dependency topology and suggest refactors")]
+    Topology(TopologyCli),
     #[command(about = "Manage configuration files")]
     Config(ConfigCli),
 }
@@ -400,12 +402,29 @@ pub struct PromptCli {
     )]
     pub reserved_output_tokens: usize,
     #[arg(
-        long = "format",
-        value_enum,
-        default_value = "xml",
-        help = "Output format: xml|markdown"
+        long = "topology",
+        default_value_t = false,
+        help = "Use topology-driven mini codebase assembly instead of retrieval"
     )]
-    pub format: PromptFormat,
+    pub topology: bool,
+    #[arg(
+        long = "topology-depth",
+        default_value_t = 1,
+        help = "Neighbor depth for topology assembly"
+    )]
+    pub topology_depth: usize,
+    #[arg(
+        long = "topology-limit",
+        default_value_t = 25,
+        help = "Maximum files to include for topology assembly"
+    )]
+    pub topology_limit: usize,
+    #[arg(
+        long = "topology-per-file",
+        default_value_t = 5,
+        help = "Maximum chunks per file for topology assembly"
+    )]
+    pub topology_per_file: usize,
     #[arg(
         long = "sections",
         value_enum,
@@ -446,11 +465,120 @@ pub struct PromptCli {
     pub task: String,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
-pub enum PromptFormat {
-    #[value(alias = "md")]
-    Markdown,
-    Xml,
+#[derive(Args)]
+pub struct TopologyCli {
+    #[command(flatten)]
+    pub project: ProjectCli,
+    #[command(subcommand)]
+    pub command: TopologyCommand,
+}
+
+#[derive(Subcommand)]
+pub enum TopologyCommand {
+    #[command(about = "Show topology summary metrics")]
+    Stats(TopologyStatsCli),
+    #[command(about = "List strongly connected components and cycle edges")]
+    Cycles(TopologyCyclesCli),
+    #[command(about = "Show a star neighborhood around a file")]
+    Star(TopologyStarCli),
+    #[command(about = "Suggest edges to cut to break cycles")]
+    Refactor(TopologyRefactorCli),
+    #[command(about = "Assemble a topology-driven mini codebase")]
+    Assemble(TopologyAssembleCli),
+}
+
+#[derive(Args)]
+pub struct TopologyStatsCli {
+    #[arg(
+        long = "min-cycle-size",
+        default_value_t = 2,
+        help = "Minimum cycle size to count for stats output"
+    )]
+    pub min_cycle_size: usize,
+}
+
+#[derive(Args)]
+pub struct TopologyCyclesCli {
+    #[arg(long = "limit", default_value_t = 10, help = "Limit number of cycles shown")]
+    pub limit: usize,
+    #[arg(
+        long = "max-edges",
+        default_value_t = 10,
+        help = "Limit number of edges shown per cycle"
+    )]
+    pub max_edges: usize,
+}
+
+#[derive(Args)]
+pub struct TopologyStarCli {
+    #[arg(long = "file", value_name = "PATH", help = "File path to center on")]
+    pub file: String,
+    #[arg(long = "depth", default_value_t = 1, help = "Neighbor depth")]
+    pub depth: usize,
+    #[arg(long = "limit", default_value_t = 25, help = "Limit results")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct TopologyRefactorCli {
+    #[arg(
+        long = "max-cuts-per-cycle",
+        default_value_t = 3,
+        help = "Maximum cuts to suggest per cycle"
+    )]
+    pub max_cuts_per_cycle: usize,
+    #[arg(
+        long = "max-total-cuts",
+        default_value_t = 20,
+        help = "Maximum cuts to suggest across all cycles"
+    )]
+    pub max_total_cuts: usize,
+    #[arg(
+        long = "min-cut-score",
+        default_value_t = 0.2,
+        help = "Minimum cut score (0-1) to include"
+    )]
+    pub min_cut_score: f64,
+    #[arg(long = "limit", default_value_t = 20, help = "Limit cuts shown")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct TopologyAssembleCli {
+    #[arg(
+        long = "file",
+        value_name = "PATH",
+        value_delimiter = ',',
+        num_args = 1..,
+        help = "Seed file paths (comma-separated) for the mini codebase"
+    )]
+    pub files: Vec<String>,
+    #[arg(long = "depth", default_value_t = 1, help = "Neighbor depth")]
+    pub depth: usize,
+    #[arg(long = "limit", default_value_t = 25, help = "Maximum files to include")]
+    pub limit: usize,
+    #[arg(
+        long = "per-file",
+        default_value_t = 5,
+        help = "Maximum chunks per file"
+    )]
+    pub per_file: usize,
+    #[arg(
+        long = "sections",
+        value_enum,
+        value_delimiter = ',',
+        num_args = 1..,
+        help = "Sections to include (structure, summary, context, query)"
+    )]
+    pub sections: Vec<PromptSection>,
+    #[arg(long = "theme", default_value = "", help = "Syntax theme name")]
+    pub theme: String,
+    #[arg(
+        long = "task",
+        default_value = "Topology mini codebase",
+        help = "Task label for the prompt output"
+    )]
+    pub task: String,
 }
 
 #[derive(ValueEnum, Clone, Debug, Eq, PartialEq)]
@@ -510,6 +638,7 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
             cli_layer.search = cmd.search.clone();
             cli_layer.prompt = cmd.prompt.clone();
         }
+        Command::Topology(_) => {}
         Command::Config(_) => {}
     }
 

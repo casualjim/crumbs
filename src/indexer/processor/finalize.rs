@@ -59,6 +59,7 @@ impl<'a> IndexProcessor<'a> {
         file_paths: impl IntoIterator<Item = String>,
     ) -> Result<()> {
         let mut seen = HashSet::new();
+
         for file_path in file_paths {
             if !seen.insert(file_path.clone()) {
                 continue;
@@ -85,13 +86,14 @@ impl<'a> IndexProcessor<'a> {
                 .unwrap_or_else(|| PendingFile::new(0));
 
             let keep_ids: Vec<String> = entry.chunks.iter().map(|chunk| chunk.id.clone()).collect();
-            self.db.upsert_file_metadata(
-                &file_path,
-                entry.file_size,
-                eof.content_hash,
-                eof.primary_language.clone(),
-            )
-            .await?;
+            self.db
+                .upsert_file_metadata(
+                    &file_path,
+                    entry.file_size,
+                    eof.content_hash,
+                    eof.primary_language.clone(),
+                )
+                .await?;
             self.db.delete_missing_chunks(&file_path, &keep_ids).await?;
             self.state.pending_eof.remove(&file_path);
         }

@@ -6,6 +6,22 @@ use eyre::Result;
 
 use crate::db::{ChunkRecord, FtsRow, GraphData, SearchRow, SymbolRecord};
 
+#[derive(Clone, Debug)]
+pub struct DependencyEdge {
+    pub src_path: String,
+    pub dst_path: String,
+    pub reference_count: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CochangeEdge {
+    pub src_path: String,
+    pub dst_path: String,
+    pub weight: f64,
+    #[allow(dead_code)]
+    pub commit_count: i64,
+}
+
 #[async_trait]
 pub trait Repository: Send + Sync {
     async fn load_existing_hashes(&self) -> Result<BTreeMap<PathBuf, [u8; 32]>>;
@@ -63,6 +79,8 @@ pub trait Repository: Send + Sync {
     async fn file_commit_count(&self, file_path: &str) -> Result<i64>;
     async fn update_file_dependency_edges(&self, file_path: &str) -> Result<()>;
     async fn file_dependency_pagerank(&self, limit: usize) -> Result<Vec<(String, f64)>>;
+    async fn list_dependency_edges(&self) -> Result<Vec<DependencyEdge>>;
+    async fn list_cochange_edges(&self) -> Result<Vec<CochangeEdge>>;
     async fn chunks_for_files(
         &self,
         file_paths: &[String],

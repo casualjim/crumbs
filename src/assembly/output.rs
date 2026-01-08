@@ -21,12 +21,6 @@ const SUMMARY_CORE_LIMIT: usize = 5;
 const SUMMARY_HIGH_CHURN_COMMITS: i64 = 10;
 const SUMMARY_MAX_ENTRIES: usize = 400;
 
-#[derive(Clone, Copy, Debug)]
-pub enum PromptFormat {
-    Xml,
-    Markdown,
-}
-
 #[derive(Clone)]
 pub struct EnrichedBlock {
     pub file_path: String,
@@ -146,133 +140,17 @@ pub async fn enrich_blocks(
 }
 
 pub fn render_prompt(
-    format: PromptFormat,
     payload: &PromptPayload,
     sections: PromptSections,
     theme: Option<&str>,
 ) -> String {
-    match format {
-        PromptFormat::Xml => render_xml(payload, sections),
-        PromptFormat::Markdown => {
-            let markdown = render_markdown(payload, sections);
-            if std::io::stdout().is_terminal() {
-                let theme = resolve_theme(theme);
-                highlight_markdown(&markdown, &theme)
-            } else {
-                markdown
-            }
-        }
+    let markdown = render_markdown(payload, sections);
+    if std::io::stdout().is_terminal() {
+        let theme = resolve_theme(theme);
+        highlight_markdown(&markdown, &theme)
+    } else {
+        markdown
     }
-}
-
-fn render_xml(payload: &PromptPayload, sections: PromptSections) -> String {
-    let mut out = String::new();
-    writeln!(out, "<context>").ok();
-    if sections.overview_enabled() {
-        writeln!(out, "  <repository_overview>").ok();
-        writeln!(out, "    <name>{}</name>", payload.overview.name).ok();
-        if sections.structure && !payload.overview.structure.is_empty() {
-            write_cdata(
-                &mut out,
-                "    <structure><![CDATA[",
-                &payload.overview.structure.join("\n"),
-                "]]></structure>",
-            );
-        }
-        if sections.summary && !payload.overview.tech_stack.is_empty() {
-            writeln!(
-                out,
-                "    <tech_stack>{}</tech_stack>",
-                xml_escape(&payload.overview.tech_stack.join(", "))
-            )
-            .ok();
-        }
-        if sections.summary && !payload.overview.summary.is_empty() {
-            write_cdata(
-                &mut out,
-                "    <summary_map><![CDATA[",
-                &payload.overview.summary.join("\n"),
-                "]]></summary_map>",
-            );
-        }
-        writeln!(out, "  </repository_overview>").ok();
-    }
-    if !payload.warnings.is_empty() {
-        writeln!(out, "  <warnings>").ok();
-        for warning in &payload.warnings {
-            writeln!(out, "    <warning>{}</warning>", xml_escape(warning)).ok();
-        }
-        writeln!(out, "  </warnings>").ok();
-    }
-    if sections.context {
-        writeln!(out, "  <code_context>").ok();
-
-        let (primary, expanded) = split_blocks(&payload.blocks);
-        write_xml_group(&mut out, "retrieved_files", &primary);
-        write_xml_group(&mut out, "expanded_files", &expanded);
-
-        writeln!(out, "  </code_context>").ok();
-    }
-    if sections.query {
-        writeln!(out, "  <user_query>").ok();
-        writeln!(out, "{}", xml_escape(&payload.task)).ok();
-        writeln!(out, "  </user_query>").ok();
-    }
-    writeln!(out, "</context>").ok();
-    out
-}
-
-fn write_xml_group(out: &mut String, label: &str, blocks: &[EnrichedBlock]) {
-    writeln!(
-        out,
-        "    <{label} count=\"{}\" total_tokens=\"0\">",
-        blocks.len()
-    )
-    .ok();
-    for block in blocks {
-        writeln!(out, "      <file>").ok();
-        writeln!(out, "        <path>{}</path>", xml_escape(&block.file_path)).ok();
-        writeln!(
-            out,
-            "        <lines start=\"{}\" end=\"{}\"/>",
-            block.start_line, block.end_line
-        )
-        .ok();
-        writeln!(out, "        <relevance>{:.4}</relevance>", block.relevance).ok();
-        writeln!(
-            out,
-            "        <source>{}</source>",
-            source_label(block.source)
-        )
-        .ok();
-        writeln!(
-            out,
-            "        <reason>{}</reason>",
-            reason_label(block.source)
-        )
-        .ok();
-        writeln!(
-            out,
-            "        <language>{}</language>",
-            xml_escape(&block.language)
-        )
-        .ok();
-        if !block.symbols.is_empty() {
-            writeln!(out, "        <symbols>").ok();
-            for symbol in &block.symbols {
-                writeln!(out, "          <symbol>{}</symbol>", xml_escape(symbol)).ok();
-            }
-            writeln!(out, "        </symbols>").ok();
-        }
-        write_cdata(
-            out,
-            "        <content><![CDATA[",
-            &block.text,
-            "]]></content>",
-        );
-        writeln!(out, "      </file>").ok();
-    }
-    writeln!(out, "    </{label}>").ok();
 }
 
 fn render_markdown(payload: &PromptPayload, sections: PromptSections) -> String {
@@ -414,23 +292,6 @@ fn reason_label(source: CandidateSource) -> &'static str {
         CandidateSource::Primary => "retrieval",
         CandidateSource::Expanded => "expanded_neighbor",
     }
-}
-
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn write_cdata(out: &mut String, prefix: &str, text: &str, suffix: &str) {
-    out.push_str(prefix);
-    let escaped = text.replace("]]>", "]]]]><![CDATA[>");
-    out.push_str(&escaped);
-    out.push_str(suffix);
-    out.push('\n');
 }
 
 pub async fn build_repository_overview(
@@ -914,8 +775,7 @@ mod tests {
             "expected a.rs to have high-churn or core badge"
         );
 
-        let xml = render_prompt(
-            PromptFormat::Xml,
+        let rendered = render_prompt(
             &PromptPayload {
                 overview,
                 task: "test".to_string(),
@@ -926,17 +786,10 @@ mod tests {
             None,
         );
         assert!(
-            xml.contains("<summary_map>"),
-            "expected summary_map in XML output"
+            rendered.contains("<SUMMARY_MAP>"),
+            "expected summary_map in rendered output"
         );
         Ok(())
-    }
-
-    #[test]
-    fn xml_escape_rewrites_special_chars() {
-        let input = r#"<tag attr="x&y">"'"#;
-        let escaped = xml_escape(input);
-        assert_eq!(escaped, "&lt;tag attr=&quot;x&amp;y&quot;&gt;&quot;&apos;");
     }
 
     #[test]

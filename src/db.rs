@@ -1872,6 +1872,47 @@ impl Repository for Db {
         Ok(scored)
     }
 
+    async fn list_dependency_edges(&self) -> Result<Vec<crate::repository::DependencyEdge>> {
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT src_path, dst_path, reference_count \
+                 FROM file_dependency_edges",
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next().await? {
+            edges.push(crate::repository::DependencyEdge {
+                src_path: row.get::<String>(0)?,
+                dst_path: row.get::<String>(1)?,
+                reference_count: row.get::<i64>(2)?,
+            });
+        }
+        Ok(edges)
+    }
+
+    async fn list_cochange_edges(&self) -> Result<Vec<crate::repository::CochangeEdge>> {
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT src_path, dst_path, weight, commit_count \
+                 FROM file_cochange_edges",
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next().await? {
+            edges.push(crate::repository::CochangeEdge {
+                src_path: row.get::<String>(0)?,
+                dst_path: row.get::<String>(1)?,
+                weight: row.get::<f64>(2)?,
+                commit_count: row.get::<i64>(3)?,
+            });
+        }
+        Ok(edges)
+    }
+
     async fn chunks_for_files(
         &self,
         file_paths: &[String],

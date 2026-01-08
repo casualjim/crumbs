@@ -108,7 +108,8 @@ impl<'a> Indexer<'a> {
                             );
                             match processor.handle_chunk(project_chunk).await? {
                                 ProcessorOutput::Batch(batch_item) => {
-                                    if embedder_service.enqueue(batch_item).await? {
+                                    let enqueued = embedder_service.enqueue(batch_item).await?;
+                                    if enqueued {
                                         pending_batches = pending_batches.saturating_add(1);
                                         update_progress(
                                             files_processed,
