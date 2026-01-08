@@ -1,7 +1,0 @@
-[
-  {
-    "label": "remark: open draft",
-    "command": "zed \"$(remark draft)\"",
-    "cwd": "$ZED_WORKTREE_ROOT"
-  }
-]
