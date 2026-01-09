@@ -60,4 +60,8 @@ impl TokenAwareBatcher {
         self.current.retain(|item| item.file_path != file_path);
         self.current_tokens = self.current.iter().map(|item| item.token_count).sum();
     }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.current.is_empty()
+    }
 }

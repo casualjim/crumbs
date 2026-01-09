@@ -141,4 +141,8 @@ impl EmbedderService {
     pub(crate) fn remove_file(&mut self, file_path: &str) {
         self.batcher.remove_file(file_path);
     }
+
+    pub(crate) fn has_pending_batch(&self) -> bool {
+        self.batcher.has_pending()
+    }
 }

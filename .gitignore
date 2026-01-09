@@ -7,3 +7,4 @@ node_modules
 .codex/auth.json
 .env.json
 .vscode
+.config/crumbs/*.db
