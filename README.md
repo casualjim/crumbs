@@ -14,6 +14,7 @@ indexing + retrieval foundation for that pipeline.
 - Extracts symbol/reference graphs from Tree-sitter queries.
 - Adds git co-change history edges via `cupido`.
 - Supports hybrid retrieval (vector + FTS) for search.
+- Tracks local issues in JSONL + SQLite and can assemble topology-aware context per issue.
 
 ## Key concepts
 
@@ -71,6 +72,25 @@ Optional: retrieval tweaks (filters, decomposition, rerank):
 ```
 crumbs prompt --path-prefix src/ --file-ext rs --decompose --rerank "refactor the search pipeline"
 ```
+
+## Issue management (inspired by Grits)
+
+`crumbs` includes a lightweight issue tracker modeled after the Grits workflow, with a
+twin storage layer: a human-readable `issues.jsonl` file plus a SQLite table for fast queries.
+The JSONL file lives alongside `crumbs.db` in your data directory (typically
+`.config/crumbs/` under the repo when using local config).
+
+Example usage:
+```
+crumbs issue create "Add reranking fallback" -d "Use FTS when reranker is unavailable" --label search
+crumbs issue update cr-abc123 --status in-progress --add-symbol "src/search.rs"
+crumbs issue list --status open
+crumbs issue search "rerank"
+crumbs issue context cr-abc123 --depth 2 --limit 30
+```
+
+Credit: Issue management workflow and JSONL + SQLite dual storage are inspired by
+[Grits](https://github.com/babybirdprd/grits).
 
 ## Configuration
 

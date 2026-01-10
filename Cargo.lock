@@ -1285,16 +1285,19 @@ dependencies = [
  "cupido",
  "dark-light",
  "dirs",
+ "dotnet-lens",
  "eyre",
  "futures",
  "http 1.4.0",
  "indicatif 0.18.3",
+ "jiff",
  "libsql",
  "pin-project-lite",
  "reqwest 0.13.1",
  "secrecy",
  "serde",
  "serde_json",
+ "serde_yaml 0.9.34+deprecated",
  "syntastica",
  "syntastica-parsers",
  "syntastica-queries",
@@ -1605,6 +1608,16 @@ dependencies = [
  "hard-xml",
  "log",
  "zip",
+]
+
+[[package]]
+name = "dotnet-lens"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7af546c900e7ea73631219c65fe384169eddc14b72e8831cf9c9536a8126fdb9"
+dependencies = [
+ "spex",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2556,7 +2569,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3026,6 +3039,47 @@ dependencies = [
  "phf 0.13.1",
  "regex",
  "rustc-hash 2.1.1",
+]
+
+[[package]]
+name = "jiff"
+version = "0.2.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67e8da4c49d6d9909fe03361f9b620f58898859f5c7aded68351e85e71ecf50"
+dependencies = [
+ "jiff-static",
+ "jiff-tzdb-platform",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0c84ee7f197eca9a86c6fd6cb771e55eb991632f15f2bc3ca6ec838929e6e78"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.113",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68971ebff725b9e2ca27a601c5eb38a4c5d64422c4cbab0c535f248087eda5c2"
+
+[[package]]
+name = "jiff-tzdb-platform"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
+dependencies = [
+ "jiff-tzdb",
 ]
 
 [[package]]
@@ -4437,6 +4491,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f89776e4d69bb58bc6993e99ffa1d11f228b839984854c7daeb5d37f87cbe950"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8a2f0d8d040d7848a709caf78912debcc3f33ee4b3cac47d73d1e1069e83507"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4637,7 +4700,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.36",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -4675,7 +4738,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -5554,6 +5617,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
 
 [[package]]
+name = "sipp"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e3e79ba5cb5e76afe752244678859d5bad23667fabc02a97ed5b5d885d10db2"
+
+[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5600,6 +5669,15 @@ dependencies = [
  "byteorder",
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "spex"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b83c7d4fa0a543debbafaffdb623f198a69e1b18ddab9e15dfa3096500989afb"
+dependencies = [
+ "sipp",
 ]
 
 [[package]]
@@ -7404,7 +7482,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,11 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use charabia::Tokenize;
 use eyre::{Result, eyre};
 use libsql::{Builder, Connection, Database, Value, params, params_from_iter};
 
+use crate::issues::{Issue, IssueFilters, IssueSearchResult};
 use crate::repository::Repository;
+use crate::topology::TopologyExport;
+
+const ISSUE_COLUMNS: &str = "id, title, description, design, acceptance_criteria, notes, status, \
+priority, issue_type, assignee, labels, dependencies, relates_to, affected_symbols, external_refs, \
+comments, estimate_minutes, duplicate_of, superseded_by, deleted_at, deleted_by, deleted_reason, \
+created_at, updated_at, closed_at";
+const ISSUE_COLUMN_COUNT: i32 = 25;
 
 pub struct Db {
     _db: Database,
@@ -170,6 +178,39 @@ impl Db {
           symbol_id TEXT NOT NULL REFERENCES symbols(id),
           PRIMARY KEY (reference_id, symbol_id)
         );
+        CREATE TABLE IF NOT EXISTS issues (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL,
+          design TEXT NOT NULL,
+          acceptance_criteria TEXT NOT NULL,
+          notes TEXT NOT NULL,
+          status TEXT NOT NULL,
+          priority INTEGER NOT NULL,
+          issue_type TEXT NOT NULL,
+          assignee TEXT,
+          labels TEXT NOT NULL,
+          dependencies TEXT NOT NULL,
+          relates_to TEXT NOT NULL,
+          affected_symbols TEXT NOT NULL,
+          external_refs TEXT NOT NULL,
+          comments TEXT NOT NULL,
+          estimate_minutes INTEGER,
+          duplicate_of TEXT,
+          superseded_by TEXT,
+          deleted_at TEXT,
+          deleted_by TEXT,
+          deleted_reason TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          closed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS topology_snapshots (
+          name TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          nodes TEXT NOT NULL,
+          edges TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS chunks_file_path_idx ON chunks (file_path);
         CREATE INDEX IF NOT EXISTS file_commit_edges_file_idx ON file_commit_edges (file_path);
         CREATE INDEX IF NOT EXISTS file_commit_edges_commit_idx ON file_commit_edges (commit_id);
@@ -189,6 +230,7 @@ impl Db {
 
         self.conn.execute_batch(&create_sql).await?;
         self.ensure_fts_text_column().await?;
+        self.ensure_issue_columns().await?;
         self.conn
             .execute_batch(
                 "CREATE INDEX IF NOT EXISTS chunks_embedding_idx \
@@ -212,6 +254,24 @@ impl Db {
         CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN \
           INSERT INTO fts_chunks(fts_chunks, rowid, fts_text) VALUES('delete', old.rowid, old.fts_text); \
           INSERT INTO fts_chunks(rowid, fts_text) VALUES (new.rowid, new.fts_text); \
+        END; \
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_issues USING fts5( \
+          title, description, design, acceptance_criteria, notes, labels, affected_symbols, \
+          content='issues', content_rowid='rowid' \
+        ); \
+        CREATE TRIGGER IF NOT EXISTS issues_ai AFTER INSERT ON issues BEGIN \
+          INSERT INTO fts_issues(rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
+          VALUES (new.rowid, new.title, new.description, new.design, new.acceptance_criteria, new.notes, new.labels, new.affected_symbols); \
+        END; \
+        CREATE TRIGGER IF NOT EXISTS issues_ad AFTER DELETE ON issues BEGIN \
+          INSERT INTO fts_issues(fts_issues, rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
+          VALUES('delete', old.rowid, old.title, old.description, old.design, old.acceptance_criteria, old.notes, old.labels, old.affected_symbols); \
+        END; \
+        CREATE TRIGGER IF NOT EXISTS issues_au AFTER UPDATE ON issues BEGIN \
+          INSERT INTO fts_issues(fts_issues, rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
+          VALUES('delete', old.rowid, old.title, old.description, old.design, old.acceptance_criteria, old.notes, old.labels, old.affected_symbols); \
+          INSERT INTO fts_issues(rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
+          VALUES (new.rowid, new.title, new.description, new.design, new.acceptance_criteria, new.notes, new.labels, new.affected_symbols); \
         END;";
         if let Err(err) = self.conn.execute_batch(fts_sql).await {
             tracing::warn!("failed to initialize FTS: {err}");
@@ -268,6 +328,48 @@ impl Db {
 
         self.conn
             .execute("UPDATE chunks SET fts_text = text WHERE fts_text = ''", ())
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_issue_columns(&self) -> Result<()> {
+        let stmt = self.conn.prepare("PRAGMA table_info(issues)").await?;
+        let mut rows = stmt.query(()).await?;
+        let mut columns = HashSet::new();
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(1)?;
+            columns.insert(name);
+        }
+
+        let required = [
+            ("external_refs", "TEXT NOT NULL DEFAULT '[]'"),
+            ("comments", "TEXT NOT NULL DEFAULT '[]'"),
+            ("estimate_minutes", "INTEGER"),
+            ("duplicate_of", "TEXT"),
+            ("superseded_by", "TEXT"),
+            ("deleted_at", "TEXT"),
+            ("deleted_by", "TEXT"),
+            ("deleted_reason", "TEXT"),
+        ];
+
+        for (name, definition) in required {
+            if !columns.contains(name) {
+                let sql = format!("ALTER TABLE issues ADD COLUMN {name} {definition}");
+                self.conn.execute(&sql, ()).await?;
+            }
+        }
+
+        self.conn
+            .execute(
+                "UPDATE issues SET external_refs = '[]' WHERE external_refs IS NULL",
+                (),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE issues SET comments = '[]' WHERE comments IS NULL",
+                (),
+            )
             .await?;
         Ok(())
     }
@@ -832,6 +934,241 @@ impl Db {
             }
         }
     }
+
+    pub async fn upsert_issue(&self, issue: &Issue) -> Result<()> {
+        let labels = serde_json::to_string(&issue.labels)?;
+        let dependencies = serde_json::to_string(&issue.dependencies)?;
+        let relates_to = serde_json::to_string(&issue.relates_to)?;
+        let affected_symbols = serde_json::to_string(&issue.affected_symbols)?;
+        let external_refs = serde_json::to_string(&issue.external_refs)?;
+        let comments = serde_json::to_string(&issue.comments)?;
+        self.conn
+            .execute(
+                "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, \
+                 priority, issue_type, assignee, labels, dependencies, relates_to, affected_symbols, \
+                 external_refs, comments, estimate_minutes, duplicate_of, superseded_by, deleted_at, \
+                 deleted_by, deleted_reason, created_at, updated_at, closed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   title = excluded.title, \
+                   description = excluded.description, \
+                   design = excluded.design, \
+                   acceptance_criteria = excluded.acceptance_criteria, \
+                   notes = excluded.notes, \
+                   status = excluded.status, \
+                   priority = excluded.priority, \
+                   issue_type = excluded.issue_type, \
+                   assignee = excluded.assignee, \
+                   labels = excluded.labels, \
+                   dependencies = excluded.dependencies, \
+                   relates_to = excluded.relates_to, \
+                   affected_symbols = excluded.affected_symbols, \
+                   external_refs = excluded.external_refs, \
+                   comments = excluded.comments, \
+                   estimate_minutes = excluded.estimate_minutes, \
+                   duplicate_of = excluded.duplicate_of, \
+                   superseded_by = excluded.superseded_by, \
+                   deleted_at = excluded.deleted_at, \
+                   deleted_by = excluded.deleted_by, \
+                   deleted_reason = excluded.deleted_reason, \
+                   created_at = excluded.created_at, \
+                   updated_at = excluded.updated_at, \
+                   closed_at = excluded.closed_at",
+                params![
+                    issue.id.as_str(),
+                    issue.title.as_str(),
+                    issue.description.as_str(),
+                    issue.design.as_str(),
+                    issue.acceptance_criteria.as_str(),
+                    issue.notes.as_str(),
+                    issue.status.as_str(),
+                    issue.priority as i64,
+                    issue.issue_type.as_str(),
+                    issue.assignee.as_deref(),
+                    labels,
+                    dependencies,
+                    relates_to,
+                    affected_symbols,
+                    external_refs,
+                    comments,
+                    issue.estimate_minutes.map(|value| value as i64),
+                    issue.duplicate_of.as_deref(),
+                    issue.superseded_by.as_deref(),
+                    issue.deleted_at.as_deref(),
+                    issue.deleted_by.as_deref(),
+                    issue.deleted_reason.as_deref(),
+                    issue.created_at.as_str(),
+                    issue.updated_at.as_str(),
+                    issue.closed_at.as_deref()
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_issue(&self, id: &str) -> Result<Option<Issue>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!("SELECT {ISSUE_COLUMNS} FROM issues WHERE id = ?"),
+                params![id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(Some(issue_from_row(&row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn list_all_issues(&self) -> Result<Vec<Issue>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!("SELECT {ISSUE_COLUMNS} FROM issues ORDER BY updated_at DESC"),
+                (),
+            )
+            .await?;
+        let mut issues = Vec::new();
+        while let Some(row) = rows.next().await? {
+            issues.push(issue_from_row(&row)?);
+        }
+        Ok(issues)
+    }
+
+    pub async fn list_issues(&self, filters: IssueFilters) -> Result<Vec<Issue>> {
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+        if let Some(status) = &filters.status {
+            clauses.push("status = ?");
+            params.push(Value::Text(status.clone()));
+        }
+        if let Some(assignee) = &filters.assignee {
+            clauses.push("assignee = ?");
+            params.push(Value::Text(assignee.clone()));
+        }
+        if let Some(issue_type) = &filters.issue_type {
+            clauses.push("issue_type = ?");
+            params.push(Value::Text(issue_type.clone()));
+        }
+        if let Some(priority) = filters.priority {
+            clauses.push("priority = ?");
+            params.push(Value::Integer(priority as i64));
+        }
+
+        let mut sql = format!("SELECT {ISSUE_COLUMNS} FROM issues");
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY updated_at DESC");
+        if let Some(limit) = filters.limit {
+            sql.push_str(" LIMIT ?");
+            params.push(Value::Integer(limit as i64));
+        }
+
+        let mut rows = if params.is_empty() {
+            self.conn.query(&sql, ()).await?
+        } else {
+            self.conn.query(&sql, params_from_iter(params)).await?
+        };
+
+        let mut issues = Vec::new();
+        while let Some(row) = rows.next().await? {
+            issues.push(issue_from_row(&row)?);
+        }
+
+        let mut issues = if let Some(label) = filters.label {
+            let normalized = label.trim().to_ascii_lowercase();
+            issues
+                .into_iter()
+                .filter(|issue| {
+                    issue
+                        .labels
+                        .iter()
+                        .any(|entry| entry.to_ascii_lowercase() == normalized)
+                })
+                .collect()
+        } else {
+            issues
+        };
+
+        if let Some(limit) = filters.limit {
+            if issues.len() > limit {
+                issues.truncate(limit);
+            }
+        }
+        Ok(issues)
+    }
+
+    pub async fn search_issues(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<IssueSearchResult>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {ISSUE_COLUMNS}, bm25(fts_issues) as score \
+                     FROM fts_issues JOIN issues ON issues.rowid = fts_issues.rowid \
+                     WHERE fts_issues MATCH ? ORDER BY score LIMIT ?"
+                ),
+                params![query, limit as i64],
+            )
+            .await?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let issue = issue_from_row(&row)?;
+            let score: f64 = row.get(ISSUE_COLUMN_COUNT)?;
+            results.push(IssueSearchResult { issue, score });
+        }
+        Ok(results)
+    }
+
+    pub async fn save_topology_snapshot(
+        &self,
+        name: &str,
+        snapshot: &TopologyExport,
+    ) -> Result<()> {
+        let nodes = serde_json::to_string(&snapshot.nodes)?;
+        let edges = serde_json::to_string(&snapshot.edges)?;
+        let created_at = jiff::Timestamp::now().to_string();
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO topology_snapshots (name, created_at, nodes, edges) \
+                 VALUES (?, ?, ?, ?)",
+                params![name, created_at, nodes, edges],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_topology_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<Option<TopologyExport>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT nodes, edges FROM topology_snapshots WHERE name = ?",
+                params![name],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let nodes_json: String = row.get(0)?;
+        let edges_json: String = row.get(1)?;
+        let nodes = serde_json::from_str(&nodes_json)?;
+        let edges = serde_json::from_str(&edges_json)?;
+        Ok(Some(TopologyExport { nodes, edges }))
+    }
+
 }
 
 #[derive(Clone)]
@@ -876,6 +1213,110 @@ pub struct GraphData {
     pub symbols: Vec<SymbolRecord>,
     pub references: Vec<ReferenceRecord>,
     pub resolutions: Vec<(String, String)>,
+}
+
+fn issue_from_row(row: &libsql::Row) -> Result<Issue> {
+    let labels: String = row.get(10)?;
+    let dependencies: String = row.get(11)?;
+    let relates_to: String = row.get(12)?;
+    let affected_symbols: String = row.get(13)?;
+    let external_refs: String = row.get(14)?;
+    let comments: String = row.get(15)?;
+
+    Ok(Issue {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        design: row.get(3)?,
+        acceptance_criteria: row.get(4)?,
+        notes: row.get(5)?,
+        status: row.get(6)?,
+        priority: row.get::<i64>(7)? as i32,
+        issue_type: row.get(8)?,
+        assignee: row.get(9)?,
+        labels: parse_json_list(&labels),
+        dependencies: parse_dependency_list(&dependencies),
+        relates_to: parse_json_list(&relates_to),
+        affected_symbols: parse_json_list(&affected_symbols),
+        external_refs: parse_external_ref_list(&external_refs),
+        comments: parse_comment_list(&comments),
+        estimate_minutes: row.get::<Option<i64>>(16)?.map(|value| value as i32),
+        duplicate_of: row.get(17)?,
+        superseded_by: row.get(18)?,
+        deleted_at: row.get(19)?,
+        deleted_by: row.get(20)?,
+        deleted_reason: row.get(21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
+        closed_at: row.get(24)?,
+    })
+}
+
+fn parse_json_list(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(trimmed).unwrap_or_default()
+    }
+}
+
+fn parse_dependency_list(value: &str) -> Vec<crate::issues::IssueDependency> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed);
+    let Ok(parsed) = parsed else {
+        return Vec::new();
+    };
+    match parsed {
+        serde_json::Value::Array(values) => {
+            let mut deps = Vec::new();
+            for entry in values {
+                match entry {
+                    serde_json::Value::String(value) => {
+                        let (id, kind) = crate::issues::normalize_dependencies(&[value]).into_iter().next()
+                            .map(|dep| (dep.id, dep.kind))
+                            .unwrap_or_else(|| (String::new(), "blocks".to_string()));
+                        if !id.trim().is_empty() {
+                            deps.push(crate::issues::IssueDependency { id, kind });
+                        }
+                    }
+                    serde_json::Value::Object(_) => {
+                        if let Ok(dep) =
+                            serde_json::from_value::<crate::issues::IssueDependency>(entry)
+                        {
+                            if !dep.id.trim().is_empty() {
+                                deps.push(dep);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            deps
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_external_ref_list(value: &str) -> Vec<crate::issues::IssueExternalRef> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(trimmed).unwrap_or_default()
+    }
+}
+
+fn parse_comment_list(value: &str) -> Vec<crate::issues::IssueComment> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(trimmed).unwrap_or_default()
+    }
 }
 
 pub struct SearchRow {

@@ -305,13 +305,29 @@ pub async fn build_repository_overview(
         .to_string();
     let structure = Vec::new();
     let tech_stack = detect_tech_stack(repo_root, db).await;
-    let summary = build_repository_summary(repo_root, db).await;
+    let mut summary = build_repository_summary(repo_root, db).await;
+    if let Some(workspace_line) = build_workspace_summary(repo_root, db).await {
+        summary.insert(0, workspace_line);
+    }
     RepositoryOverview {
         name,
         structure,
         tech_stack,
         summary,
     }
+}
+
+async fn build_workspace_summary(
+    repo_root: &Path,
+    db: &dyn Repository,
+) -> Option<String> {
+    let files = db.list_files().await.ok()?;
+    if files.is_empty() {
+        return None;
+    }
+    let workspace =
+        crate::topology::workspace::detect_workspace_info(repo_root, &files).ok()?;
+    Some(crate::topology::workspace::format_workspace_summary(&workspace))
 }
 
 async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
@@ -323,6 +339,14 @@ async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<
         return lines;
     }
 
+    let workspace_config =
+        crate::topology::workspace::WorkspaceDetector::detect(repo_root, &files)
+            .ok()
+            .flatten();
+    let package_map = workspace_config
+        .as_ref()
+        .map(crate::topology::workspace::build_package_map);
+
     let ranks = db.file_dependency_pagerank(SUMMARY_LIMIT).await.unwrap_or_default();
     let core_limit = SUMMARY_CORE_LIMIT.min(ranks.len());
     let mut ranked = std::collections::HashMap::new();
@@ -331,14 +355,35 @@ async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<
         let display_path_value = display_path(repo_root, file_path);
         let mut badges = Vec::new();
         if idx < core_limit {
-            badges.push("core");
+            badges.push("core".to_string());
         }
         if is_test_path(&display_path_value) {
-            badges.push("test");
+            badges.push("test".to_string());
         }
         if let Ok(commit_count) = db.file_commit_count(file_path).await {
             if commit_count >= SUMMARY_HIGH_CHURN_COMMITS {
-                badges.push("high-churn");
+                badges.push("high-churn".to_string());
+            }
+        }
+        if let Some(config) = &workspace_config {
+            let package = crate::topology::workspace::WorkspaceDetector::get_package_for_file(
+                &display_path_value,
+                config,
+            )
+                .or_else(|| {
+                    package_map.as_ref().and_then(|map| {
+                        map.iter()
+                            .filter(|(path, _)| {
+                                !path.is_empty()
+                                    && (display_path_value == path.as_str()
+                                        || display_path_value.starts_with(&format!("{path}/")))
+                            })
+                            .map(|(_, name)| name.clone())
+                            .next()
+                    })
+                });
+            if let Some(package) = package {
+                badges.push(format!("pkg:{package}"));
             }
         }
 
@@ -419,125 +464,7 @@ fn is_test_path(path: &str) -> bool {
 }
 
 fn detect_tech_stack_from_path(path: &Path, stack: &mut std::collections::BTreeSet<String>) {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    match file_name.as_str() {
-        "cargo.toml" | "cargo.lock" => {
-            stack.insert("Rust".to_string());
-        }
-        "package.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lockb" => {
-            stack.insert("Node.js".to_string());
-        }
-        "pyproject.toml"
-        | "requirements.txt"
-        | "requirements-dev.txt"
-        | "pipfile"
-        | "poetry.lock"
-        | "setup.py"
-        | "setup.cfg" => {
-            stack.insert("Python".to_string());
-        }
-        "go.mod" | "go.sum" => {
-            stack.insert("Go".to_string());
-        }
-        "gemfile" | "gemfile.lock" => {
-            stack.insert("Ruby".to_string());
-        }
-        "composer.json" | "composer.lock" => {
-            stack.insert("PHP".to_string());
-        }
-        "pom.xml"
-        | "build.gradle"
-        | "build.gradle.kts"
-        | "settings.gradle"
-        | "settings.gradle.kts"
-        | "gradle.properties" => {
-            stack.insert("Java".to_string());
-        }
-        "mix.exs" | "mix.lock" => {
-            stack.insert("Elixir".to_string());
-        }
-        "dockerfile" | "dockerfile.dev" => {
-            stack.insert("Docker".to_string());
-        }
-        "deno.json" | "deno.jsonc" => {
-            stack.insert("Deno".to_string());
-        }
-        "cabal.project" | "stack.yaml" => {
-            stack.insert("Haskell".to_string());
-        }
-        "build.sbt" => {
-            stack.insert("Scala".to_string());
-        }
-        "pubspec.yaml" => {
-            stack.insert("Dart".to_string());
-        }
-        "package-lock.json" => {
-            stack.insert("Node.js".to_string());
-        }
-        _ => {}
-    }
-
-    match extension.as_str() {
-        "rs" => {
-            stack.insert("Rust".to_string());
-        }
-        "py" => {
-            stack.insert("Python".to_string());
-        }
-        "js" | "jsx" => {
-            stack.insert("JavaScript".to_string());
-        }
-        "ts" | "tsx" => {
-            stack.insert("TypeScript".to_string());
-        }
-        "go" => {
-            stack.insert("Go".to_string());
-        }
-        "rb" => {
-            stack.insert("Ruby".to_string());
-        }
-        "php" => {
-            stack.insert("PHP".to_string());
-        }
-        "java" => {
-            stack.insert("Java".to_string());
-        }
-        "kt" | "kts" => {
-            stack.insert("Kotlin".to_string());
-        }
-        "cs" | "fs" | "vb" => {
-            stack.insert(".NET".to_string());
-        }
-        "swift" => {
-            stack.insert("Swift".to_string());
-        }
-        "scala" => {
-            stack.insert("Scala".to_string());
-        }
-        "c" | "h" => {
-            stack.insert("C".to_string());
-        }
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" => {
-            stack.insert("C++".to_string());
-        }
-        "sql" => {
-            stack.insert("SQL".to_string());
-        }
-        "tf" | "tfvars" => {
-            stack.insert("Terraform".to_string());
-        }
-        _ => {}
-    }
+    crate::topology::workspace::detect_stack_from_path(path, stack);
 }
 
 async fn detect_tech_stack(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
@@ -549,9 +476,19 @@ async fn detect_tech_stack(repo_root: &Path, db: &dyn Repository) -> Vec<String>
     }
 
     let mut stack = std::collections::BTreeSet::new();
-    for file in files {
+    for file in &files {
         let display = display_path(repo_root, &file);
         detect_tech_stack_from_path(Path::new(&display), &mut stack);
+        crate::topology::workspace::detect_stack_from_compose(repo_root, &display, &mut stack);
+    }
+    if let Ok(workspace) = crate::topology::workspace::detect_workspace_info(repo_root, &files) {
+        for ecosystem in workspace.ecosystems {
+            if let Some(name) =
+                crate::topology::workspace::stack_name_for_ecosystem(&ecosystem)
+            {
+                stack.insert(name.to_string());
+            }
+        }
     }
     stack.into_iter().collect()
 }
@@ -559,7 +496,7 @@ async fn detect_tech_stack(repo_root: &Path, db: &dyn Repository) -> Vec<String>
 #[derive(Clone)]
 struct RepoMapEntry {
     score: Option<f64>,
-    badges: Vec<&'static str>,
+    badges: Vec<String>,
     cochanges: Option<String>,
 }
 

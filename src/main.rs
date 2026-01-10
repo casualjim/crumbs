@@ -4,6 +4,8 @@ mod db;
 mod embedding;
 mod graph;
 mod indexer;
+mod issue_analysis;
+mod issues;
 mod logging;
 mod progress;
 mod reqwestx;
@@ -26,6 +28,7 @@ use crate::config::{Cli, Command};
 use crate::db::Db;
 use crate::embedding::{Client as EmbedClient, EmbedderConfig, ProviderDialect};
 use crate::indexer::{Indexer, IndexerConfig};
+use crate::issues::{IssueFilters, IssueSearchResult};
 use crate::assembly::pipeline::{AssembleContext, BudgetAndMerge, DefaultAssembleContext, DefaultBudgetAndMerge};
 use crate::reranker::{Client as RerankerClient, RerankerConfig, RerankingProvider};
 use crate::repository::Repository;
@@ -131,6 +134,7 @@ async fn main() -> Result<()> {
         Command::Prompt(cmd) => {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| project.repo_path.clone());
             let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
             let progress_watch = progress::watch_spinner("assembling prompt");
@@ -181,7 +185,12 @@ async fn main() -> Result<()> {
             let sections = resolve_sections(&cmd.sections);
 
             let (blocks, warnings) = if cmd.topology {
-                let snapshot = topology::TopologySnapshot::load(&db).await?;
+                let snapshot = topology::TopologySnapshot::load_with_workspace(
+                    &db,
+                    &project.repo_path,
+                    &cwd,
+                )
+                .await?;
                 let seed_sources = collect_seed_sources(
                     &project.repo_path,
                     &snapshot,
@@ -304,8 +313,14 @@ async fn main() -> Result<()> {
         Command::Topology(cmd) => {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| project.repo_path.clone());
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
-            let snapshot = topology::TopologySnapshot::load(&db).await?;
+            let snapshot = topology::TopologySnapshot::load_with_workspace(
+                &db,
+                &project.repo_path,
+                &cwd,
+            )
+            .await?;
 
             match &cmd.command {
                 config::TopologyCommand::Stats(options) => {
@@ -325,6 +340,8 @@ async fn main() -> Result<()> {
                     println!("cycles >= {}: {}", options.min_cycle_size, cycles_over_threshold);
                     println!("betti_0: {}", snapshot.stats.betti_0);
                     println!("betti_1: {}", snapshot.stats.betti_1);
+                    println!("betti_2: {}", snapshot.stats.betti_2);
+                    println!("triangles: {}", snapshot.stats.triangle_count);
                     println!("solid_score: {:.3}", snapshot.stats.solid_score);
                     println!("avg_out_degree: {:.2}", snapshot.stats.avg_out_degree);
                     println!("density: {:.4}", snapshot.stats.density);
@@ -381,6 +398,85 @@ async fn main() -> Result<()> {
                             out_weight = neighbor.out_weight,
                             total = neighbor.total_weight
                         );
+                    }
+                }
+                config::TopologyCommand::Path(options) => {
+                    let path = snapshot.shortest_path(&options.start, &options.end)?;
+                    if path.is_empty() {
+                        println!(
+                            "No dependency path found between {} and {}",
+                            options.start, options.end
+                        );
+                        return Ok(());
+                    }
+                    println!("path length={}", path.len().saturating_sub(1));
+                    for (idx, node) in path.iter().enumerate() {
+                        let package = snapshot
+                            .package_for_path(node)
+                            .map(|value| format!(" package={value}"))
+                            .unwrap_or_default();
+                        println!("  {}. {}{}", idx + 1, node, package);
+                    }
+                }
+                config::TopologyCommand::Volumes(options) => {
+                    let volumes = snapshot.feature_volumes(options.max_triangles, options.limit);
+                    if volumes.is_empty() {
+                        println!("No feature volumes detected.");
+                        return Ok(());
+                    }
+                    for volume in volumes {
+                        println!(
+                            "volume {} nodes={} triangles={} cohesion={:.3}",
+                            volume.id,
+                            volume.nodes.len(),
+                            volume.triangle_count,
+                            volume.cohesion
+                        );
+                        for node in volume.nodes {
+                            let package = snapshot
+                                .package_for_path(&node)
+                                .map(|value| format!(" package={value}"))
+                                .unwrap_or_default();
+                            println!("  - {}{}", node, package);
+                        }
+                    }
+                }
+                config::TopologyCommand::Layers(options) => {
+                    let config = if let Some(path) = &options.config {
+                        let content = std::fs::read_to_string(path)?;
+                        if path.ends_with(".yaml") || path.ends_with(".yml") {
+                            serde_yaml::from_str(&content)?
+                        } else {
+                            serde_json::from_str(&content)?
+                        }
+                    } else {
+                        topology::layers::LayerConfig::default_config()
+                    };
+                    let result = topology::layers::check_layers(&snapshot, &config);
+                    if result.is_valid {
+                        println!("Layer check OK ({} layers).", config.layers.len());
+                    } else {
+                        println!(
+                            "Layer violations: {} ({} orphaned nodes)",
+                            result.violations.len(),
+                            result.orphaned_nodes.len()
+                        );
+                        for violation in result.violations {
+                            println!(
+                                "  {} -> {} ({from} -> {to}) reason={reason}",
+                                violation.from_node,
+                                violation.to_node,
+                                from = violation.from_layer,
+                                to = violation.to_layer,
+                                reason = violation.reason
+                            );
+                        }
+                    }
+                    if !result.orphaned_nodes.is_empty() {
+                        println!("Orphaned nodes:");
+                        for node in result.orphaned_nodes {
+                            println!("  - {node}");
+                        }
                     }
                 }
                 config::TopologyCommand::Refactor(options) => {
@@ -478,6 +574,721 @@ async fn main() -> Result<()> {
                     );
                     print!("{rendered}");
                 }
+                config::TopologyCommand::Export(options) => {
+                    let export = snapshot.export_graph(options.include_cochange);
+                    if options.format == "json" {
+                        let json = serde_json::to_string_pretty(&export)?;
+                        std::fs::write(&options.output, json)?;
+                    } else if options.format == "dot" {
+                        let mut dot = String::from("digraph G {\n  rankdir=LR;\n");
+                        for node in &export.nodes {
+                            let label = if let Some(pkg) = &node.package {
+                                format!("{}\\n({})", node.path, pkg)
+                            } else {
+                                node.path.clone()
+                            };
+                            dot.push_str(&format!("  \"{}\" [label=\"{}\"];\n", node.path, label));
+                        }
+                        for edge in &export.edges {
+                            let color = match edge.kind {
+                                topology::EdgeKind::Dependency => "black",
+                                topology::EdgeKind::Cochange => "gray",
+                            };
+                            dot.push_str(&format!(
+                                "  \"{}\" -> \"{}\" [label=\"{:.2}\", color=\"{}\"];\n",
+                                edge.src, edge.dst, edge.weight, color
+                            ));
+                        }
+                        dot.push_str("}\n");
+                        std::fs::write(&options.output, dot)?;
+                    } else {
+                        return Err(eyre!("unsupported format: {}", options.format));
+                    }
+                    println!("Exported topology to {}", options.output);
+                }
+                config::TopologyCommand::Snapshot(options) => {
+                    let export = snapshot.export_graph(false);
+                    db.save_topology_snapshot(&options.name, &export).await?;
+                    println!("Saved topology snapshot {}", options.name);
+                }
+                config::TopologyCommand::Diff(options) => {
+                    let Some(baseline) = db.load_topology_snapshot(&options.name).await? else {
+                        return Err(eyre!(
+                            "snapshot '{}' not found (run topology snapshot --name <name>)",
+                            options.name
+                        ));
+                    };
+                    let current = snapshot.export_graph(false);
+                    let mut baseline_edges = std::collections::HashMap::new();
+                    for edge in baseline.edges {
+                        baseline_edges.insert((edge.src, edge.dst, edge.kind), edge.weight);
+                    }
+                    let mut current_edges = std::collections::HashMap::new();
+                    for edge in current.edges {
+                        current_edges.insert((edge.src, edge.dst, edge.kind), edge.weight);
+                    }
+
+                    let mut added = Vec::new();
+                    let mut removed = Vec::new();
+                    for (edge, weight) in &current_edges {
+                        if !baseline_edges.contains_key(edge) {
+                            added.push((edge.clone(), *weight));
+                        }
+                    }
+                    for (edge, weight) in &baseline_edges {
+                        if !current_edges.contains_key(edge) {
+                            removed.push((edge.clone(), *weight));
+                        }
+                    }
+
+                    println!(
+                        "Topology diff vs '{}' (added: {}, removed: {})",
+                        options.name,
+                        added.len(),
+                        removed.len()
+                    );
+                    if !added.is_empty() {
+                        println!("Added edges:");
+                        for (edge, weight) in added.into_iter().take(options.limit) {
+                            println!(
+                                "  {} -> {} weight={:.2} kind={:?}",
+                                edge.0, edge.1, weight, edge.2
+                            );
+                        }
+                    }
+                    if !removed.is_empty() {
+                        println!("Removed edges:");
+                        for (edge, weight) in removed.into_iter().take(options.limit) {
+                            println!(
+                                "  {} -> {} weight={:.2} kind={:?}",
+                                edge.0, edge.1, weight, edge.2
+                            );
+                        }
+                    }
+                }
+                config::TopologyCommand::Hotspots(options) => {
+                    let hotspots =
+                        snapshot.hotspots(options.limit, options.iterations, options.damping);
+                    println!("Top {} hotspots:", hotspots.len());
+                    for (idx, (path, score)) in hotspots.iter().enumerate() {
+                        let package = snapshot
+                            .package_for_path(path)
+                            .map(|value| format!(" package={value}"))
+                            .unwrap_or_default();
+                        println!("  {}. {} score={:.4}{}", idx + 1, path, score, package);
+                    }
+                }
+            }
+        }
+        Command::Issue(cmd) => {
+            let cfg = config::load_config(&cli)?;
+            let project = config::resolve_project(&cfg, project_override(&cli.command))?;
+            let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
+            let jsonl_path = issues::issues_jsonl_path(&project.data_dir);
+
+            issues::sync_from_jsonl(&db, &jsonl_path).await?;
+
+            match &cmd.command {
+                config::IssueCommand::Create(options) => {
+                    let mut issue = issues::Issue::new(options.title.clone());
+                    if let Some(description) = &options.description {
+                        issue.description = description.clone();
+                    }
+                    if let Some(design) = &options.design {
+                        issue.design = design.clone();
+                    }
+                    if let Some(acceptance) = &options.acceptance_criteria {
+                        issue.acceptance_criteria = acceptance.clone();
+                    }
+                    if let Some(notes) = &options.notes {
+                        issue.notes = notes.clone();
+                    }
+                    issue.status = options.status.clone();
+                    issue.priority = options.priority;
+                    issue.issue_type = options.issue_type.clone();
+                    issue.assignee = options.assignee.clone();
+                    issue.labels = issues::normalize_tags(&options.labels);
+                    issue.dependencies = issues::normalize_dependencies(&options.dependencies);
+                    issue.relates_to = issues::normalize_ids(&options.relates_to);
+                    issue.affected_symbols = issues::normalize_symbols(&options.affected_symbols);
+                    issue.external_refs = issues::normalize_external_refs(&options.external_refs);
+                    issue.estimate_minutes = options.estimate_minutes;
+                    issue.duplicate_of = options
+                        .duplicate_of
+                        .clone()
+                        .filter(|value| !value.trim().is_empty());
+                    issue.superseded_by = options
+                        .superseded_by
+                        .clone()
+                        .filter(|value| !value.trim().is_empty());
+                    issue.comments =
+                        issues::build_comments(&options.comments, options.comment_author.as_deref());
+                    db.upsert_issue(&issue).await?;
+                    issues::export_to_jsonl(&db, &jsonl_path).await?;
+                    println!("Created {}", issue.id);
+                }
+                config::IssueCommand::Update(options) => {
+                    let mut issue = db
+                        .get_issue(&options.id)
+                        .await?
+                        .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
+                    if let Some(title) = &options.title {
+                        issue.title = title.clone();
+                    }
+                    if let Some(description) = &options.description {
+                        issue.description = description.clone();
+                    }
+                    if let Some(design) = &options.design {
+                        issue.design = design.clone();
+                    }
+                    if let Some(acceptance) = &options.acceptance_criteria {
+                        issue.acceptance_criteria = acceptance.clone();
+                    }
+                    if let Some(notes) = &options.notes {
+                        issue.notes = notes.clone();
+                    }
+                    if let Some(status) = &options.status {
+                        issue.status = status.clone();
+                    }
+                    if let Some(priority) = options.priority {
+                        issue.priority = priority;
+                    }
+                    if let Some(issue_type) = &options.issue_type {
+                        issue.issue_type = issue_type.clone();
+                    }
+                    if let Some(assignee) = &options.assignee {
+                        if assignee.trim().is_empty() {
+                            issue.assignee = None;
+                        } else {
+                            issue.assignee = Some(assignee.clone());
+                        }
+                    }
+                    issue.labels = issues::merge_tags(
+                        &issue.labels,
+                        &options.add_labels,
+                        &options.remove_labels,
+                    );
+                    issue.dependencies = issues::merge_dependencies(
+                        &issue.dependencies,
+                        &options.add_dependencies,
+                        &options.remove_dependencies,
+                    );
+                    issue.relates_to = issues::merge_ids(
+                        &issue.relates_to,
+                        &options.add_related,
+                        &options.remove_related,
+                    );
+                    issue.affected_symbols = issues::merge_symbols(
+                        &issue.affected_symbols,
+                        &options.add_symbols,
+                        &options.remove_symbols,
+                    );
+                    issue.external_refs = issues::merge_external_refs(
+                        &issue.external_refs,
+                        &options.add_external_refs,
+                        &options.remove_external_refs,
+                    );
+                    if options.clear_estimate {
+                        issue.estimate_minutes = None;
+                    }
+                    if let Some(value) = options.estimate_minutes {
+                        issue.estimate_minutes = Some(value);
+                    }
+                    if options.clear_duplicate {
+                        issue.duplicate_of = None;
+                    }
+                    if let Some(value) = &options.duplicate_of {
+                        if value.trim().is_empty() {
+                            issue.duplicate_of = None;
+                        } else {
+                            issue.duplicate_of = Some(value.clone());
+                        }
+                    }
+                    if options.clear_superseded {
+                        issue.superseded_by = None;
+                    }
+                    if let Some(value) = &options.superseded_by {
+                        if value.trim().is_empty() {
+                            issue.superseded_by = None;
+                        } else {
+                            issue.superseded_by = Some(value.clone());
+                        }
+                    }
+                    let new_comments =
+                        issues::build_comments(&options.add_comments, options.comment_author.as_deref());
+                    if !new_comments.is_empty() {
+                        issue.comments.extend(new_comments);
+                    }
+                    if options.restore {
+                        issue.deleted_at = None;
+                        issue.deleted_by = None;
+                        issue.deleted_reason = None;
+                    }
+                    if options.mark_deleted {
+                        issue.deleted_at = Some(jiff::Timestamp::now().to_string());
+                    }
+                    if let Some(value) = &options.deleted_by {
+                        if value.trim().is_empty() {
+                            issue.deleted_by = None;
+                        } else {
+                            issue.deleted_by = Some(value.clone());
+                        }
+                    }
+                    if let Some(value) = &options.deleted_reason {
+                        if value.trim().is_empty() {
+                            issue.deleted_reason = None;
+                        } else {
+                            issue.deleted_reason = Some(value.clone());
+                        }
+                    }
+                    issue.touch();
+                    db.upsert_issue(&issue).await?;
+                    issues::export_to_jsonl(&db, &jsonl_path).await?;
+                    println!("Updated {}", issue.id);
+                }
+                config::IssueCommand::Close(options) => {
+                    let mut issue = db
+                        .get_issue(&options.id)
+                        .await?
+                        .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
+                    issue.close();
+                    db.upsert_issue(&issue).await?;
+                    issues::export_to_jsonl(&db, &jsonl_path).await?;
+                    println!("Closed {}", issue.id);
+                }
+                config::IssueCommand::Get(options) => {
+                    let issue = db
+                        .get_issue(&options.id)
+                        .await?
+                        .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
+                    print_issue(&issue);
+                }
+                config::IssueCommand::List(options) => {
+                    let filters = IssueFilters {
+                        status: options.status.clone(),
+                        assignee: options.assignee.clone(),
+                        label: options.label.clone(),
+                        issue_type: options.issue_type.clone(),
+                        priority: options.priority,
+                        limit: options.limit,
+                    };
+                    let issues = db.list_issues(filters).await?;
+                    for issue in issues {
+                        print_issue_summary(&issue);
+                    }
+                }
+                config::IssueCommand::Search(options) => {
+                    let results = db.search_issues(&options.query, options.limit).await?;
+                    for IssueSearchResult { issue, score } in results {
+                        println!(
+                            "{id} [{status}] p{priority} score={score:.3} {title}",
+                            id = issue.id,
+                            status = issue.status,
+                            priority = issue.priority,
+                            score = score,
+                            title = issue.title
+                        );
+                    }
+                }
+                config::IssueCommand::Context(options) => {
+                    let issue = db
+                        .get_issue(&options.id)
+                        .await?
+                        .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
+                    let selection_opts = assembly::SelectionOptions::default();
+                    let theme_value = resolve_theme_value(&options.theme, &cfg.prompt.theme);
+                    let sections = resolve_sections(&options.sections);
+
+                    if issue.affected_symbols.is_empty() {
+                        let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+                        let embedder = build_embedder(&cfg.embedding)?;
+                        let reranker = build_reranker(&cfg)?;
+                        let ctx = assembly::AssemblyContext {
+                            repo_path: &project.repo_path,
+                            db: &db,
+                            embedder: Some(&embedder),
+                            reranker: &reranker as &dyn RerankingProvider,
+                            config: &cfg,
+                            selection: selection_opts,
+                        };
+                        let budget = assembly::pipeline::BudgetOptions {
+                            max_tokens: Some(cfg.embedding.context_length),
+                            reserved_output_tokens: 0,
+                            tokenizer: Some(tokenizer.clone()),
+                        };
+                        let pipeline =
+                            assembly::pipeline::default_pipeline(&cfg, budget);
+                        let mut arena = assembly::Arena::new();
+                        let input = arena.insert(assembly::pipeline::QueryInput {
+                            text: issue.summary_query(),
+                        });
+                        let handle = pipeline.run(&ctx, &mut arena, input).await?;
+                        let assembled = arena.get(handle);
+                        let enriched =
+                            assembly::output::enrich_blocks(&project.repo_path, &db, &assembled.blocks).await?;
+                        let overview =
+                            assembly::output::build_repository_overview(&project.repo_path, &db).await;
+                        let payload = assembly::output::PromptPayload {
+                            overview,
+                            task: issue.title.clone(),
+                            blocks: enriched,
+                            warnings: assembled.warnings.clone(),
+                        };
+                        let rendered =
+                            assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
+                        print!("{rendered}");
+                    } else {
+                        let cwd =
+                            std::env::current_dir().unwrap_or_else(|_| project.repo_path.clone());
+                        let snapshot = topology::TopologySnapshot::load_with_workspace(
+                            &db,
+                            &project.repo_path,
+                            &cwd,
+                        )
+                        .await?;
+                        let seed_sources = collect_seed_sources(
+                            &project.repo_path,
+                            &snapshot,
+                            &selection_opts,
+                            &issue.affected_symbols,
+                            &[],
+                        )?;
+                        let selection = select_topology_files(
+                            &snapshot,
+                            &selection_opts,
+                            seed_sources,
+                            options.depth,
+                            options.limit,
+                        )?;
+                        let blocks = build_topology_blocks(&db, &selection, options.per_file).await?;
+                        let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+                        let prompt_tokenizer_value = cfg.prompt.tokenizer.clone();
+                        let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
+                            tokenizer
+                        } else {
+                            parse_tokenizer(&prompt_tokenizer_value)?
+                        };
+                        let budget = assembly::pipeline::BudgetOptions {
+                            max_tokens: Some(cfg.embedding.context_length),
+                            reserved_output_tokens: 0,
+                            tokenizer: Some(prompt_tokenizer),
+                        };
+                        let max_blocks = options.limit.saturating_mul(options.per_file.max(1));
+                        let noop = NoopReranker;
+                        let ctx = assembly::AssemblyContext {
+                            repo_path: &project.repo_path,
+                            db: &db,
+                            embedder: None,
+                            reranker: &noop,
+                            config: &cfg,
+                            selection: selection_opts,
+                        };
+                        let (blocks, warnings) =
+                            budget_blocks(&ctx, blocks, selection.warnings, &budget, max_blocks)
+                                .await?;
+
+                        let enriched =
+                            assembly::output::enrich_blocks(&project.repo_path, &db, &blocks).await?;
+                        let overview =
+                            assembly::output::build_repository_overview(&project.repo_path, &db).await;
+                        let payload = assembly::output::PromptPayload {
+                            overview,
+                            task: issue.title.clone(),
+                            blocks: enriched,
+                            warnings,
+                        };
+                        let rendered =
+                            assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
+                        print!("{rendered}");
+                    }
+                }
+                config::IssueCommand::Next(options) => {
+                    let issues = db.list_all_issues().await?;
+                    let suggestions = issue_analysis::suggest_next_tasks(
+                        &issues,
+                        options.assignee.as_deref(),
+                        options.limit,
+                    )?;
+                    if suggestions.is_empty() {
+                        println!("No ready issues found.");
+                    } else {
+                        for suggestion in suggestions {
+                            let issue = suggestion.issue;
+                            let blockers = if suggestion.blockers.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" blockers={}", suggestion.blockers.join(","))
+                            };
+                            println!(
+                                "{id} [{status}] p{priority} {title} ({reason}){blockers}",
+                                id = issue.id,
+                                status = issue.status,
+                                priority = issue.priority,
+                                title = issue.title,
+                                reason = suggestion.reason,
+                                blockers = blockers
+                            );
+                        }
+                    }
+                }
+                config::IssueCommand::Stale(options) => {
+                    let issues = db.list_all_issues().await?;
+                    let stale = issue_analysis::find_stale_issues(
+                        &issues,
+                        options.days,
+                        options.assignee.as_deref(),
+                        options.status.as_deref(),
+                        options.limit,
+                    )?;
+                    if stale.is_empty() {
+                        println!("No stale issues found.");
+                    } else {
+                        for entry in stale {
+                            println!(
+                                "{id} [{status}] p{priority} stale={days}d {title}",
+                                id = entry.issue.id,
+                                status = entry.issue.status,
+                                priority = entry.issue.priority,
+                                days = entry.days_inactive,
+                                title = entry.issue.title
+                            );
+                        }
+                    }
+                }
+                config::IssueCommand::Triage(options) => {
+                    let mut updated = 0usize;
+                    for id in &options.ids {
+                        let mut issue = db
+                            .get_issue(id)
+                            .await?
+                            .ok_or_else(|| eyre!("issue not found: {}", id))?;
+                        if let Some(status) = &options.status {
+                            issue.status = status.clone();
+                        }
+                        if let Some(priority) = options.priority {
+                            issue.priority = priority;
+                        }
+                        if let Some(assignee) = &options.assignee {
+                            if assignee.trim().is_empty() {
+                                issue.assignee = None;
+                            } else {
+                                issue.assignee = Some(assignee.clone());
+                            }
+                        }
+                        issue.labels = issues::merge_tags(
+                            &issue.labels,
+                            &options.add_labels,
+                            &options.remove_labels,
+                        );
+                        issue.touch();
+                        db.upsert_issue(&issue).await?;
+                        updated += 1;
+                    }
+                    if updated > 0 {
+                        issues::export_to_jsonl(&db, &jsonl_path).await?;
+                    }
+                    println!("Triaged {} issues.", updated);
+                }
+                config::IssueCommand::Duplicates(options) => {
+                    let issues = db.list_all_issues().await?;
+                    let duplicates = issue_analysis::find_duplicates(
+                        &issues,
+                        options.threshold,
+                        options.limit,
+                    );
+                    if duplicates.is_empty() {
+                        println!("No duplicate issues found.");
+                    } else {
+                        for pair in duplicates {
+                            println!(
+                                "{a} <-> {b} similarity={:.2} ({title_a} / {title_b})",
+                                pair.similarity,
+                                a = pair.issue_a.id,
+                                b = pair.issue_b.id,
+                                title_a = pair.issue_a.title,
+                                title_b = pair.issue_b.title
+                            );
+                        }
+                    }
+                }
+                config::IssueCommand::Related(options) => {
+                    let issues = db.list_all_issues().await?;
+                    if let Some(file) = &options.file {
+                        let related =
+                            issue_analysis::related_issues_for_file(&issues, file, options.limit);
+                        if related.is_empty() {
+                            println!("No related issues found for {}", file);
+                        } else {
+                            for entry in related {
+                                println!(
+                                    "{id} [{status}] score={score:.2} {title} reasons={reasons}",
+                                    id = entry.issue.id,
+                                    status = entry.issue.status,
+                                    score = entry.score,
+                                    title = entry.issue.title,
+                                    reasons = entry.reasons.join(",")
+                                );
+                            }
+                        }
+                    } else if let Some(id) = &options.issue {
+                        let issue = db
+                            .get_issue(id)
+                            .await?
+                            .ok_or_else(|| eyre!("issue not found: {}", id))?;
+                        let related = issue_analysis::related_issues_for_issue(
+                            &issues,
+                            &issue,
+                            options.limit,
+                        );
+                        if related.is_empty() {
+                            println!("No related issues found for {}", issue.id);
+                        } else {
+                            for entry in related {
+                                println!(
+                                    "{id} [{status}] score={score:.2} {title} reasons={reasons}",
+                                    id = entry.issue.id,
+                                    status = entry.issue.status,
+                                    score = entry.score,
+                                    title = entry.issue.title,
+                                    reasons = entry.reasons.join(",")
+                                );
+                            }
+                        }
+                    } else {
+                        return Err(eyre!("--file or --issue is required"));
+                    }
+                }
+                config::IssueCommand::Infer(options) => match &options.command {
+                    config::IssueInferCommand::Error(inner) => {
+                        let draft = issue_analysis::infer_issue_from_error(&inner.message);
+                        let issues = db.list_all_issues().await?;
+                        println!("Suggested issue:");
+                        println!("  title: {}", draft.title);
+                        println!("  type: {}", draft.issue_type);
+                        if !draft.labels.is_empty() {
+                            println!("  labels: {}", draft.labels.join(", "));
+                        }
+                        if !draft.affected_symbols.is_empty() {
+                            println!(
+                                "  affected_symbols: {}",
+                                draft.affected_symbols.join(", ")
+                            );
+                        }
+                        println!("  description: {}", draft.description);
+
+                        let results = db.search_issues(&inner.message, inner.limit).await?;
+                        if !results.is_empty() {
+                            println!("\nMatching issues:");
+                            for result in results {
+                                println!(
+                                    "  {id} [{status}] score={score:.2} {title}",
+                                    id = result.issue.id,
+                                    status = result.issue.status,
+                                    score = result.score,
+                                    title = result.issue.title
+                                );
+                            }
+                        }
+
+                        let related =
+                            issue_analysis::group_related_issues_by_file(&issues, &draft.affected_symbols, inner.limit);
+                        for (file, entries) in related {
+                            println!("\nRelated issues for {}:", file);
+                            for entry in entries {
+                                println!(
+                                    "  {id} [{status}] score={score:.2} {title}",
+                                    id = entry.issue.id,
+                                    status = entry.issue.status,
+                                    score = entry.score,
+                                    title = entry.issue.title
+                                );
+                            }
+                        }
+                    }
+                    config::IssueInferCommand::Diff(inner) => {
+                        let diff_text = if let Some(path) = &inner.path {
+                            std::fs::read_to_string(path)?
+                        } else {
+                            let mut args = vec!["diff", "--name-only"];
+                            if let Some(range) = &inner.range {
+                                args.push(range);
+                            }
+                            let output = std::process::Command::new("git")
+                                .args(args)
+                                .current_dir(&project.repo_path)
+                                .output()?;
+                            String::from_utf8_lossy(&output.stdout).to_string()
+                        };
+                        let draft = issue_analysis::infer_issue_from_diff(&diff_text);
+                        println!("Suggested issue:");
+                        println!("  title: {}", draft.title);
+                        println!("  type: {}", draft.issue_type);
+                        if !draft.labels.is_empty() {
+                            println!("  labels: {}", draft.labels.join(", "));
+                        }
+                        if !draft.affected_symbols.is_empty() {
+                            println!(
+                                "  affected_symbols: {}",
+                                draft.affected_symbols.join(", ")
+                            );
+                        }
+                        println!("  description:\n{}", draft.description);
+
+                        let issues = db.list_all_issues().await?;
+                        let related =
+                            issue_analysis::group_related_issues_by_file(&issues, &draft.affected_symbols, inner.limit);
+                        for (file, entries) in related {
+                            println!("\nRelated issues for {}:", file);
+                            for entry in entries {
+                                println!(
+                                    "  {id} [{status}] score={score:.2} {title}",
+                                    id = entry.issue.id,
+                                    status = entry.issue.status,
+                                    score = entry.score,
+                                    title = entry.issue.title
+                                );
+                            }
+                        }
+                    }
+                    config::IssueInferCommand::Todo(inner) => {
+                        let content = std::fs::read_to_string(&inner.file)?;
+                        let drafts = issue_analysis::infer_issues_from_todos(
+                            &inner.file,
+                            &content,
+                            inner.limit,
+                        );
+                        if drafts.is_empty() {
+                            println!("No TODOs found in {}", inner.file);
+                        } else {
+                            println!("Suggested issues:");
+                            for draft in drafts {
+                                println!("  title: {}", draft.title);
+                                println!("  type: {}", draft.issue_type);
+                                if !draft.labels.is_empty() {
+                                    println!("  labels: {}", draft.labels.join(", "));
+                                }
+                                println!("  affected_symbols: {}", draft.affected_symbols.join(", "));
+                                println!("  description: {}", draft.description);
+                                println!("---");
+                            }
+                        }
+                        let issues = db.list_all_issues().await?;
+                        let related =
+                            issue_analysis::related_issues_for_file(&issues, &inner.file, inner.limit);
+                        if !related.is_empty() {
+                            println!("\nRelated issues for {}:", inner.file);
+                            for entry in related {
+                                println!(
+                                    "  {id} [{status}] score={score:.2} {title}",
+                                    id = entry.issue.id,
+                                    status = entry.issue.status,
+                                    score = entry.score,
+                                    title = entry.issue.title
+                                );
+                            }
+                        }
+                    }
+                },
             }
         }
     }
@@ -492,8 +1303,127 @@ fn project_override(command: &Command) -> Option<&str> {
         Command::Search(cmd) => cmd.project.project.as_deref(),
         Command::Prompt(cmd) => cmd.project.project.as_deref(),
         Command::Topology(cmd) => cmd.project.project.as_deref(),
+        Command::Issue(cmd) => cmd.project.project.as_deref(),
         Command::Config(_) => None,
     }
+}
+
+fn print_issue_summary(issue: &issues::Issue) {
+    let labels = if issue.labels.is_empty() {
+        String::new()
+    } else {
+        format!(" labels={}", issue.labels.join(","))
+    };
+    let assignee = issue
+        .assignee
+        .as_ref()
+        .map(|value| format!(" assignee={value}"))
+        .unwrap_or_default();
+    println!(
+        "{id} [{status}] p{priority} {title}{assignee}{labels}",
+        id = issue.id,
+        status = issue.status,
+        priority = issue.priority,
+        title = issue.title,
+        assignee = assignee,
+        labels = labels
+    );
+}
+
+fn print_issue(issue: &issues::Issue) {
+    println!("id: {}", issue.id);
+    println!("title: {}", issue.title);
+    println!("status: {}", issue.status);
+    println!("priority: {}", issue.priority);
+    println!("type: {}", issue.issue_type);
+    if let Some(assignee) = &issue.assignee {
+        println!("assignee: {assignee}");
+    }
+    if !issue.labels.is_empty() {
+        println!("labels: {}", issue.labels.join(", "));
+    }
+    if !issue.dependencies.is_empty() {
+        println!("dependencies: {}", format_dependencies(&issue.dependencies));
+    }
+    if !issue.relates_to.is_empty() {
+        println!("relates_to: {}", issue.relates_to.join(", "));
+    }
+    if !issue.affected_symbols.is_empty() {
+        println!("affected_symbols: {}", issue.affected_symbols.join(", "));
+    }
+    if !issue.external_refs.is_empty() {
+        println!("external_refs: {}", format_external_refs(&issue.external_refs));
+    }
+    if let Some(estimate) = issue.estimate_minutes {
+        println!("estimate_minutes: {}", estimate);
+    }
+    if let Some(duplicate_of) = &issue.duplicate_of {
+        println!("duplicate_of: {}", duplicate_of);
+    }
+    if let Some(superseded_by) = &issue.superseded_by {
+        println!("superseded_by: {}", superseded_by);
+    }
+    if let Some(deleted_at) = &issue.deleted_at {
+        println!("deleted_at: {}", deleted_at);
+    }
+    if let Some(deleted_by) = &issue.deleted_by {
+        println!("deleted_by: {}", deleted_by);
+    }
+    if let Some(deleted_reason) = &issue.deleted_reason {
+        println!("deleted_reason: {}", deleted_reason);
+    }
+    if !issue.description.trim().is_empty() {
+        println!("\ndescription:\n{}", issue.description);
+    }
+    if !issue.design.trim().is_empty() {
+        println!("\ndesign:\n{}", issue.design);
+    }
+    if !issue.acceptance_criteria.trim().is_empty() {
+        println!("\nacceptance:\n{}", issue.acceptance_criteria);
+    }
+    if !issue.notes.trim().is_empty() {
+        println!("\nnotes:\n{}", issue.notes);
+    }
+    if !issue.comments.is_empty() {
+        println!("\ncomments:");
+        for comment in &issue.comments {
+            let author = comment.author.as_deref().unwrap_or("unknown");
+            println!("  {} {author}: {}", comment.created_at, comment.body);
+        }
+    }
+    println!("created_at: {}", issue.created_at);
+    println!("updated_at: {}", issue.updated_at);
+    if let Some(closed_at) = &issue.closed_at {
+        println!("closed_at: {}", closed_at);
+    }
+}
+
+fn format_dependencies(values: &[issues::IssueDependency]) -> String {
+    values
+        .iter()
+        .map(|dep| {
+            if dep.kind.trim().is_empty() {
+                dep.id.clone()
+            } else {
+                format!("{}:{}", dep.id, dep.kind)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_external_refs(values: &[issues::IssueExternalRef]) -> String {
+    values
+        .iter()
+        .map(|reference| {
+            if reference.kind.trim().is_empty() {
+                reference.value.clone()
+            } else {
+                format!("{}:{}", reference.kind, reference.value)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(crate) fn build_embedder(cfg: &config::Embedding) -> Result<EmbedClient> {

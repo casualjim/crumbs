@@ -330,6 +330,8 @@ pub enum Command {
     Prompt(PromptCli),
     #[command(about = "Analyze dependency topology and suggest refactors")]
     Topology(TopologyCli),
+    #[command(about = "Manage local issues and topology context")]
+    Issue(IssueCli),
     #[command(about = "Manage configuration files")]
     Config(ConfigCli),
 }
@@ -473,6 +475,44 @@ pub struct TopologyCli {
     pub command: TopologyCommand,
 }
 
+#[derive(Args)]
+pub struct IssueCli {
+    #[command(flatten)]
+    pub project: ProjectCli,
+    #[command(subcommand)]
+    pub command: IssueCommand,
+}
+
+#[derive(Subcommand)]
+pub enum IssueCommand {
+    #[command(about = "Create a new issue")]
+    Create(IssueCreateCli),
+    #[command(about = "Update an existing issue")]
+    Update(IssueUpdateCli),
+    #[command(about = "Close an issue")]
+    Close(IssueCloseCli),
+    #[command(about = "Show issue details")]
+    Get(IssueGetCli),
+    #[command(about = "List issues")]
+    List(IssueListCli),
+    #[command(about = "Search issues by text")]
+    Search(IssueSearchCli),
+    #[command(about = "Assemble issue context (topology or semantic search)")]
+    Context(IssueContextCli),
+    #[command(about = "Suggest the next task to work on")]
+    Next(IssueNextCli),
+    #[command(about = "Show stale issues by last update time")]
+    Stale(IssueStaleCli),
+    #[command(about = "Apply a triage update to multiple issues")]
+    Triage(IssueTriageCli),
+    #[command(about = "Find potential duplicate issues")]
+    Duplicates(IssueDuplicatesCli),
+    #[command(about = "Find issues related to a file or issue")]
+    Related(IssueRelatedCli),
+    #[command(about = "Infer issues from errors, diffs, or TODOs")]
+    Infer(IssueInferCli),
+}
+
 #[derive(Subcommand)]
 pub enum TopologyCommand {
     #[command(about = "Show topology summary metrics")]
@@ -481,10 +521,24 @@ pub enum TopologyCommand {
     Cycles(TopologyCyclesCli),
     #[command(about = "Show a star neighborhood around a file")]
     Star(TopologyStarCli),
+    #[command(about = "Find shortest dependency path between two files")]
+    Path(TopologyPathCli),
+    #[command(about = "List topological volumes (triangle clusters)")]
+    Volumes(TopologyVolumesCli),
+    #[command(about = "Check layer dependency invariants")]
+    Layers(TopologyLayersCli),
     #[command(about = "Suggest edges to cut to break cycles")]
     Refactor(TopologyRefactorCli),
     #[command(about = "Assemble a topology-driven mini codebase")]
     Assemble(TopologyAssembleCli),
+    #[command(about = "Export topology graph data")]
+    Export(TopologyExportCli),
+    #[command(about = "Save a topology snapshot into the database")]
+    Snapshot(TopologySnapshotCli),
+    #[command(about = "Diff current topology against a stored snapshot")]
+    Diff(TopologyDiffCli),
+    #[command(about = "Show most connected files by PageRank")]
+    Hotspots(TopologyHotspotsCli),
 }
 
 #[derive(Args)]
@@ -517,6 +571,28 @@ pub struct TopologyStarCli {
     pub depth: usize,
     #[arg(long = "limit", default_value_t = 25, help = "Limit results")]
     pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct TopologyPathCli {
+    #[arg(long = "start", value_name = "PATH", help = "Start file path")]
+    pub start: String,
+    #[arg(long = "end", value_name = "PATH", help = "End file path")]
+    pub end: String,
+}
+
+#[derive(Args)]
+pub struct TopologyVolumesCli {
+    #[arg(long = "limit", default_value_t = 10, help = "Limit volumes shown")]
+    pub limit: usize,
+    #[arg(long = "max-triangles", default_value_t = 5000, help = "Limit triangles analyzed")]
+    pub max_triangles: usize,
+}
+
+#[derive(Args)]
+pub struct TopologyLayersCli {
+    #[arg(long = "config", value_name = "PATH", help = "Layer config file (json or yaml)")]
+    pub config: Option<String>,
 }
 
 #[derive(Args)]
@@ -581,6 +657,298 @@ pub struct TopologyAssembleCli {
     pub task: String,
 }
 
+#[derive(Args)]
+pub struct TopologyExportCli {
+    #[arg(long = "output", value_name = "PATH", help = "Output file path")]
+    pub output: String,
+    #[arg(long = "format", default_value = "json", help = "Format: json or dot")]
+    pub format: String,
+    #[arg(long = "include-cochange", help = "Include cochange edges in export")]
+    pub include_cochange: bool,
+}
+
+#[derive(Args)]
+pub struct TopologySnapshotCli {
+    #[arg(long = "name", value_name = "NAME", help = "Snapshot name")]
+    pub name: String,
+}
+
+#[derive(Args)]
+pub struct TopologyDiffCli {
+    #[arg(long = "name", value_name = "NAME", help = "Snapshot name to diff against")]
+    pub name: String,
+    #[arg(long = "limit", default_value_t = 20, help = "Limit edges shown per section")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct TopologyHotspotsCli {
+    #[arg(long = "limit", default_value_t = 10, help = "Limit results")]
+    pub limit: usize,
+    #[arg(long = "iterations", default_value_t = 50, help = "PageRank iterations")]
+    pub iterations: usize,
+    #[arg(long = "damping", default_value_t = 0.85, help = "PageRank damping factor")]
+    pub damping: f64,
+}
+
+#[derive(Args)]
+pub struct IssueCreateCli {
+    #[arg(value_name = "TITLE", help = "Issue title")]
+    pub title: String,
+    #[arg(short = 'd', long = "description", help = "Issue description")]
+    pub description: Option<String>,
+    #[arg(long = "design", help = "Design notes")]
+    pub design: Option<String>,
+    #[arg(long = "acceptance", help = "Acceptance criteria")]
+    pub acceptance_criteria: Option<String>,
+    #[arg(long = "notes", help = "Additional notes")]
+    pub notes: Option<String>,
+    #[arg(long = "status", default_value = "open", help = "Status (open, in-progress, blocked, closed)")]
+    pub status: String,
+    #[arg(long = "priority", default_value_t = 3, help = "Priority (1-5)")]
+    pub priority: i32,
+    #[arg(long = "type", default_value = "task", help = "Issue type (task, bug, chore)")]
+    pub issue_type: String,
+    #[arg(long = "assignee", help = "Assignee name")]
+    pub assignee: Option<String>,
+    #[arg(long = "label", value_delimiter = ',', num_args = 0.., help = "Labels (comma-separated)")]
+    pub labels: Vec<String>,
+    #[arg(long = "depends-on", value_delimiter = ',', num_args = 0.., help = "Dependencies (comma-separated IDs or id:kind)")]
+    pub dependencies: Vec<String>,
+    #[arg(long = "relates-to", value_delimiter = ',', num_args = 0.., help = "Related issues (comma-separated IDs)")]
+    pub relates_to: Vec<String>,
+    #[arg(long = "add-symbol", value_delimiter = ',', num_args = 0.., help = "Affected symbols or files")]
+    pub affected_symbols: Vec<String>,
+    #[arg(long = "external-ref", value_delimiter = ',', num_args = 0.., help = "External refs (kind:value or value)")]
+    pub external_refs: Vec<String>,
+    #[arg(long = "estimate-minutes", help = "Estimated effort in minutes")]
+    pub estimate_minutes: Option<i32>,
+    #[arg(long = "duplicate-of", help = "Mark as duplicate of issue ID")]
+    pub duplicate_of: Option<String>,
+    #[arg(long = "superseded-by", help = "Mark as superseded by issue ID")]
+    pub superseded_by: Option<String>,
+    #[arg(long = "comment", value_delimiter = ',', num_args = 0.., help = "Initial comments")]
+    pub comments: Vec<String>,
+    #[arg(long = "comment-author", help = "Comment author name")]
+    pub comment_author: Option<String>,
+}
+
+#[derive(Args)]
+pub struct IssueUpdateCli {
+    #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
+    pub id: String,
+    #[arg(long = "title", help = "Update title")]
+    pub title: Option<String>,
+    #[arg(short = 'd', long = "description", help = "Update description")]
+    pub description: Option<String>,
+    #[arg(long = "design", help = "Update design notes")]
+    pub design: Option<String>,
+    #[arg(long = "acceptance", help = "Update acceptance criteria")]
+    pub acceptance_criteria: Option<String>,
+    #[arg(long = "notes", help = "Update notes")]
+    pub notes: Option<String>,
+    #[arg(long = "status", help = "Update status")]
+    pub status: Option<String>,
+    #[arg(long = "priority", help = "Update priority")]
+    pub priority: Option<i32>,
+    #[arg(long = "type", help = "Update issue type")]
+    pub issue_type: Option<String>,
+    #[arg(long = "assignee", help = "Update assignee (empty string clears)")]
+    pub assignee: Option<String>,
+    #[arg(long = "add-label", value_delimiter = ',', num_args = 0.., help = "Labels to add")]
+    pub add_labels: Vec<String>,
+    #[arg(long = "remove-label", value_delimiter = ',', num_args = 0.., help = "Labels to remove")]
+    pub remove_labels: Vec<String>,
+    #[arg(long = "add-dependency", value_delimiter = ',', num_args = 0.., help = "Dependencies to add (id or id:kind)")]
+    pub add_dependencies: Vec<String>,
+    #[arg(long = "remove-dependency", value_delimiter = ',', num_args = 0.., help = "Dependencies to remove (id or id:kind)")]
+    pub remove_dependencies: Vec<String>,
+    #[arg(long = "add-related", value_delimiter = ',', num_args = 0.., help = "Related issues to add")]
+    pub add_related: Vec<String>,
+    #[arg(long = "remove-related", value_delimiter = ',', num_args = 0.., help = "Related issues to remove")]
+    pub remove_related: Vec<String>,
+    #[arg(long = "add-symbol", value_delimiter = ',', num_args = 0.., help = "Affected symbols or files to add")]
+    pub add_symbols: Vec<String>,
+    #[arg(long = "remove-symbol", value_delimiter = ',', num_args = 0.., help = "Affected symbols or files to remove")]
+    pub remove_symbols: Vec<String>,
+    #[arg(long = "add-external-ref", value_delimiter = ',', num_args = 0.., help = "External refs to add (kind:value or value)")]
+    pub add_external_refs: Vec<String>,
+    #[arg(long = "remove-external-ref", value_delimiter = ',', num_args = 0.., help = "External refs to remove")]
+    pub remove_external_refs: Vec<String>,
+    #[arg(long = "estimate-minutes", help = "Set estimate in minutes")]
+    pub estimate_minutes: Option<i32>,
+    #[arg(long = "clear-estimate", help = "Clear estimate")]
+    pub clear_estimate: bool,
+    #[arg(long = "duplicate-of", help = "Set duplicate-of issue ID (empty clears)")]
+    pub duplicate_of: Option<String>,
+    #[arg(long = "clear-duplicate", help = "Clear duplicate-of")]
+    pub clear_duplicate: bool,
+    #[arg(long = "superseded-by", help = "Set superseded-by issue ID (empty clears)")]
+    pub superseded_by: Option<String>,
+    #[arg(long = "clear-superseded", help = "Clear superseded-by")]
+    pub clear_superseded: bool,
+    #[arg(long = "add-comment", value_delimiter = ',', num_args = 0.., help = "Append comments")]
+    pub add_comments: Vec<String>,
+    #[arg(long = "comment-author", help = "Comment author name")]
+    pub comment_author: Option<String>,
+    #[arg(long = "mark-deleted", help = "Mark issue as deleted")]
+    pub mark_deleted: bool,
+    #[arg(long = "deleted-by", help = "Deleted-by identifier")]
+    pub deleted_by: Option<String>,
+    #[arg(long = "deleted-reason", help = "Deletion reason")]
+    pub deleted_reason: Option<String>,
+    #[arg(long = "restore", help = "Clear deletion metadata")]
+    pub restore: bool,
+}
+
+#[derive(Args)]
+pub struct IssueCloseCli {
+    #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct IssueGetCli {
+    #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct IssueListCli {
+    #[arg(long = "status", help = "Filter by status")]
+    pub status: Option<String>,
+    #[arg(long = "assignee", help = "Filter by assignee")]
+    pub assignee: Option<String>,
+    #[arg(long = "label", help = "Filter by label")]
+    pub label: Option<String>,
+    #[arg(long = "type", help = "Filter by issue type")]
+    pub issue_type: Option<String>,
+    #[arg(long = "priority", help = "Filter by priority")]
+    pub priority: Option<i32>,
+    #[arg(long = "limit", help = "Limit results")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Args)]
+pub struct IssueSearchCli {
+    #[arg(value_name = "QUERY", help = "Search query")]
+    pub query: String,
+    #[arg(long = "limit", default_value_t = 10, help = "Limit results")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct IssueContextCli {
+    #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
+    pub id: String,
+    #[arg(long = "depth", default_value_t = 1, help = "Topology depth for context assembly")]
+    pub depth: usize,
+    #[arg(long = "limit", default_value_t = 25, help = "Maximum files to include")]
+    pub limit: usize,
+    #[arg(long = "per-file", default_value_t = 5, help = "Maximum chunks per file")]
+    pub per_file: usize,
+    #[arg(long = "sections", value_enum, value_delimiter = ',', num_args = 1.., help = "Sections to include")]
+    pub sections: Vec<PromptSection>,
+    #[arg(long = "theme", default_value = "", help = "Syntax theme name")]
+    pub theme: String,
+}
+
+#[derive(Args)]
+pub struct IssueNextCli {
+    #[arg(long = "assignee", help = "Filter by assignee")]
+    pub assignee: Option<String>,
+    #[arg(long = "limit", default_value_t = 5, help = "Limit results")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct IssueStaleCli {
+    #[arg(long = "days", default_value_t = 30, help = "Days since last update")]
+    pub days: i64,
+    #[arg(long = "assignee", help = "Filter by assignee")]
+    pub assignee: Option<String>,
+    #[arg(long = "status", help = "Filter by status")]
+    pub status: Option<String>,
+    #[arg(long = "limit", default_value_t = 50, help = "Limit results")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct IssueTriageCli {
+    #[arg(value_name = "ID", num_args = 1.., help = "Issue IDs (or prefixes)")]
+    pub ids: Vec<String>,
+    #[arg(long = "status", help = "Status to set")]
+    pub status: Option<String>,
+    #[arg(long = "priority", help = "Priority to set")]
+    pub priority: Option<i32>,
+    #[arg(long = "assignee", help = "Assignee to set (empty clears)")]
+    pub assignee: Option<String>,
+    #[arg(long = "add-label", value_delimiter = ',', num_args = 0.., help = "Labels to add")]
+    pub add_labels: Vec<String>,
+    #[arg(long = "remove-label", value_delimiter = ',', num_args = 0.., help = "Labels to remove")]
+    pub remove_labels: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct IssueDuplicatesCli {
+    #[arg(long = "threshold", default_value_t = 0.5, help = "Similarity threshold (0-1)")]
+    pub threshold: f64,
+    #[arg(long = "limit", default_value_t = 20, help = "Limit results")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct IssueRelatedCli {
+    #[arg(long = "file", value_name = "PATH", conflicts_with = "issue", help = "File path to match")]
+    pub file: Option<String>,
+    #[arg(long = "issue", value_name = "ID", conflicts_with = "file", help = "Issue ID to match")]
+    pub issue: Option<String>,
+    #[arg(long = "limit", default_value_t = 10, help = "Limit results")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct IssueInferCli {
+    #[command(subcommand)]
+    pub command: IssueInferCommand,
+}
+
+#[derive(Subcommand)]
+pub enum IssueInferCommand {
+    #[command(about = "Infer an issue from an error message")]
+    Error(IssueInferErrorCli),
+    #[command(about = "Infer an issue from a git diff")]
+    Diff(IssueInferDiffCli),
+    #[command(about = "Infer issues from TODO comments in a file")]
+    Todo(IssueInferTodoCli),
+}
+
+#[derive(Args)]
+pub struct IssueInferErrorCli {
+    #[arg(value_name = "MESSAGE", help = "Error message text")]
+    pub message: String,
+    #[arg(long = "limit", default_value_t = 5, help = "Limit related issues shown")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct IssueInferDiffCli {
+    #[arg(long = "path", value_name = "PATH", help = "Path to a diff file")]
+    pub path: Option<String>,
+    #[arg(long = "range", value_name = "RANGE", help = "Git diff range (e.g. HEAD~1..HEAD)")]
+    pub range: Option<String>,
+    #[arg(long = "limit", default_value_t = 10, help = "Limit related issues shown")]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct IssueInferTodoCli {
+    #[arg(long = "file", value_name = "PATH", help = "File to scan for TODOs")]
+    pub file: String,
+    #[arg(long = "limit", default_value_t = 10, help = "Limit TODOs processed")]
+    pub limit: usize,
+}
+
 #[derive(ValueEnum, Clone, Debug, Eq, PartialEq)]
 pub enum PromptSection {
     Structure,
@@ -639,6 +1007,7 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
             cli_layer.prompt = cmd.prompt.clone();
         }
         Command::Topology(_) => {}
+        Command::Issue(_) => {}
         Command::Config(_) => {}
     }
 
@@ -714,6 +1083,7 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
 pub struct ResolvedProject {
     pub repo_path: PathBuf,
     pub database_path: PathBuf,
+    pub data_dir: PathBuf,
 }
 
 pub fn resolve_project(
@@ -807,6 +1177,7 @@ fn build_resolved_project(
     Ok(ResolvedProject {
         repo_path,
         database_path,
+        data_dir,
     })
 }
 
@@ -1179,7 +1550,7 @@ fn canonical_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn find_git_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn find_git_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
         if current.join(".git").exists() {
