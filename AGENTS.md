@@ -2,29 +2,56 @@
 
 > **Important:** Prefer the `mise` tasks for installs, builds, tests, and formatting. Only use raw toolchain commands when no `mise` wrapper exists, and call that out explicitly.
 >
-> **CRITICAL: Use the Rust LSP for all code navigation!** Do NOT use grep/find/rg or manual file browsing - the Rust LSP provides accurate, fast, type-aware navigation. See the "Code Navigation (Use Rust LSP!)" section for detailed commands.
->
 > **CRITICAL: Do NOT run git mutations without explicit approval from the user** Do NOT ever run git checkout/revert/restore/reset without EXPLICIT APPROVAL from the USER
+
+## Tool Preference Order
+
+When working with code, **strongly prefer** higher-priority tools over lower-priority ones. Only fall back to lower-priority tools if the higher ones aren't sufficient:
+
+### 1. Language Server Protocol (LSP) Tools - HIGHEST PRIORITY
+- **Rust**: `rust-lsp` (e.g., `mcp__rust-lsp__search`, `mcp__rust-lsp__outline`, `mcp__rust-lsp__references`)
+- **TypeScript**: `typescript-lsp`
+- **Go**: `golang-lsp`
+
+**Why LSP first?** Type-aware, accurate, context-sensitive, IDE-quality navigation and refactoring.
+
+### 2. Code Index Tools - SECOND PRIORITY
+- Faster than raw text search tools
+- Indexed file and symbol search
+- Use when LSP doesn't provide what you need or for cross-language searches
+
+### 3. Default CLI Tools - FALLBACK ONLY
+- `rg` (ripgrep), `grep`, `fd`, `find`, `cat`, `ls`, `sed`, etc.
+- Use only when LSP and Code Index can't accomplish the task
+- Still useful for non-code files or when you need regex patterns across arbitrary text
+
+### GitHub Operations
+- **Always use `gh` CLI** for GitHub operations (PRs, issues, repos, etc.)
+- Examples: `gh pr list`, `gh issue create`, `gh repo view`
 
 ## Build, Test, and Development Commands
 Always default to the `mise` tasks below; only run direct toolchain commands if no `mise` wrapper exists and note the deviation.
 
-**For rust code navigation and understanding, use the Rust LSP!** See the "Code Navigation (Use Rust LSP!)" section above for detailed commands.
+**For code navigation and understanding, follow the Tool Preference Order above!** See the "Code Navigation with LSP" section for detailed LSP commands.
 
 - `mise install`: Install pinned Rust, Bun, Wrangler, etc.
-- `mise build:debug`: Build Rust
-- `mise test`: All tests (Rust nextest + Workers via bun test).
+- `mise format`: Quick Checks for this codebase
+- `mise test`: All tests (Rust nextest).
 
-## Code Navigation (Use Rust LSP!)
+**IMPORTANT** after changes ALWAYS run `mise format` and if you modified rust code also `mise test`
 
-**IMPORTANT: Always use the Rust LSP for rust code navigation!** The Rust LSP should be your primary tool for:
+## Code Navigation with LSP
+
+**IMPORTANT: Follow the Tool Preference Order!** LSP tools are your PRIMARY navigation method for supported languages (Rust, TypeScript, Go).
+
+LSP tools should be used for:
 - Finding symbols and definitions
 - Navigating to references
 - Getting function signatures and documentation
 - Understanding code structure
 - Finding implementations and usages
 
-**Prefer Rust LSP over:** grep/find/rg, manual file browsing, or any other navigation method!
+**Only fall back to Code Index or CLI tools** when LSP doesn't provide what you need (e.g., cross-language searches, regex patterns, non-code files).
 
 ### Rust LSP Commands Available
 
@@ -72,15 +99,15 @@ mcp__rust-lsp__inspect "crates/embedding/src/lib.rs" 127 1
 mcp__rust-lsp__completion "crates/slipstreamd/src/routes.rs" 42 20
 ```
 
-### Why Use Rust LSP?
+### Why Use LSP First?
 
-- **Accurate**: Understands Rust's type system and module resolution
+- **Accurate**: Understands the language's type system and module resolution
 - **Fast**: Instant navigation without scanning files
-- **Context-aware**: Knows about imports, traits, generics
+- **Context-aware**: Knows about imports, traits, generics, interfaces
 - **Complete**: Shows parameters, return types, documentation
 - **IDE-quality**: Same experience as modern IDEs
 
-**Remember: When you need to understand or navigate code, reach for the Rust LSP first!**
+**Remember: Follow the Tool Preference Order - LSP first, Code Index second, CLI tools as fallback!**
 
 
 > REMINDER:

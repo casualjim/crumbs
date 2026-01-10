@@ -42,9 +42,7 @@ impl<'a> IndexProcessor<'a> {
             .or_insert_with(|| PendingFile::new(file_size));
         entry.file_size = file_size;
         if !entry.file_row_ensured {
-            self.db
-                .ensure_file_row(&file_path, file_size, None)
-                .await?;
+            self.db.ensure_file_row(&file_path, file_size, None).await?;
             entry.file_row_ensured = true;
         }
 
@@ -55,13 +53,7 @@ impl<'a> IndexProcessor<'a> {
 
         let existing_id = self
             .db
-            .find_chunk_id(
-                &file_path,
-                start_byte,
-                end_byte,
-                kind,
-                chunk_hash,
-            )
+            .find_chunk_id(&file_path, start_byte, end_byte, kind, chunk_hash)
             .await?;
         let fts_text = build_fts_text(&text);
         let record = ChunkRecord {
@@ -93,10 +85,7 @@ impl<'a> IndexProcessor<'a> {
         };
 
         if kind == "semantic" {
-            let language = metadata
-                .language
-                .trim()
-                .to_string();
+            let language = metadata.language.trim().to_string();
             if !language.is_empty() {
                 entry.graph_language = Some(language.clone());
             }
@@ -106,13 +95,7 @@ impl<'a> IndexProcessor<'a> {
                 .unwrap_or("text")
                 .to_string();
             for name in metadata.definitions {
-                let id = stable_id(
-                    &file_path_value,
-                    "definition",
-                    start_byte,
-                    end_byte,
-                    &name,
-                );
+                let id = stable_id(&file_path_value, "definition", start_byte, end_byte, &name);
                 if entry.symbol_ids.insert(id.clone()) {
                     entry.symbols.push(SymbolRecord {
                         id,
@@ -126,13 +109,7 @@ impl<'a> IndexProcessor<'a> {
                 }
             }
             for name in metadata.references {
-                let id = stable_id(
-                    &file_path_value,
-                    "reference",
-                    start_byte,
-                    end_byte,
-                    &name,
-                );
+                let id = stable_id(&file_path_value, "reference", start_byte, end_byte, &name);
                 if entry.reference_ids.insert(id.clone()) {
                     entry.references.push(ReferenceRecord {
                         id,
@@ -214,7 +191,6 @@ impl<'a> IndexProcessor<'a> {
         );
         self.try_finalize_files(vec![file_path.to_string()]).await
     }
-
 }
 
 fn stable_id(

@@ -8,15 +8,16 @@ mod issue_analysis;
 mod issues;
 mod logging;
 mod progress;
-mod reqwestx;
 mod repository;
+mod reqwestx;
 mod reranker;
 mod search;
-mod topology;
 #[cfg(test)]
 mod test_support;
+mod topology;
 
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,14 +25,16 @@ use clap::Parser;
 use eyre::{Result, eyre};
 use text_chunking::Tokenizer;
 
+use crate::assembly::pipeline::{
+    AssembleContext, BudgetAndMerge, DefaultAssembleContext, DefaultBudgetAndMerge,
+};
 use crate::config::{Cli, Command};
 use crate::db::Db;
 use crate::embedding::{Client as EmbedClient, EmbedderConfig, ProviderDialect};
 use crate::indexer::{Indexer, IndexerConfig};
 use crate::issues::{IssueFilters, IssueSearchResult};
-use crate::assembly::pipeline::{AssembleContext, BudgetAndMerge, DefaultAssembleContext, DefaultBudgetAndMerge};
-use crate::reranker::{Client as RerankerClient, RerankerConfig, RerankingProvider};
 use crate::repository::Repository;
+use crate::reranker::{Client as RerankerClient, RerankerConfig, RerankingProvider};
 use crate::topology::RefactorOptions;
 
 struct NoopReranker;
@@ -45,7 +48,7 @@ impl RerankingProvider for NoopReranker {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _logging_guard = logging::init()?;
+    logging::init()?;
     let cli = Cli::parse();
 
     match &cli.command {
@@ -113,6 +116,16 @@ async fn main() -> Result<()> {
                 progress: None,
             };
             let results = search::search(&search_ctx, &cmd.query, search_config).await?;
+            let use_tty = std::io::stdout().is_terminal();
+            let mut language_cache: HashMap<String, String> = HashMap::new();
+            let prompt_theme = {
+                let theme = cfg.prompt.theme.trim();
+                if theme.is_empty() {
+                    None
+                } else {
+                    Some(theme.to_string())
+                }
+            };
             for (idx, result) in results.iter().enumerate() {
                 let mut score_line = format!("score={:.4}", result.score);
                 if let Some(vector) = result.vector_score {
@@ -121,13 +134,33 @@ async fn main() -> Result<()> {
                 if let Some(fts) = result.fts_score {
                     score_line.push_str(&format!(" fts={fts:.4}"));
                 }
+                let text = if use_tty {
+                    let language = if let Some(cached) = language_cache.get(&result.file_path) {
+                        cached.clone()
+                    } else {
+                        let detected = db
+                            .file_primary_language(&result.file_path)
+                            .await?
+                            .unwrap_or_else(|| "text".to_string());
+                        let normalized = normalize_search_language(&detected);
+                        language_cache.insert(result.file_path.clone(), normalized.clone());
+                        normalized
+                    };
+                    assembly::output::highlight_code(
+                        &result.text,
+                        &language,
+                        prompt_theme.as_deref(),
+                    )
+                } else {
+                    result.text.clone()
+                };
                 println!(
                     "{idx}. {path}:{start}-{end} {score_line}\n{text}\n",
                     idx = idx + 1,
                     path = result.file_path,
                     start = result.start_byte,
                     end = result.end_byte,
-                    text = result.text
+                    text = text
                 );
             }
         }
@@ -185,12 +218,9 @@ async fn main() -> Result<()> {
             let sections = resolve_sections(&cmd.sections);
 
             let (blocks, warnings) = if cmd.topology {
-                let snapshot = topology::TopologySnapshot::load_with_workspace(
-                    &db,
-                    &project.repo_path,
-                    &cwd,
-                )
-                .await?;
+                let snapshot =
+                    topology::TopologySnapshot::load_with_workspace(&db, &project.repo_path, &cwd)
+                        .await?;
                 let seed_sources = collect_seed_sources(
                     &project.repo_path,
                     &snapshot,
@@ -273,11 +303,8 @@ async fn main() -> Result<()> {
                 blocks: enriched,
                 warnings,
             };
-            let rendered = assembly::output::render_prompt(
-                &payload,
-                sections,
-                prompt_theme.as_deref(),
-            );
+            let rendered =
+                assembly::output::render_prompt(&payload, sections, prompt_theme.as_deref());
             if let Some(spinner) = spinner {
                 spinner.finish_and_clear();
             }
@@ -315,12 +342,9 @@ async fn main() -> Result<()> {
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
             let cwd = std::env::current_dir().unwrap_or_else(|_| project.repo_path.clone());
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
-            let snapshot = topology::TopologySnapshot::load_with_workspace(
-                &db,
-                &project.repo_path,
-                &cwd,
-            )
-            .await?;
+            let snapshot =
+                topology::TopologySnapshot::load_with_workspace(&db, &project.repo_path, &cwd)
+                    .await?;
 
             match &cmd.command {
                 config::TopologyCommand::Stats(options) => {
@@ -337,7 +361,10 @@ async fn main() -> Result<()> {
                         snapshot.stats.scc_count, snapshot.stats.cyclic_scc_count
                     );
                     println!("cyclic nodes: {}", snapshot.stats.cyclic_node_count);
-                    println!("cycles >= {}: {}", options.min_cycle_size, cycles_over_threshold);
+                    println!(
+                        "cycles >= {}: {}",
+                        options.min_cycle_size, cycles_over_threshold
+                    );
                     println!("betti_0: {}", snapshot.stats.betti_0);
                     println!("betti_1: {}", snapshot.stats.betti_1);
                     println!("betti_2: {}", snapshot.stats.betti_2);
@@ -353,7 +380,11 @@ async fn main() -> Result<()> {
                             .len()
                             .cmp(&a.nodes.len())
                             .then_with(|| b.cycle_rank.cmp(&a.cycle_rank))
-                            .then_with(|| b.total_weight.partial_cmp(&a.total_weight).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| {
+                                b.total_weight
+                                    .partial_cmp(&a.total_weight)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
                     });
                     for cycle in cycles.into_iter().take(options.limit) {
                         println!(
@@ -490,7 +521,11 @@ async fn main() -> Result<()> {
                         b.cut_score
                             .partial_cmp(&a.cut_score)
                             .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| {
+                                a.weight
+                                    .partial_cmp(&b.weight)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
                     });
                     if cuts.len() > options.limit {
                         cuts.truncate(options.limit);
@@ -567,11 +602,8 @@ async fn main() -> Result<()> {
                     };
                     let sections = resolve_sections(&options.sections);
                     let theme_value = resolve_theme_value(&options.theme, &cfg.prompt.theme);
-                    let rendered = assembly::output::render_prompt(
-                        &payload,
-                        sections,
-                        theme_value.as_deref(),
-                    );
+                    let rendered =
+                        assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
                     print!("{rendered}");
                 }
                 config::TopologyCommand::Export(options) => {
@@ -721,8 +753,10 @@ async fn main() -> Result<()> {
                         .superseded_by
                         .clone()
                         .filter(|value| !value.trim().is_empty());
-                    issue.comments =
-                        issues::build_comments(&options.comments, options.comment_author.as_deref());
+                    issue.comments = issues::build_comments(
+                        &options.comments,
+                        options.comment_author.as_deref(),
+                    );
                     db.upsert_issue(&issue).await?;
                     issues::export_to_jsonl(&db, &jsonl_path).await?;
                     println!("Created {}", issue.id);
@@ -814,8 +848,10 @@ async fn main() -> Result<()> {
                             issue.superseded_by = Some(value.clone());
                         }
                     }
-                    let new_comments =
-                        issues::build_comments(&options.add_comments, options.comment_author.as_deref());
+                    let new_comments = issues::build_comments(
+                        &options.add_comments,
+                        options.comment_author.as_deref(),
+                    );
                     if !new_comments.is_empty() {
                         issue.comments.extend(new_comments);
                     }
@@ -916,26 +952,33 @@ async fn main() -> Result<()> {
                             reserved_output_tokens: 0,
                             tokenizer: Some(tokenizer.clone()),
                         };
-                        let pipeline =
-                            assembly::pipeline::default_pipeline(&cfg, budget);
+                        let pipeline = assembly::pipeline::default_pipeline(&cfg, budget);
                         let mut arena = assembly::Arena::new();
                         let input = arena.insert(assembly::pipeline::QueryInput {
                             text: issue.summary_query(),
                         });
                         let handle = pipeline.run(&ctx, &mut arena, input).await?;
                         let assembled = arena.get(handle);
-                        let enriched =
-                            assembly::output::enrich_blocks(&project.repo_path, &db, &assembled.blocks).await?;
+                        let enriched = assembly::output::enrich_blocks(
+                            &project.repo_path,
+                            &db,
+                            &assembled.blocks,
+                        )
+                        .await?;
                         let overview =
-                            assembly::output::build_repository_overview(&project.repo_path, &db).await;
+                            assembly::output::build_repository_overview(&project.repo_path, &db)
+                                .await;
                         let payload = assembly::output::PromptPayload {
                             overview,
                             task: issue.title.clone(),
                             blocks: enriched,
                             warnings: assembled.warnings.clone(),
                         };
-                        let rendered =
-                            assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
+                        let rendered = assembly::output::render_prompt(
+                            &payload,
+                            sections,
+                            theme_value.as_deref(),
+                        );
                         print!("{rendered}");
                     } else {
                         let cwd =
@@ -960,7 +1003,8 @@ async fn main() -> Result<()> {
                             options.depth,
                             options.limit,
                         )?;
-                        let blocks = build_topology_blocks(&db, &selection, options.per_file).await?;
+                        let blocks =
+                            build_topology_blocks(&db, &selection, options.per_file).await?;
                         let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
                         let prompt_tokenizer_value = cfg.prompt.tokenizer.clone();
                         let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
@@ -988,17 +1032,22 @@ async fn main() -> Result<()> {
                                 .await?;
 
                         let enriched =
-                            assembly::output::enrich_blocks(&project.repo_path, &db, &blocks).await?;
+                            assembly::output::enrich_blocks(&project.repo_path, &db, &blocks)
+                                .await?;
                         let overview =
-                            assembly::output::build_repository_overview(&project.repo_path, &db).await;
+                            assembly::output::build_repository_overview(&project.repo_path, &db)
+                                .await;
                         let payload = assembly::output::PromptPayload {
                             overview,
                             task: issue.title.clone(),
                             blocks: enriched,
                             warnings,
                         };
-                        let rendered =
-                            assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
+                        let rendered = assembly::output::render_prompt(
+                            &payload,
+                            sections,
+                            theme_value.as_deref(),
+                        );
                         print!("{rendered}");
                     }
                 }
@@ -1091,11 +1140,8 @@ async fn main() -> Result<()> {
                 }
                 config::IssueCommand::Duplicates(options) => {
                     let issues = db.list_all_issues().await?;
-                    let duplicates = issue_analysis::find_duplicates(
-                        &issues,
-                        options.threshold,
-                        options.limit,
-                    );
+                    let duplicates =
+                        issue_analysis::find_duplicates(&issues, options.threshold, options.limit);
                     if duplicates.is_empty() {
                         println!("No duplicate issues found.");
                     } else {
@@ -1169,10 +1215,7 @@ async fn main() -> Result<()> {
                             println!("  labels: {}", draft.labels.join(", "));
                         }
                         if !draft.affected_symbols.is_empty() {
-                            println!(
-                                "  affected_symbols: {}",
-                                draft.affected_symbols.join(", ")
-                            );
+                            println!("  affected_symbols: {}", draft.affected_symbols.join(", "));
                         }
                         println!("  description: {}", draft.description);
 
@@ -1190,8 +1233,11 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        let related =
-                            issue_analysis::group_related_issues_by_file(&issues, &draft.affected_symbols, inner.limit);
+                        let related = issue_analysis::group_related_issues_by_file(
+                            &issues,
+                            &draft.affected_symbols,
+                            inner.limit,
+                        );
                         for (file, entries) in related {
                             println!("\nRelated issues for {}:", file);
                             for entry in entries {
@@ -1227,16 +1273,16 @@ async fn main() -> Result<()> {
                             println!("  labels: {}", draft.labels.join(", "));
                         }
                         if !draft.affected_symbols.is_empty() {
-                            println!(
-                                "  affected_symbols: {}",
-                                draft.affected_symbols.join(", ")
-                            );
+                            println!("  affected_symbols: {}", draft.affected_symbols.join(", "));
                         }
                         println!("  description:\n{}", draft.description);
 
                         let issues = db.list_all_issues().await?;
-                        let related =
-                            issue_analysis::group_related_issues_by_file(&issues, &draft.affected_symbols, inner.limit);
+                        let related = issue_analysis::group_related_issues_by_file(
+                            &issues,
+                            &draft.affected_symbols,
+                            inner.limit,
+                        );
                         for (file, entries) in related {
                             println!("\nRelated issues for {}:", file);
                             for entry in entries {
@@ -1267,14 +1313,20 @@ async fn main() -> Result<()> {
                                 if !draft.labels.is_empty() {
                                     println!("  labels: {}", draft.labels.join(", "));
                                 }
-                                println!("  affected_symbols: {}", draft.affected_symbols.join(", "));
+                                println!(
+                                    "  affected_symbols: {}",
+                                    draft.affected_symbols.join(", ")
+                                );
                                 println!("  description: {}", draft.description);
                                 println!("---");
                             }
                         }
                         let issues = db.list_all_issues().await?;
-                        let related =
-                            issue_analysis::related_issues_for_file(&issues, &inner.file, inner.limit);
+                        let related = issue_analysis::related_issues_for_file(
+                            &issues,
+                            &inner.file,
+                            inner.limit,
+                        );
                         if !related.is_empty() {
                             println!("\nRelated issues for {}:", inner.file);
                             for entry in related {
@@ -1352,7 +1404,10 @@ fn print_issue(issue: &issues::Issue) {
         println!("affected_symbols: {}", issue.affected_symbols.join(", "));
     }
     if !issue.external_refs.is_empty() {
-        println!("external_refs: {}", format_external_refs(&issue.external_refs));
+        println!(
+            "external_refs: {}",
+            format_external_refs(&issue.external_refs)
+        );
     }
     if let Some(estimate) = issue.estimate_minutes {
         println!("estimate_minutes: {}", estimate);
@@ -1475,6 +1530,22 @@ pub(crate) fn parse_tokenizer(value: &str) -> Result<Tokenizer> {
     tokenizer.preload().map_err(|err| eyre!(err))
 }
 
+fn normalize_search_language(language: &str) -> String {
+    let trimmed = language.trim();
+    if trimmed.is_empty() {
+        return "text".to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if text_chunking::languages::get_language(trimmed).is_some()
+        || text_chunking::languages::get_language(&lower).is_some()
+        || text_chunking::languages::is_language_supported(&lower)
+    {
+        lower.replace(' ', "_")
+    } else {
+        "text".to_string()
+    }
+}
+
 fn split_history_path_specs(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -1496,7 +1567,11 @@ fn normalize_seed_path(repo_root: &std::path::Path, value: &str) -> String {
 }
 
 fn normalize_prefix(value: &str) -> String {
-    value.trim().trim_start_matches("./").trim_end_matches('/').to_string()
+    value
+        .trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn selection_allows_path(selection: &assembly::SelectionOptions, path: &str) -> bool {
@@ -1646,11 +1721,14 @@ fn select_topology_files(
     let mut weights = neighbor_weights;
     for seed in &file_paths {
         if seed_set.contains(seed) {
-            weights.entry(seed.clone()).and_modify(|v| {
-                if *v < 1.0 {
-                    *v = 1.0;
-                }
-            }).or_insert(1.0);
+            weights
+                .entry(seed.clone())
+                .and_modify(|v| {
+                    if *v < 1.0 {
+                        *v = 1.0;
+                    }
+                })
+                .or_insert(1.0);
         }
     }
 
@@ -1667,9 +1745,7 @@ async fn build_topology_blocks(
     selection: &TopologySelection,
     per_file: usize,
 ) -> Result<Vec<assembly::pipeline::ContextBlock>> {
-    let chunks = db
-        .chunks_for_files(&selection.file_paths, per_file)
-        .await?;
+    let chunks = db.chunks_for_files(&selection.file_paths, per_file).await?;
     if chunks.is_empty() {
         return Err(eyre!("no chunks found for selected files"));
     }
@@ -1681,7 +1757,11 @@ async fn build_topology_blocks(
             .get(&chunk.file_path)
             .copied()
             .unwrap_or(assembly::pipeline::CandidateSource::Expanded);
-        let score = selection.weights.get(&chunk.file_path).copied().unwrap_or(0.0);
+        let score = selection
+            .weights
+            .get(&chunk.file_path)
+            .copied()
+            .unwrap_or(0.0);
         blocks.push(assembly::pipeline::ContextBlock {
             id: chunk.id,
             file_path: chunk.file_path,

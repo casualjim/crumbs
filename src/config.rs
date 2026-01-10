@@ -553,7 +553,11 @@ pub struct TopologyStatsCli {
 
 #[derive(Args)]
 pub struct TopologyCyclesCli {
-    #[arg(long = "limit", default_value_t = 10, help = "Limit number of cycles shown")]
+    #[arg(
+        long = "limit",
+        default_value_t = 10,
+        help = "Limit number of cycles shown"
+    )]
     pub limit: usize,
     #[arg(
         long = "max-edges",
@@ -585,13 +589,21 @@ pub struct TopologyPathCli {
 pub struct TopologyVolumesCli {
     #[arg(long = "limit", default_value_t = 10, help = "Limit volumes shown")]
     pub limit: usize,
-    #[arg(long = "max-triangles", default_value_t = 5000, help = "Limit triangles analyzed")]
+    #[arg(
+        long = "max-triangles",
+        default_value_t = 5000,
+        help = "Limit triangles analyzed"
+    )]
     pub max_triangles: usize,
 }
 
 #[derive(Args)]
 pub struct TopologyLayersCli {
-    #[arg(long = "config", value_name = "PATH", help = "Layer config file (json or yaml)")]
+    #[arg(
+        long = "config",
+        value_name = "PATH",
+        help = "Layer config file (json or yaml)"
+    )]
     pub config: Option<String>,
 }
 
@@ -631,7 +643,11 @@ pub struct TopologyAssembleCli {
     pub files: Vec<String>,
     #[arg(long = "depth", default_value_t = 1, help = "Neighbor depth")]
     pub depth: usize,
-    #[arg(long = "limit", default_value_t = 25, help = "Maximum files to include")]
+    #[arg(
+        long = "limit",
+        default_value_t = 25,
+        help = "Maximum files to include"
+    )]
     pub limit: usize,
     #[arg(
         long = "per-file",
@@ -675,9 +691,17 @@ pub struct TopologySnapshotCli {
 
 #[derive(Args)]
 pub struct TopologyDiffCli {
-    #[arg(long = "name", value_name = "NAME", help = "Snapshot name to diff against")]
+    #[arg(
+        long = "name",
+        value_name = "NAME",
+        help = "Snapshot name to diff against"
+    )]
     pub name: String,
-    #[arg(long = "limit", default_value_t = 20, help = "Limit edges shown per section")]
+    #[arg(
+        long = "limit",
+        default_value_t = 20,
+        help = "Limit edges shown per section"
+    )]
     pub limit: usize,
 }
 
@@ -685,9 +709,17 @@ pub struct TopologyDiffCli {
 pub struct TopologyHotspotsCli {
     #[arg(long = "limit", default_value_t = 10, help = "Limit results")]
     pub limit: usize,
-    #[arg(long = "iterations", default_value_t = 50, help = "PageRank iterations")]
+    #[arg(
+        long = "iterations",
+        default_value_t = 50,
+        help = "PageRank iterations"
+    )]
     pub iterations: usize,
-    #[arg(long = "damping", default_value_t = 0.85, help = "PageRank damping factor")]
+    #[arg(
+        long = "damping",
+        default_value_t = 0.85,
+        help = "PageRank damping factor"
+    )]
     pub damping: f64,
 }
 
@@ -703,11 +735,19 @@ pub struct IssueCreateCli {
     pub acceptance_criteria: Option<String>,
     #[arg(long = "notes", help = "Additional notes")]
     pub notes: Option<String>,
-    #[arg(long = "status", default_value = "open", help = "Status (open, in-progress, blocked, closed)")]
+    #[arg(
+        long = "status",
+        default_value = "open",
+        help = "Status (open, in-progress, blocked, closed)"
+    )]
     pub status: String,
     #[arg(long = "priority", default_value_t = 3, help = "Priority (1-5)")]
     pub priority: i32,
-    #[arg(long = "type", default_value = "task", help = "Issue type (task, bug, chore)")]
+    #[arg(
+        long = "type",
+        default_value = "task",
+        help = "Issue type (task, bug, chore)"
+    )]
     pub issue_type: String,
     #[arg(long = "assignee", help = "Assignee name")]
     pub assignee: Option<String>,
@@ -779,11 +819,17 @@ pub struct IssueUpdateCli {
     pub estimate_minutes: Option<i32>,
     #[arg(long = "clear-estimate", help = "Clear estimate")]
     pub clear_estimate: bool,
-    #[arg(long = "duplicate-of", help = "Set duplicate-of issue ID (empty clears)")]
+    #[arg(
+        long = "duplicate-of",
+        help = "Set duplicate-of issue ID (empty clears)"
+    )]
     pub duplicate_of: Option<String>,
     #[arg(long = "clear-duplicate", help = "Clear duplicate-of")]
     pub clear_duplicate: bool,
-    #[arg(long = "superseded-by", help = "Set superseded-by issue ID (empty clears)")]
+    #[arg(
+        long = "superseded-by",
+        help = "Set superseded-by issue ID (empty clears)"
+    )]
     pub superseded_by: Option<String>,
     #[arg(long = "clear-superseded", help = "Clear superseded-by")]
     pub clear_superseded: bool,
@@ -841,11 +887,23 @@ pub struct IssueSearchCli {
 pub struct IssueContextCli {
     #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
     pub id: String,
-    #[arg(long = "depth", default_value_t = 1, help = "Topology depth for context assembly")]
+    #[arg(
+        long = "depth",
+        default_value_t = 1,
+        help = "Topology depth for context assembly"
+    )]
     pub depth: usize,
-    #[arg(long = "limit", default_value_t = 25, help = "Maximum files to include")]
+    #[arg(
+        long = "limit",
+        default_value_t = 25,
+        help = "Maximum files to include"
+    )]
     pub limit: usize,
-    #[arg(long = "per-file", default_value_t = 5, help = "Maximum chunks per file")]
+    #[arg(
+        long = "per-file",
+        default_value_t = 5,
+        help = "Maximum chunks per file"
+    )]
     pub per_file: usize,
     #[arg(long = "sections", value_enum, value_delimiter = ',', num_args = 1.., help = "Sections to include")]
     pub sections: Vec<PromptSection>,
@@ -891,7 +949,11 @@ pub struct IssueTriageCli {
 
 #[derive(Args)]
 pub struct IssueDuplicatesCli {
-    #[arg(long = "threshold", default_value_t = 0.5, help = "Similarity threshold (0-1)")]
+    #[arg(
+        long = "threshold",
+        default_value_t = 0.5,
+        help = "Similarity threshold (0-1)"
+    )]
     pub threshold: f64,
     #[arg(long = "limit", default_value_t = 20, help = "Limit results")]
     pub limit: usize,
@@ -899,9 +961,19 @@ pub struct IssueDuplicatesCli {
 
 #[derive(Args)]
 pub struct IssueRelatedCli {
-    #[arg(long = "file", value_name = "PATH", conflicts_with = "issue", help = "File path to match")]
+    #[arg(
+        long = "file",
+        value_name = "PATH",
+        conflicts_with = "issue",
+        help = "File path to match"
+    )]
     pub file: Option<String>,
-    #[arg(long = "issue", value_name = "ID", conflicts_with = "file", help = "Issue ID to match")]
+    #[arg(
+        long = "issue",
+        value_name = "ID",
+        conflicts_with = "file",
+        help = "Issue ID to match"
+    )]
     pub issue: Option<String>,
     #[arg(long = "limit", default_value_t = 10, help = "Limit results")]
     pub limit: usize,
@@ -927,7 +999,11 @@ pub enum IssueInferCommand {
 pub struct IssueInferErrorCli {
     #[arg(value_name = "MESSAGE", help = "Error message text")]
     pub message: String,
-    #[arg(long = "limit", default_value_t = 5, help = "Limit related issues shown")]
+    #[arg(
+        long = "limit",
+        default_value_t = 5,
+        help = "Limit related issues shown"
+    )]
     pub limit: usize,
 }
 
@@ -935,9 +1011,17 @@ pub struct IssueInferErrorCli {
 pub struct IssueInferDiffCli {
     #[arg(long = "path", value_name = "PATH", help = "Path to a diff file")]
     pub path: Option<String>,
-    #[arg(long = "range", value_name = "RANGE", help = "Git diff range (e.g. HEAD~1..HEAD)")]
+    #[arg(
+        long = "range",
+        value_name = "RANGE",
+        help = "Git diff range (e.g. HEAD~1..HEAD)"
+    )]
     pub range: Option<String>,
-    #[arg(long = "limit", default_value_t = 10, help = "Limit related issues shown")]
+    #[arg(
+        long = "limit",
+        default_value_t = 10,
+        help = "Limit related issues shown"
+    )]
     pub limit: usize,
 }
 
@@ -1460,8 +1544,7 @@ fn macos_alt_config_present() -> bool {
 }
 
 fn etc_config_present() -> bool {
-    Path::new("/etc/crumbs/config.toml").exists()
-        || Path::new("/etc/crumbs/secrets.toml").exists()
+    Path::new("/etc/crumbs/config.toml").exists() || Path::new("/etc/crumbs/secrets.toml").exists()
 }
 
 fn ensure_repo_data_gitignore(

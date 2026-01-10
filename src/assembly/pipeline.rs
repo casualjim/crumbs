@@ -235,13 +235,13 @@ impl RetrieveCandidates for DefaultRetrieve {
 
         let per_file_limit = self.config.limit.max(1);
         if !ctx.selection.explicit_includes.is_empty() {
-            let include_paths = resolve_input_paths(ctx.repo_path, &ctx.selection.explicit_includes);
+            let include_paths =
+                resolve_input_paths(ctx.repo_path, &ctx.selection.explicit_includes);
             let rows = ctx
                 .db
                 .chunks_for_files(&include_paths, per_file_limit)
                 .await?;
-            let found: HashSet<String> =
-                rows.iter().map(|row| row.file_path.clone()).collect();
+            let found: HashSet<String> = rows.iter().map(|row| row.file_path.clone()).collect();
             for path in &include_paths {
                 if !found.contains(path) {
                     warnings.push(format!(
@@ -272,8 +272,7 @@ impl RetrieveCandidates for DefaultRetrieve {
                 .db
                 .chunks_for_files(&pinned_paths, per_file_limit)
                 .await?;
-            let found: HashSet<String> =
-                rows.iter().map(|row| row.file_path.clone()).collect();
+            let found: HashSet<String> = rows.iter().map(|row| row.file_path.clone()).collect();
             for path in &pinned_paths {
                 if !found.contains(path) {
                     warnings.push(format!(
@@ -298,8 +297,7 @@ impl RetrieveCandidates for DefaultRetrieve {
             }
         }
 
-        let results =
-            crate::search::search(&search_ctx, &query.text, self.config.clone()).await?;
+        let results = crate::search::search(&search_ctx, &query.text, self.config.clone()).await?;
         let mut retrieved = results
             .into_iter()
             .filter(|result| is_allowed_path(ctx.repo_path, &ctx.selection, &result.file_path))
@@ -346,7 +344,9 @@ impl ExpandGraph for DefaultExpandGraph {
         let mut expanded = if seeds.is_empty() {
             Vec::new()
         } else {
-            ctx.db.cochange_neighbors(&seeds, self.max_expanded_files).await?
+            ctx.db
+                .cochange_neighbors(&seeds, self.max_expanded_files)
+                .await?
         };
         if !expanded.is_empty() {
             expanded.retain(|path| is_allowed_path(ctx.repo_path, &ctx.selection, path));
@@ -473,30 +473,30 @@ impl BudgetAndMerge for DefaultBudgetAndMerge {
 
             if let Some(counter) = token_counter.as_ref() {
                 block_tokens = counter.count(&candidate.text)?;
-                if let Some(max_tokens) = token_budget {
-                    if tokens + block_tokens > max_tokens {
-                        if candidate.source == CandidateSource::Expanded {
-                            continue;
+                if let Some(max_tokens) = token_budget
+                    && tokens + block_tokens > max_tokens
+                {
+                    if candidate.source == CandidateSource::Expanded {
+                        continue;
+                    }
+                    if let Some(trimmed) = trim_block_to_tokens(
+                        &candidate,
+                        max_tokens.saturating_sub(tokens),
+                        counter,
+                    )? {
+                        candidate = trimmed;
+                        block_tokens = counter.count(&candidate.text)?;
+                    } else {
+                        if candidate.source == CandidateSource::Explicit
+                            || candidate.source == CandidateSource::Pinned
+                        {
+                            warnings.push(format!(
+                                "{} dropped due to token budget: {}",
+                                source_label(candidate.source),
+                                normalize_path(ctx.repo_path, &candidate.file_path)
+                            ));
                         }
-                        if let Some(trimmed) = trim_block_to_tokens(
-                            &candidate,
-                            max_tokens.saturating_sub(tokens),
-                            counter,
-                        )? {
-                            candidate = trimmed;
-                            block_tokens = counter.count(&candidate.text)?;
-                        } else {
-                            if candidate.source == CandidateSource::Explicit
-                                || candidate.source == CandidateSource::Pinned
-                            {
-                                warnings.push(format!(
-                                    "{} dropped due to token budget: {}",
-                                    source_label(candidate.source),
-                                    normalize_path(ctx.repo_path, &candidate.file_path)
-                                ));
-                            }
-                            continue;
-                        }
+                        continue;
                     }
                 }
             }
@@ -508,9 +508,7 @@ impl BudgetAndMerge for DefaultBudgetAndMerge {
                 if candidate.source == CandidateSource::Expanded {
                     continue;
                 }
-                if let Some(trimmed) =
-                    trim_block_to_bytes(&candidate, max.saturating_sub(bytes))
-                {
+                if let Some(trimmed) = trim_block_to_bytes(&candidate, max.saturating_sub(bytes)) {
                     candidate = trimmed;
                     next_bytes = bytes + candidate.text.len();
                     if let Some(counter) = token_counter.as_ref() {
@@ -654,10 +652,7 @@ fn resolve_input_paths(repo_root: &Path, inputs: &[String]) -> Vec<String> {
             if path.is_absolute() {
                 value.clone()
             } else {
-                repo_root
-                    .join(path)
-                    .to_string_lossy()
-                    .to_string()
+                repo_root.join(path).to_string_lossy().to_string()
             }
         })
         .collect()
@@ -665,14 +660,12 @@ fn resolve_input_paths(repo_root: &Path, inputs: &[String]) -> Vec<String> {
 
 fn normalize_path(repo_root: &Path, file_path: &str) -> String {
     let path = Path::new(file_path);
-    if path.is_absolute() {
-        if let Ok(stripped) = path.strip_prefix(repo_root) {
-            if let Some(rel) = stripped.to_str() {
-                if !rel.is_empty() {
-                    return rel.replace('\\', "/");
-                }
-            }
-        }
+    if path.is_absolute()
+        && let Ok(stripped) = path.strip_prefix(repo_root)
+        && let Some(rel) = stripped.to_str()
+        && !rel.is_empty()
+    {
+        return rel.replace('\\', "/");
     }
     file_path.replace('\\', "/")
 }
@@ -691,11 +684,7 @@ fn matches_any(path: &str, patterns: &[String]) -> bool {
     false
 }
 
-fn is_allowed_path(
-    repo_root: &Path,
-    selection: &super::SelectionOptions,
-    file_path: &str,
-) -> bool {
+fn is_allowed_path(repo_root: &Path, selection: &super::SelectionOptions, file_path: &str) -> bool {
     let normalized = normalize_path(repo_root, file_path);
     if !selection.scope_paths.is_empty()
         && !matches_any(&normalized, &selection.scope_paths)

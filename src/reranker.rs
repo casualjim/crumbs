@@ -120,7 +120,11 @@ impl Client {
             debug!("Reranking used {} input tokens", input_tokens);
         }
 
-        Ok(response.scores.into_iter().map(|s| s.clamp(0.0, 1.0)).collect())
+        Ok(response
+            .scores
+            .into_iter()
+            .map(|s| s.clamp(0.0, 1.0))
+            .collect())
     }
 }
 

@@ -12,7 +12,7 @@ indexing + retrieval foundation for that pipeline.
 - Chunks files with configurable size/overlap and embedding tokenizer.
 - Stores embeddings for semantic retrieval.
 - Extracts symbol/reference graphs from Tree-sitter queries.
-- Adds git co-change history edges via `cupido`.
+- Adds git co-change history edges via `gix`.
 - Supports hybrid retrieval (vector + FTS) for search.
 - Tracks local issues in JSONL + SQLite and can assemble topology-aware context per issue.
 
@@ -159,6 +159,14 @@ hybrid_weight = 0.6
 ```
 cargo build
 cargo test --all
+```
+
+## Install from source
+
+When installing with Cargo, use the lockfile to avoid pulling incompatible
+transitive dependencies:
+```
+cargo install --path . --locked --force
 ```
 
 Note: tests that hit the embedder require a real API key in config or secrets.

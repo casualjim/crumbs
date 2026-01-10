@@ -70,6 +70,10 @@ pub trait Repository: Send + Sync {
         file_commit_edges: &[(String, String)],
         cochange_edges: &[(String, String, i64, f64)],
     ) -> Result<()>;
+    async fn upsert_commit_issue_edges(
+        &self,
+        commit_issue_edges: &[(String, String)],
+    ) -> Result<()>;
     fn vss_loaded(&self) -> bool;
     fn fts_loaded(&self) -> bool;
     async fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>>;

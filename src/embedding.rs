@@ -38,7 +38,6 @@ pub struct EmbedderConfig {
     pub tokens_per_minute: u32,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingInput {

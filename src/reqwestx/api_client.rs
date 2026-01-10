@@ -102,11 +102,9 @@ impl ApiClient {
             .default_headers({
                 let mut headers = HeaderMap::new();
                 if let Some(api_key) = &config.api_key {
-                    let value = HeaderValue::from_str(&format!(
-                        "Bearer {}",
-                        api_key.expose_secret()
-                    ))
-                    .map_err(|err| eyre::eyre!("invalid api key header: {err}"))?;
+                    let value =
+                        HeaderValue::from_str(&format!("Bearer {}", api_key.expose_secret()))
+                            .map_err(|err| eyre::eyre!("invalid api key header: {err}"))?;
                     headers.insert(AUTHORIZATION, value);
                 }
                 headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));

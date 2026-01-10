@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use eyre::{Result, eyre};
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::{mpsc, Semaphore};
+use futures::stream::FuturesUnordered;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::embedding::{EmbeddingInput, EmbeddingProvider};
 
@@ -105,19 +105,19 @@ impl EmbedderService {
 
         (
             Self {
-            batcher: TokenAwareBatcher::new(max_tokens, max_batch_size),
-            batch_tx: Some(batch_tx),
-        },
+                batcher: TokenAwareBatcher::new(max_tokens, max_batch_size),
+                batch_tx: Some(batch_tx),
+            },
             result_rx,
         )
     }
 
     pub(crate) async fn enqueue(&mut self, item: BatchItem) -> Result<bool> {
-        if let Some(batch) = self.batcher.add(item) {
-            if let Some(tx) = self.batch_tx.as_ref() {
-                tx.send(batch).await?;
-                return Ok(true);
-            }
+        if let Some(batch) = self.batcher.add(item)
+            && let Some(tx) = self.batch_tx.as_ref()
+        {
+            tx.send(batch).await?;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -128,11 +128,11 @@ impl EmbedderService {
         }
 
         let mut sent = false;
-        if let Some(batch) = self.batcher.flush() {
-            if let Some(tx) = self.batch_tx.as_ref() {
-                tx.send(batch).await?;
-                sent = true;
-            }
+        if let Some(batch) = self.batcher.flush()
+            && let Some(tx) = self.batch_tx.as_ref()
+        {
+            tx.send(batch).await?;
+            sent = true;
         }
         drop(self.batch_tx.take());
         Ok(sent)

@@ -112,6 +112,11 @@ impl Db {
           commit_id TEXT NOT NULL,
           PRIMARY KEY (file_path, commit_id)
         );
+        CREATE TABLE IF NOT EXISTS commit_issue_edges (
+          commit_id TEXT NOT NULL,
+          issue_id TEXT NOT NULL,
+          PRIMARY KEY (commit_id, issue_id)
+        );
         CREATE TABLE IF NOT EXISTS file_cochange_edges (
           src_path TEXT NOT NULL REFERENCES files(path),
           dst_path TEXT NOT NULL REFERENCES files(path),
@@ -214,6 +219,8 @@ impl Db {
         CREATE INDEX IF NOT EXISTS chunks_file_path_idx ON chunks (file_path);
         CREATE INDEX IF NOT EXISTS file_commit_edges_file_idx ON file_commit_edges (file_path);
         CREATE INDEX IF NOT EXISTS file_commit_edges_commit_idx ON file_commit_edges (commit_id);
+        CREATE INDEX IF NOT EXISTS commit_issue_edges_commit_idx ON commit_issue_edges (commit_id);
+        CREATE INDEX IF NOT EXISTS commit_issue_edges_issue_idx ON commit_issue_edges (issue_id);
         CREATE INDEX IF NOT EXISTS file_cochange_edges_src_idx ON file_cochange_edges (src_path);
         CREATE INDEX IF NOT EXISTS file_cochange_edges_dst_idx ON file_cochange_edges (dst_path);
         CREATE INDEX IF NOT EXISTS file_dependency_edges_src_idx ON file_dependency_edges (src_path);
@@ -1093,19 +1100,15 @@ impl Db {
             issues
         };
 
-        if let Some(limit) = filters.limit {
-            if issues.len() > limit {
-                issues.truncate(limit);
-            }
+        if let Some(limit) = filters.limit
+            && issues.len() > limit
+        {
+            issues.truncate(limit);
         }
         Ok(issues)
     }
 
-    pub async fn search_issues(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<IssueSearchResult>> {
+    pub async fn search_issues(&self, query: &str, limit: usize) -> Result<Vec<IssueSearchResult>> {
         let query = query.trim();
         if query.is_empty() {
             return Ok(Vec::new());
@@ -1148,10 +1151,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn load_topology_snapshot(
-        &self,
-        name: &str,
-    ) -> Result<Option<TopologyExport>> {
+    pub async fn load_topology_snapshot(&self, name: &str) -> Result<Option<TopologyExport>> {
         let mut rows = self
             .conn
             .query(
@@ -1168,7 +1168,6 @@ impl Db {
         let edges = serde_json::from_str(&edges_json)?;
         Ok(Some(TopologyExport { nodes, edges }))
     }
-
 }
 
 #[derive(Clone)]
@@ -1276,7 +1275,9 @@ fn parse_dependency_list(value: &str) -> Vec<crate::issues::IssueDependency> {
             for entry in values {
                 match entry {
                     serde_json::Value::String(value) => {
-                        let (id, kind) = crate::issues::normalize_dependencies(&[value]).into_iter().next()
+                        let (id, kind) = crate::issues::normalize_dependencies(&[value])
+                            .into_iter()
+                            .next()
                             .map(|dep| (dep.id, dep.kind))
                             .unwrap_or_else(|| (String::new(), "blocks".to_string()));
                         if !id.trim().is_empty() {
@@ -1286,10 +1287,9 @@ fn parse_dependency_list(value: &str) -> Vec<crate::issues::IssueDependency> {
                     serde_json::Value::Object(_) => {
                         if let Ok(dep) =
                             serde_json::from_value::<crate::issues::IssueDependency>(entry)
+                            && !dep.id.trim().is_empty()
                         {
-                            if !dep.id.trim().is_empty() {
-                                deps.push(dep);
-                            }
+                            deps.push(dep);
                         }
                     }
                     _ => {}
@@ -1984,6 +1984,26 @@ impl Repository for Db {
         Ok(())
     }
 
+    async fn upsert_commit_issue_edges(
+        &self,
+        commit_issue_edges: &[(String, String)],
+    ) -> Result<()> {
+        self.with_transaction(|| async {
+            for (commit_id, issue_id) in commit_issue_edges {
+                self.conn
+                    .execute(
+                        "INSERT INTO commit_issue_edges (commit_id, issue_id) VALUES (?, ?) \
+                     ON CONFLICT(commit_id, issue_id) DO NOTHING",
+                        params![commit_id.as_str(), issue_id.as_str()],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
     fn vss_loaded(&self) -> bool {
         self.vss_loaded
     }
@@ -2304,8 +2324,7 @@ impl Repository for Db {
             ranks.clone_from_slice(&next);
         }
 
-        let mut scored: Vec<(String, f64)> =
-            index_to_path.into_iter().zip(ranks.into_iter()).collect();
+        let mut scored: Vec<(String, f64)> = index_to_path.into_iter().zip(ranks).collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         if scored.len() > limit {
             scored.truncate(limit);

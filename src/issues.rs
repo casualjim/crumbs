@@ -142,10 +142,7 @@ impl Issue {
     }
 
     pub fn dependency_ids(&self) -> Vec<String> {
-        self.dependencies
-            .iter()
-            .map(|dep| dep.id.clone())
-            .collect()
+        self.dependencies.iter().map(|dep| dep.id.clone()).collect()
     }
 }
 
@@ -300,7 +297,10 @@ pub fn normalize_external_refs(values: &[String]) -> Vec<IssueExternalRef> {
         if normalized.is_empty() || !seen.insert(normalized.clone()) {
             continue;
         }
-        out.push(IssueExternalRef { kind, value: reference });
+        out.push(IssueExternalRef {
+            kind,
+            value: reference,
+        });
     }
     out.sort_by(|a, b| a.value.cmp(&b.value));
     out
@@ -321,7 +321,13 @@ pub fn merge_external_refs(
         if normalized.is_empty() {
             continue;
         }
-        map.insert(normalized, IssueExternalRef { kind, value: reference });
+        map.insert(
+            normalized,
+            IssueExternalRef {
+                kind,
+                value: reference,
+            },
+        );
     }
     for value in remove {
         let (_kind, reference) = parse_external_ref_spec(value);
@@ -333,11 +339,7 @@ pub fn merge_external_refs(
     out
 }
 
-pub fn merge_tags(
-    existing: &[String],
-    add: &[String],
-    remove: &[String],
-) -> Vec<String> {
+pub fn merge_tags(existing: &[String], add: &[String], remove: &[String]) -> Vec<String> {
     let mut set: HashSet<String> = existing.iter().map(|v| v.to_ascii_lowercase()).collect();
     for value in normalize_tags(add) {
         set.insert(value);
@@ -350,11 +352,7 @@ pub fn merge_tags(
     out
 }
 
-pub fn merge_ids(
-    existing: &[String],
-    add: &[String],
-    remove: &[String],
-) -> Vec<String> {
+pub fn merge_ids(existing: &[String], add: &[String], remove: &[String]) -> Vec<String> {
     let mut set: HashSet<String> = existing.iter().map(|v| v.to_ascii_lowercase()).collect();
     for value in normalize_ids(add) {
         set.insert(value);
@@ -367,11 +365,7 @@ pub fn merge_ids(
     out
 }
 
-pub fn merge_symbols(
-    existing: &[String],
-    add: &[String],
-    remove: &[String],
-) -> Vec<String> {
+pub fn merge_symbols(existing: &[String], add: &[String], remove: &[String]) -> Vec<String> {
     let mut set: HashSet<String> = existing.iter().cloned().collect();
     for value in normalize_symbols(add) {
         set.insert(value);
@@ -405,7 +399,9 @@ pub fn build_comments(values: &[String], author: Option<&str>) -> Vec<IssueComme
         out.push(IssueComment {
             id: Uuid::now_v7().to_string(),
             body,
-            author: author.map(|value| value.to_string()).filter(|value| !value.trim().is_empty()),
+            author: author
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty()),
             created_at: now.clone(),
             updated_at: now,
         });
@@ -420,12 +416,12 @@ fn parse_dependency_spec(value: &str) -> (String, String) {
     }
     let mut parts = trimmed.splitn(2, ':');
     let id = parts.next().unwrap_or("").trim().to_string();
-    let kind = parts
-        .next()
-        .unwrap_or("blocks")
-        .trim()
-        .to_ascii_lowercase();
-    let kind = if kind.is_empty() { "blocks".to_string() } else { kind };
+    let kind = parts.next().unwrap_or("blocks").trim().to_ascii_lowercase();
+    let kind = if kind.is_empty() {
+        "blocks".to_string()
+    } else {
+        kind
+    };
     (id, kind)
 }
 

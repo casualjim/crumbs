@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{TopologySnapshot, TopologyEdge};
+use super::{TopologyEdge, TopologySnapshot};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerConfig {
@@ -78,14 +78,25 @@ pub fn check_layers(snapshot: &TopologySnapshot, config: &LayerConfig) -> LayerC
 
     let mut violations = Vec::new();
     for edge in snapshot.dependency_edges() {
-        let Some(from_layer) = node_layers.get(&edge.src) else { continue };
-        let Some(to_layer) = node_layers.get(&edge.dst) else { continue };
+        let Some(from_layer) = node_layers.get(&edge.src) else {
+            continue;
+        };
+        let Some(to_layer) = node_layers.get(&edge.dst) else {
+            continue;
+        };
         if from_layer == to_layer {
             continue;
         }
-        let Some(layer) = layer_lookup.get(&from_layer.to_ascii_lowercase()) else { continue };
+        let Some(layer) = layer_lookup.get(&from_layer.to_ascii_lowercase()) else {
+            continue;
+        };
         if layer.allowed_deps.is_empty() {
-            violations.push(build_violation(&edge, from_layer, to_layer, "disallowed dependency"));
+            violations.push(build_violation(
+                &edge,
+                from_layer,
+                to_layer,
+                "disallowed dependency",
+            ));
             continue;
         }
         let allowed: HashSet<String> = layer
@@ -94,7 +105,12 @@ pub fn check_layers(snapshot: &TopologySnapshot, config: &LayerConfig) -> LayerC
             .map(|item| item.to_ascii_lowercase())
             .collect();
         if !allowed.contains(&to_layer.to_ascii_lowercase()) {
-            violations.push(build_violation(&edge, from_layer, to_layer, "disallowed dependency"));
+            violations.push(build_violation(
+                &edge,
+                from_layer,
+                to_layer,
+                "disallowed dependency",
+            ));
         }
     }
 

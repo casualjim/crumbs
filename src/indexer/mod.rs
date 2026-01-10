@@ -62,19 +62,20 @@ impl<'a> Indexer<'a> {
         let mut completed_batches = 0usize;
         let mut buffered_batch = false;
         let mut seen_files = HashSet::new();
-        let update_progress = |files_processed: usize,
-                               total_files: usize,
-                               completed_batches: usize,
-                               total_batches: usize,
-                               buffered_batch: bool,
-                               stream_done: bool,
-                               progress: &Option<progress::IndexProgress>| {
-            if let Some(progress) = progress {
-                let total_batches = total_batches.saturating_add(usize::from(buffered_batch));
-                progress.update_files(files_processed, total_files, stream_done);
-                progress.update_embedding(completed_batches, total_batches, stream_done);
-            }
-        };
+        let update_progress =
+            |files_processed: usize,
+             total_files: usize,
+             completed_batches: usize,
+             total_batches: usize,
+             buffered_batch: bool,
+             stream_done: bool,
+             progress: &Option<progress::IndexProgress>| {
+                if let Some(progress) = progress {
+                    let total_batches = total_batches.saturating_add(usize::from(buffered_batch));
+                    progress.update_files(files_processed, total_files, stream_done);
+                    progress.update_embedding(completed_batches, total_batches, stream_done);
+                }
+            };
 
         let existing_hashes = self.db.load_existing_hashes().await?;
         let options = WalkOptions {

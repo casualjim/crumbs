@@ -7,8 +7,8 @@ use std::path::Path;
 
 use crate::db::{FtsRow, SearchRow};
 use crate::embedding::{EmbeddingInput, EmbeddingProvider};
-use crate::reranker::RerankingProvider;
 use crate::repository::Repository;
+use crate::reranker::RerankingProvider;
 use text_chunking::Tokenizer as ChunkTokenizer;
 use tiktoken_rs::{cl100k_base, o200k_base, p50k_base, p50k_edit, r50k_base};
 use tokenizers::Tokenizer as HfTokenizer;
@@ -104,16 +104,11 @@ pub async fn search(
 ) -> Result<Vec<SearchResult>> {
     let config = config.normalize();
     report_progress(ctx.progress, "preparing query");
-    let mut combined = search_single(
-        ctx,
-        query,
-        config.limit,
-        config.hybrid_weight,
-    )
-    .await?
-    .into_iter()
-    .filter(|result| config.matches_path(&result.file_path))
-    .collect::<Vec<_>>();
+    let mut combined = search_single(ctx, query, config.limit, config.hybrid_weight)
+        .await?
+        .into_iter()
+        .filter(|result| config.matches_path(&result.file_path))
+        .collect::<Vec<_>>();
     combined.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)

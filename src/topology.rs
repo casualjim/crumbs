@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::repository::{CochangeEdge, DependencyEdge, Repository};
 
+pub mod layers;
 #[cfg(test)]
 mod refactor;
-pub mod layers;
 pub mod workspace;
 use workspace::WorkspaceInfo;
 use workspace::detect_workspace_info;
@@ -92,7 +92,6 @@ pub struct RefactorOptions {
     pub min_cut_score: f64,
 }
 
-
 impl Default for RefactorOptions {
     fn default() -> Self {
         Self {
@@ -164,10 +163,14 @@ impl TopologySnapshot {
         let cochange_edges = db.list_cochange_edges().await?;
         let files = db.list_files().await?;
         let workspace = detect_workspace_info(start_path, &files)?;
-        let (scoped_files, scoped_dependencies, scoped_cochanges) =
-            scope_workspace_files(repo_root, &workspace, &files, &dependency_edges, &cochange_edges);
-        let mut snapshot =
-            Self::from_edges(&scoped_files, &scoped_dependencies, &scoped_cochanges);
+        let (scoped_files, scoped_dependencies, scoped_cochanges) = scope_workspace_files(
+            repo_root,
+            &workspace,
+            &files,
+            &dependency_edges,
+            &cochange_edges,
+        );
+        let mut snapshot = Self::from_edges(&scoped_files, &scoped_dependencies, &scoped_cochanges);
         snapshot.apply_workspace(workspace, &scoped_files);
         Ok(snapshot)
     }
@@ -261,7 +264,11 @@ impl TopologySnapshot {
         neighbors.sort_by(|a, b| {
             a.distance
                 .cmp(&b.distance)
-                .then_with(|| b.total_weight.partial_cmp(&a.total_weight).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| {
+                    b.total_weight
+                        .partial_cmp(&a.total_weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| a.path.cmp(&b.path))
         });
         Ok(neighbors)
@@ -317,12 +324,7 @@ impl TopologySnapshot {
         Ok(path)
     }
 
-    pub fn hotspots(
-        &self,
-        limit: usize,
-        iterations: usize,
-        damping: f64,
-    ) -> Vec<(String, f64)> {
+    pub fn hotspots(&self, limit: usize, iterations: usize, damping: f64) -> Vec<(String, f64)> {
         let ranks = pagerank(self, iterations, damping);
         let mut pairs: Vec<(String, f64)> = ranks
             .into_iter()
@@ -336,11 +338,7 @@ impl TopologySnapshot {
         pairs
     }
 
-    pub fn feature_volumes(
-        &self,
-        max_triangles: usize,
-        limit: usize,
-    ) -> Vec<FeatureVolume> {
+    pub fn feature_volumes(&self, max_triangles: usize, limit: usize) -> Vec<FeatureVolume> {
         let triangles = find_triangles(self, max_triangles);
         if triangles.is_empty() {
             return Vec::new();
@@ -375,7 +373,12 @@ impl TopologySnapshot {
         build_refactor_plan(self, options)
     }
 
-    fn neighborhood_weights(&self, node_idx: usize, distances: &[usize], depth: usize) -> (f64, f64) {
+    fn neighborhood_weights(
+        &self,
+        node_idx: usize,
+        distances: &[usize],
+        depth: usize,
+    ) -> (f64, f64) {
         let mut in_weight = 0.0;
         let mut out_weight = 0.0;
         for &edge_idx in &self.incoming[node_idx] {
@@ -492,12 +495,10 @@ impl TopologySnapshot {
             .map(|pkg| {
                 let prefix = if files_are_absolute {
                     Path::new(&workspace.root).join(&pkg.path)
+                } else if workspace.root.trim().is_empty() || workspace.root == "." {
+                    PathBuf::from(&pkg.path)
                 } else {
-                    if workspace.root.trim().is_empty() || workspace.root == "." {
-                        PathBuf::from(&pkg.path)
-                    } else {
-                        Path::new(&workspace.root).join(&pkg.path)
-                    }
+                    Path::new(&workspace.root).join(&pkg.path)
                 };
                 (prefix, pkg.name.clone())
             })
@@ -540,14 +541,15 @@ fn scope_workspace_files(
     let mut root_path = PathBuf::from(root);
     if files_are_absolute && root_path.is_relative() {
         root_path = repo_root.join(root_path);
-    } else if !files_are_absolute && root_path.is_absolute() {
-        if let Ok(relative) = root_path.strip_prefix(repo_root) {
-            root_path = if relative.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                relative.to_path_buf()
-            };
-        }
+    } else if !files_are_absolute
+        && root_path.is_absolute()
+        && let Ok(relative) = root_path.strip_prefix(repo_root)
+    {
+        root_path = if relative.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative.to_path_buf()
+        };
     }
 
     let mut allowed = HashSet::new();
@@ -611,8 +613,12 @@ fn cochange_map(
     let mut weights = HashMap::new();
     let mut max_weight = 0.0;
     for edge in edges {
-        let Some(&src) = index.get(&edge.src_path) else { continue };
-        let Some(&dst) = index.get(&edge.dst_path) else { continue };
+        let Some(&src) = index.get(&edge.src_path) else {
+            continue;
+        };
+        let Some(&dst) = index.get(&edge.dst_path) else {
+            continue;
+        };
         let key = if src <= dst { (src, dst) } else { (dst, src) };
         let entry = weights.entry(key).or_insert(0.0);
         if edge.weight > *entry {
@@ -634,12 +640,18 @@ fn analyze_topology(
     max_cochange: f64,
 ) -> (TopologyStats, Vec<CycleComponent>) {
     let node_count = nodes.len();
-    let edge_count = edges.iter().filter(|edge| edge.kind == EdgeKind::Dependency).count();
+    let edge_count = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Dependency)
+        .count();
 
     let components = connected_components(undirected);
     let component_count = components.len();
     let mut undirected_edge_set = HashSet::new();
-    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::Dependency) {
+    for edge in edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Dependency)
+    {
         let (a, b) = if edge.src <= edge.dst {
             (edge.src, edge.dst)
         } else {
@@ -704,8 +716,16 @@ fn analyze_topology(
         for edge_idx in &edge_indices {
             let edge = &edges[*edge_idx];
             let cochange = cochange_for_edge(edge, cochange_weights);
-            let dep_norm = if max_weight > 0.0 { edge.weight / max_weight } else { 0.0 };
-            let co_norm = if max_cochange > 0.0 { cochange / max_cochange } else { 0.0 };
+            let dep_norm = if max_weight > 0.0 {
+                edge.weight / max_weight
+            } else {
+                0.0
+            };
+            let co_norm = if max_cochange > 0.0 {
+                cochange / max_cochange
+            } else {
+                0.0
+            };
             let persistence = DEPENDENCY_WEIGHT * dep_norm + COCHANGE_WEIGHT * co_norm;
             let cut_score = 1.0 - persistence;
             cycle_edges.push(CycleEdge {
@@ -722,11 +742,14 @@ fn analyze_topology(
             min_weight = 0.0;
         }
 
-        let cycle_rank =
-            ((edge_indices.len() as isize) - (scc.len() as isize) + 1).max(0) as usize;
+        let cycle_rank = ((edge_indices.len() as isize) - (scc.len() as isize) + 1).max(0) as usize;
         let mut node_paths: Vec<String> = scc.iter().map(|idx| nodes[*idx].clone()).collect();
         node_paths.sort();
-        cycle_edges.sort_by(|a, b| b.cut_score.partial_cmp(&a.cut_score).unwrap_or(std::cmp::Ordering::Equal));
+        cycle_edges.sort_by(|a, b| {
+            b.cut_score
+                .partial_cmp(&a.cut_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         cycles.push(CycleComponent {
             id,
@@ -987,7 +1010,7 @@ fn triangle_boundary_rank(
     if edge_count == 0 || triangles.is_empty() {
         return 0;
     }
-    let word_len = (edge_count + 63) / 64;
+    let word_len = edge_count.div_ceil(64);
     let mut rows: Vec<Vec<u64>> = Vec::with_capacity(triangles.len());
 
     for triangle in triangles {
@@ -1045,10 +1068,7 @@ struct VolumeGroup {
     cohesion: f64,
 }
 
-fn group_triangles(
-    snapshot: &TopologySnapshot,
-    triangles: &[[usize; 3]],
-) -> Vec<VolumeGroup> {
+fn group_triangles(snapshot: &TopologySnapshot, triangles: &[[usize; 3]]) -> Vec<VolumeGroup> {
     if triangles.is_empty() {
         return Vec::new();
     }
@@ -1140,7 +1160,7 @@ fn group_triangles(
 #[cfg(test)]
 mod extra_tests {
     use super::*;
-    use crate::topology::layers::{check_layers, Layer, LayerConfig};
+    use crate::topology::layers::{Layer, LayerConfig, check_layers};
     use std::collections::{BTreeSet, HashSet};
 
     fn snapshot_from_edges(edges: &[(&str, &str, i64)]) -> TopologySnapshot {
@@ -1161,10 +1181,8 @@ mod extra_tests {
 
     #[test]
     fn shortest_path_finds_dependency_route() -> Result<()> {
-        let snapshot = snapshot_from_edges(&[
-            ("src/a.rs", "src/b.rs", 1),
-            ("src/b.rs", "src/c.rs", 1),
-        ]);
+        let snapshot =
+            snapshot_from_edges(&[("src/a.rs", "src/b.rs", 1), ("src/b.rs", "src/c.rs", 1)]);
 
         let path = snapshot.shortest_path("src/a.rs", "src/c.rs")?;
         assert_eq!(path, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
@@ -1190,10 +1208,8 @@ mod extra_tests {
 
     #[test]
     fn hotspots_include_all_nodes() {
-        let snapshot = snapshot_from_edges(&[
-            ("src/a.rs", "src/b.rs", 5),
-            ("src/b.rs", "src/c.rs", 1),
-        ]);
+        let snapshot =
+            snapshot_from_edges(&[("src/a.rs", "src/b.rs", 5), ("src/b.rs", "src/c.rs", 1)]);
 
         let hotspots = snapshot.hotspots(0, 10, 0.85);
         let nodes: HashSet<&str> = hotspots.iter().map(|(node, _)| node.as_str()).collect();
@@ -1205,11 +1221,8 @@ mod extra_tests {
 
     #[test]
     fn layers_detect_disallowed_dependency() {
-        let snapshot = snapshot_from_edges(&[(
-            "src/domain/model.rs",
-            "src/application/service.rs",
-            1,
-        )]);
+        let snapshot =
+            snapshot_from_edges(&[("src/domain/model.rs", "src/application/service.rs", 1)]);
 
         let config = LayerConfig {
             layers: vec![
@@ -1265,7 +1278,11 @@ fn build_refactor_plan(snapshot: &TopologySnapshot, options: RefactorOptions) ->
                 b.cut_score
                     .partial_cmp(&a.cut_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| {
+                        a.weight
+                            .partial_cmp(&b.weight)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| a.src.cmp(&b.src))
                     .then_with(|| a.dst.cmp(&b.dst))
             });
@@ -1282,7 +1299,8 @@ fn build_refactor_plan(snapshot: &TopologySnapshot, options: RefactorOptions) ->
             };
 
             removed.push(candidate.clone());
-            remaining_edges.retain(|edge| !(edge.src == candidate.src && edge.dst == candidate.dst));
+            remaining_edges
+                .retain(|edge| !(edge.src == candidate.src && edge.dst == candidate.dst));
         }
 
         for cut in removed {
@@ -1319,8 +1337,12 @@ fn has_cycle_in_component(node_set: &HashSet<String>, edges: &[CycleEdge]) -> bo
     let mut indegree = vec![0usize; node_count];
     let mut outgoing = vec![Vec::new(); node_count];
     for edge in edges {
-        let Some(&src) = index.get(&edge.src) else { continue };
-        let Some(&dst) = index.get(&edge.dst) else { continue };
+        let Some(&src) = index.get(&edge.src) else {
+            continue;
+        };
+        let Some(&dst) = index.get(&edge.dst) else {
+            continue;
+        };
         outgoing[src].push(dst);
         indegree[dst] += 1;
     }
@@ -1406,22 +1428,25 @@ mod tests {
         assert_eq!(plan.cuts[0].dst, "c");
     }
 
-
     #[test]
     fn star_neighborhood_respects_depth() {
-        let snapshot = snapshot_from_edges(&[
-            ("a", "b", 1),
-            ("b", "c", 1),
-            ("c", "d", 1),
-        ]);
+        let snapshot = snapshot_from_edges(&[("a", "b", 1), ("b", "c", 1), ("c", "d", 1)]);
         let depth1 = snapshot.star_neighborhood("a", 1).expect("star");
         assert_eq!(depth1.len(), 1);
         assert_eq!(depth1[0].path, "b");
         assert_eq!(depth1[0].distance, 1);
 
         let depth2 = snapshot.star_neighborhood("a", 2).expect("star");
-        assert!(depth2.iter().any(|item| item.path == "b" && item.distance == 1));
-        assert!(depth2.iter().any(|item| item.path == "c" && item.distance == 2));
+        assert!(
+            depth2
+                .iter()
+                .any(|item| item.path == "b" && item.distance == 1)
+        );
+        assert!(
+            depth2
+                .iter()
+                .any(|item| item.path == "c" && item.distance == 2)
+        );
         assert!(!depth2.iter().any(|item| item.path == "d"));
     }
 

@@ -174,22 +174,22 @@ impl WorkspaceDetector {
             let package_json = dir.join("package.json");
             if package_json.exists() {
                 let content = std::fs::read_to_string(&package_json)?;
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(workspaces) = json.get("workspaces") {
-                        let workspace_list = match workspaces {
-                            serde_json::Value::Array(arr) => arr.clone(),
-                            serde_json::Value::Object(obj) => obj
-                                .get("packages")
-                                .and_then(|packages| packages.as_array())
-                                .cloned()
-                                .unwrap_or_default(),
-                            _ => Vec::new(),
-                        };
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                    && let Some(workspaces) = json.get("workspaces")
+                {
+                    let workspace_list = match workspaces {
+                        serde_json::Value::Array(arr) => arr.clone(),
+                        serde_json::Value::Object(obj) => obj
+                            .get("packages")
+                            .and_then(|packages| packages.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
 
-                        for ws in workspace_list {
-                            if let Some(ws_str) = ws.as_str() {
-                                push_workspace_package(&mut packages, dir, ws_str, "node");
-                            }
+                    for ws in workspace_list {
+                        if let Some(ws_str) = ws.as_str() {
+                            push_workspace_package(&mut packages, dir, ws_str, "node");
                         }
                     }
                 }
@@ -200,12 +200,12 @@ impl WorkspaceDetector {
             let lerna_json = dir.join("lerna.json");
             if lerna_json.exists() {
                 let content = std::fs::read_to_string(&lerna_json)?;
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(list) = json.get("packages").and_then(|value| value.as_array()) {
-                        for entry in list {
-                            if let Some(path) = entry.as_str() {
-                                push_workspace_package(&mut packages, dir, path, "node");
-                            }
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                    && let Some(list) = json.get("packages").and_then(|value| value.as_array())
+                {
+                    for entry in list {
+                        if let Some(path) = entry.as_str() {
+                            push_workspace_package(&mut packages, dir, path, "node");
                         }
                     }
                 }
@@ -316,10 +316,7 @@ impl WorkspaceDetector {
         }))
     }
 
-    fn detect_bazel_workspace(
-        dir: &Path,
-        files: &[String],
-    ) -> Result<Option<WorkspaceConfig>> {
+    fn detect_bazel_workspace(dir: &Path, files: &[String]) -> Result<Option<WorkspaceConfig>> {
         let workspace_root = dir.join("WORKSPACE").exists()
             || dir.join("WORKSPACE.bazel").exists()
             || dir.join("MODULE.bazel").exists();
@@ -424,10 +421,7 @@ impl WorkspaceDetector {
         }))
     }
 
-    fn detect_elixir_workspace(
-        dir: &Path,
-        files: &[String],
-    ) -> Result<Option<WorkspaceConfig>> {
+    fn detect_elixir_workspace(dir: &Path, files: &[String]) -> Result<Option<WorkspaceConfig>> {
         let mix_exs = dir.join("mix.exs");
         if !mix_exs.exists() {
             return Ok(None);
@@ -572,10 +566,7 @@ impl WorkspaceDetector {
         }))
     }
 
-    fn detect_ruby_workspace(
-        dir: &Path,
-        files: &[String],
-    ) -> Result<Option<WorkspaceConfig>> {
+    fn detect_ruby_workspace(dir: &Path, files: &[String]) -> Result<Option<WorkspaceConfig>> {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
         for file in files {
@@ -620,10 +611,10 @@ impl WorkspaceDetector {
         for repo in repos {
             let repo_type = repo.get("type").and_then(|value| value.as_str());
             let repo_url = repo.get("url").and_then(|value| value.as_str());
-            if repo_type == Some("path") {
-                if let Some(path) = repo_url {
-                    push_workspace_package(&mut packages, dir, path, "php");
-                }
+            if repo_type == Some("path")
+                && let Some(path) = repo_url
+            {
+                push_workspace_package(&mut packages, dir, path, "php");
             }
         }
         if packages.is_empty() {
@@ -660,10 +651,7 @@ impl WorkspaceDetector {
         }))
     }
 
-    fn detect_dotnet_workspace(
-        dir: &Path,
-        files: &[String],
-    ) -> Result<Option<WorkspaceConfig>> {
+    fn detect_dotnet_workspace(dir: &Path, files: &[String]) -> Result<Option<WorkspaceConfig>> {
         let mut has_marker = false;
         let mut solution_path = None;
         for file in files {
@@ -689,26 +677,24 @@ impl WorkspaceDetector {
             }
         }
 
-        if !has_marker {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                        continue;
-                    };
-                    let lower = name.to_ascii_lowercase();
-                    if lower.ends_with(".sln")
-                        || lower.ends_with(".slnx")
-                        || lower.ends_with(".csproj")
-                        || lower.ends_with(".fsproj")
-                        || lower.ends_with(".vbproj")
-                    {
-                        has_marker = true;
-                        if solution_path.is_none() && lower.ends_with(".sln") {
-                            solution_path = Some(path);
-                        }
-                        break;
+        if !has_marker && let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".sln")
+                    || lower.ends_with(".slnx")
+                    || lower.ends_with(".csproj")
+                    || lower.ends_with(".fsproj")
+                    || lower.ends_with(".vbproj")
+                {
+                    has_marker = true;
+                    if solution_path.is_none() && lower.ends_with(".sln") {
+                        solution_path = Some(path);
                     }
+                    break;
                 }
             }
         }
@@ -720,13 +706,13 @@ impl WorkspaceDetector {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        if let Some(solution_path) = solution_path {
-            if let Ok(content) = std::fs::read_to_string(&solution_path) {
-                let sln_dir = solution_path.parent().unwrap_or(dir);
-                for project in parse_sln_projects(&content) {
-                    let project_path = sln_dir.join(&project);
-                    push_dotnet_project(&mut packages, &mut seen, dir, &project_path);
-                }
+        if let Some(solution_path) = solution_path
+            && let Ok(content) = std::fs::read_to_string(&solution_path)
+        {
+            let sln_dir = solution_path.parent().unwrap_or(dir);
+            for project in parse_sln_projects(&content) {
+                let project_path = sln_dir.join(&project);
+                push_dotnet_project(&mut packages, &mut seen, dir, &project_path);
             }
         }
 
@@ -840,11 +826,7 @@ pub fn detect_stack_from_path(path: &Path, stack: &mut BTreeSet<String>) {
         "cargo.toml" | "cargo.lock" => {
             stack.insert("Rust".to_string());
         }
-        "package.json"
-        | "pnpm-lock.yaml"
-        | "yarn.lock"
-        | "bun.lockb"
-        | "bun.lock"
+        "package.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lockb" | "bun.lock"
         | "package-lock.json" => {
             stack.insert("Node.js".to_string());
         }
@@ -905,11 +887,7 @@ pub fn detect_stack_from_path(path: &Path, stack: &mut BTreeSet<String>) {
         "package.swift" => {
             stack.insert("Swift".to_string());
         }
-        "workspace"
-        | "workspace.bazel"
-        | "module.bazel"
-        | "build"
-        | "build.bazel" => {
+        "workspace" | "workspace.bazel" | "module.bazel" | "build" | "build.bazel" => {
             stack.insert("Bazel".to_string());
         }
         _ => {}
@@ -1120,7 +1098,10 @@ fn expand_workspace_pattern(repo_root: &Path, pattern: &str) -> Vec<String> {
         if !path.is_dir() {
             continue;
         }
-        let dir_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let dir_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if dir_name.is_empty() {
             continue;
         }
@@ -1212,17 +1193,17 @@ fn parse_elixir_apps_path(content: &str) -> Option<String> {
         if !line.contains("apps_path") {
             continue;
         }
-        if let Some(start) = line.find('"') {
-            if let Some(end) = line[start + 1..].find('"') {
-                let value = &line[start + 1..start + 1 + end];
-                return Some(value.trim().to_string());
-            }
+        if let Some(start) = line.find('"')
+            && let Some(end) = line[start + 1..].find('"')
+        {
+            let value = &line[start + 1..start + 1 + end];
+            return Some(value.trim().to_string());
         }
-        if let Some(start) = line.find('\'') {
-            if let Some(end) = line[start + 1..].find('\'') {
-                let value = &line[start + 1..start + 1 + end];
-                return Some(value.trim().to_string());
-            }
+        if let Some(start) = line.find('\'')
+            && let Some(end) = line[start + 1..].find('\'')
+        {
+            let value = &line[start + 1..start + 1 + end];
+            return Some(value.trim().to_string());
         }
     }
     None
@@ -1235,7 +1216,7 @@ fn strip_json_comments(content: &str) -> String {
         if ch == '"' {
             out.push(ch);
             let mut escaped = false;
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 out.push(next);
                 if escaped {
                     escaped = false;
@@ -1254,7 +1235,7 @@ fn strip_json_comments(content: &str) -> String {
         if ch == '/' {
             if let Some('/') = chars.peek().copied() {
                 chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if next == '\n' {
                         out.push('\n');
                         break;
@@ -1265,11 +1246,11 @@ fn strip_json_comments(content: &str) -> String {
             if let Some('*') = chars.peek().copied() {
                 chars.next();
                 while let Some(next) = chars.next() {
-                    if next == '*' {
-                        if let Some('/') = chars.peek().copied() {
-                            chars.next();
-                            break;
-                        }
+                    if next == '*'
+                        && let Some('/') = chars.peek().copied()
+                    {
+                        chars.next();
+                        break;
                     }
                 }
                 continue;
@@ -1323,10 +1304,10 @@ fn parse_sbt_modules(content: &str) -> Vec<String> {
         }
         if let Some(start) = trimmed.find("lazy val") {
             let rest = trimmed[start + "lazy val".len()..].trim();
-            if let Some(name) = rest.split_whitespace().next() {
-                if !name.is_empty() {
-                    modules.push(name.to_string());
-                }
+            if let Some(name) = rest.split_whitespace().next()
+                && !name.is_empty()
+            {
+                modules.push(name.to_string());
             }
         }
     }
@@ -1390,7 +1371,7 @@ fn extract_quoted_strings(line: &str) -> Vec<String> {
         if ch == '"' || ch == '\'' {
             let quote = ch;
             let mut value = String::new();
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if next == quote {
                     break;
                 }
@@ -1477,14 +1458,12 @@ fn stack_marker_ecosystem(file_name: &str) -> Option<&'static str> {
 
 fn normalize_repo_path(repo_root: &Path, file_path: &str) -> String {
     let path = Path::new(file_path);
-    if path.is_absolute() {
-        if let Ok(stripped) = path.strip_prefix(repo_root) {
-            if let Some(rel) = stripped.to_str() {
-                if !rel.is_empty() {
-                    return rel.replace('\\', "/");
-                }
-            }
-        }
+    if path.is_absolute()
+        && let Ok(stripped) = path.strip_prefix(repo_root)
+        && let Some(rel) = stripped.to_str()
+        && !rel.is_empty()
+    {
+        return rel.replace('\\', "/");
     }
     file_path.replace('\\', "/")
 }
@@ -1606,10 +1585,7 @@ fn infer_ecosystem_from_stack(stack: &BTreeSet<String>) -> String {
     if stack.contains("Deno") {
         return "deno".to_string();
     }
-    if stack.contains("Node.js")
-        || stack.contains("JavaScript")
-        || stack.contains("TypeScript")
-    {
+    if stack.contains("Node.js") || stack.contains("JavaScript") || stack.contains("TypeScript") {
         return "node".to_string();
     }
     if stack.contains("Python") {
@@ -1720,16 +1696,16 @@ fn find_workspace_root(repo_root: &Path, start: &Path) -> PathBuf {
 
 fn has_workspace_marker(dir: &Path) -> bool {
     let cargo_toml = dir.join("Cargo.toml");
-    if cargo_toml.exists() {
-        if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-            if let Ok(doc) = content.parse::<DocumentMut>() {
-                if doc.get("workspace").is_some() {
-                    return true;
-                }
-            }
-            if content.contains("[workspace]") {
-                return true;
-            }
+    if cargo_toml.exists()
+        && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+    {
+        if let Ok(doc) = content.parse::<DocumentMut>()
+            && doc.get("workspace").is_some()
+        {
+            return true;
+        }
+        if content.contains("[workspace]") {
+            return true;
         }
     }
 
@@ -1764,12 +1740,11 @@ fn has_workspace_marker(dir: &Path) -> bool {
     }
 
     let pom = dir.join("pom.xml");
-    if pom.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pom) {
-            if content.contains("<modules>") {
-                return true;
-            }
-        }
+    if pom.exists()
+        && let Ok(content) = std::fs::read_to_string(&pom)
+        && content.contains("<modules>")
+    {
+        return true;
     }
 
     let turbo = dir.join("turbo.json");
@@ -1788,68 +1763,62 @@ fn has_workspace_marker(dir: &Path) -> bool {
     }
 
     let package_json = dir.join("package.json");
-    if package_json.exists() {
-        if let Ok(content) = std::fs::read_to_string(&package_json) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if json.get("workspaces").is_some() {
-                    return true;
-                }
-            }
-        }
+    if package_json.exists()
+        && let Ok(content) = std::fs::read_to_string(&package_json)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && json.get("workspaces").is_some()
+    {
+        return true;
     }
 
     for name in ["deno.json", "deno.jsonc"] {
         let path = dir.join(name);
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let normalized = if name.ends_with("jsonc") {
-                    strip_json_comments(&content)
-                } else {
-                    content
-                };
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&normalized) {
-                    if json.get("workspace").is_some() {
-                        return true;
-                    }
-                }
+        if path.exists()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let normalized = if name.ends_with("jsonc") {
+                strip_json_comments(&content)
+            } else {
+                content
+            };
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&normalized)
+                && json.get("workspace").is_some()
+            {
+                return true;
             }
         }
     }
 
     let pyproject = dir.join("pyproject.toml");
-    if pyproject.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pyproject) {
-            if let Ok(doc) = content.parse::<DocumentMut>() {
-                let tool = doc.get("tool");
-                if tool
-                    .and_then(|item| item.get("uv"))
-                    .and_then(|item| item.get("workspace"))
-                    .is_some()
-                {
-                    return true;
-                }
-            }
+    if pyproject.exists()
+        && let Ok(content) = std::fs::read_to_string(&pyproject)
+        && let Ok(doc) = content.parse::<DocumentMut>()
+    {
+        let tool = doc.get("tool");
+        if tool
+            .and_then(|item| item.get("uv"))
+            .and_then(|item| item.get("workspace"))
+            .is_some()
+        {
+            return true;
         }
     }
 
     let pubspec = dir.join("pubspec.yaml");
-    if pubspec.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pubspec) {
-            if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                if doc.get("workspace").is_some() {
-                    return true;
-                }
-            }
-        }
+    if pubspec.exists()
+        && let Ok(content) = std::fs::read_to_string(&pubspec)
+        && let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&content)
+        && doc.get("workspace").is_some()
+    {
+        return true;
     }
 
     let mix_exs = dir.join("mix.exs");
-    if mix_exs.exists() {
-        if let Ok(content) = std::fs::read_to_string(&mix_exs) {
-            if parse_elixir_apps_path(&content).is_some() {
-                return true;
-            }
-        }
+    if mix_exs.exists()
+        && let Ok(content) = std::fs::read_to_string(&mix_exs)
+        && parse_elixir_apps_path(&content).is_some()
+    {
+        return true;
     }
 
     if dir.join("WORKSPACE").exists()

@@ -59,10 +59,10 @@ pub fn suggest_next_tasks(
         if issue.status == "closed" || issue.status == "blocked" {
             continue;
         }
-        if let Some(assignee_filter) = assignee {
-            if issue.assignee.as_deref() != Some(assignee_filter) {
-                continue;
-            }
+        if let Some(assignee_filter) = assignee
+            && issue.assignee.as_deref() != Some(assignee_filter)
+        {
+            continue;
         }
 
         let mut blockers = Vec::new();
@@ -122,15 +122,15 @@ pub fn find_stale_issues(
         if issue.status == "closed" {
             continue;
         }
-        if let Some(status_filter) = status {
-            if issue.status != status_filter {
-                continue;
-            }
+        if let Some(status_filter) = status
+            && issue.status != status_filter
+        {
+            continue;
         }
-        if let Some(assignee_filter) = assignee {
-            if issue.assignee.as_deref() != Some(assignee_filter) {
-                continue;
-            }
+        if let Some(assignee_filter) = assignee
+            && issue.assignee.as_deref() != Some(assignee_filter)
+        {
+            continue;
         }
         let age_days = days_since(&issue.updated_at)?;
         if age_days >= days {
@@ -266,8 +266,7 @@ pub fn related_issues_for_issue(
         .iter()
         .map(|label| label.to_ascii_lowercase())
         .collect();
-    let target_dependencies: HashSet<String> =
-        target.dependency_ids().into_iter().collect();
+    let target_dependencies: HashSet<String> = target.dependency_ids().into_iter().collect();
     let target_tokens = tokenize(&target.summary_query());
 
     for issue in issues {
@@ -381,7 +380,7 @@ pub fn infer_issues_from_todos(file_path: &str, content: &str, limit: usize) -> 
             continue;
         }
         let title = trimmed
-            .trim_start_matches(|ch: char| ch == '/' || ch == '*' || ch == '#')
+            .trim_start_matches(['/', '*', '#'])
             .trim()
             .trim_start_matches("TODO")
             .trim_start_matches(':')
@@ -423,12 +422,12 @@ pub fn extract_paths(text: &str) -> Vec<String> {
         if candidate.is_empty() {
             continue;
         }
-        let candidate = candidate.trim_end_matches(|ch: char| ch == '.' || ch == ']' || ch == '}');
+        let candidate = candidate.trim_end_matches(['.', ']', '}']);
         let candidate = strip_line_suffix(candidate);
-        if candidate.contains('/') || candidate.contains('\\') {
-            if candidate.contains('.') || candidate.contains("::") {
-                paths.insert(normalize_path(&candidate));
-            }
+        if (candidate.contains('/') || candidate.contains('\\'))
+            && (candidate.contains('.') || candidate.contains("::"))
+        {
+            paths.insert(normalize_path(&candidate));
         }
     }
     paths.into_iter().collect()
@@ -584,7 +583,7 @@ mod tests {
 
         let pairs = find_duplicates(&[first.clone(), second.clone(), closed], 0.2, 10);
         assert_eq!(pairs.len(), 1);
-        let ids = vec![pairs[0].issue_a.id.clone(), pairs[0].issue_b.id.clone()];
+        let ids = [pairs[0].issue_a.id.clone(), pairs[0].issue_b.id.clone()];
         assert!(ids.contains(&first.id));
         assert!(ids.contains(&second.id));
     }

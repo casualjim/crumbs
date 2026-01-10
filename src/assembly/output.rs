@@ -145,11 +145,15 @@ pub fn render_prompt(
     theme: Option<&str>,
 ) -> String {
     let markdown = render_markdown(payload, sections);
+    render_markdown_terminal(&markdown, theme)
+}
+
+pub(crate) fn render_markdown_terminal(markdown: &str, theme: Option<&str>) -> String {
     if std::io::stdout().is_terminal() {
         let theme = resolve_theme(theme);
-        highlight_markdown(&markdown, &theme)
+        highlight_markdown(markdown, &theme)
     } else {
-        markdown
+        markdown.to_string()
     }
 }
 
@@ -200,7 +204,12 @@ fn render_markdown(payload: &PromptPayload, sections: PromptSections) -> String 
         write_markdown_group(&mut out, "Expanded Context", &expanded);
     }
     if sections.query {
-        writeln!(out, "\n## User Query\n<USER_QUERY>\n{}\n</USER_QUERY>", payload.task).ok();
+        writeln!(
+            out,
+            "\n## User Query\n<USER_QUERY>\n{}\n</USER_QUERY>",
+            payload.task
+        )
+        .ok();
     }
     out
 }
@@ -246,12 +255,41 @@ fn highlight_markdown(markdown: &str, theme: &ResolvedTheme) -> String {
     }
 }
 
+pub(crate) fn highlight_code(text: &str, language: &str, theme: Option<&str>) -> String {
+    if !std::io::stdout().is_terminal() {
+        return text.to_string();
+    }
+    let language = language.trim();
+    if language.is_empty() || language.eq_ignore_ascii_case("text") {
+        return text.to_string();
+    }
+    let language_set = LanguageSetImpl::new();
+    let lang = <Lang as SupportedLanguage<'_, LanguageSetImpl>>::for_name(language, &language_set)
+        .or_else(|_| {
+            let lower = language.to_ascii_lowercase();
+            <Lang as SupportedLanguage<'_, LanguageSetImpl>>::for_name(&lower, &language_set)
+        })
+        .ok();
+    let Some(lang) = lang else {
+        return text.to_string();
+    };
+
+    let mut processor = Processor::new(&language_set);
+    let mut renderer = TerminalRenderer::new(None);
+    let theme = resolve_theme(theme);
+    match processor.process(text, lang) {
+        Ok(highlights) => syntastica::render(&highlights, &mut renderer, theme),
+        Err(_) => text.to_string(),
+    }
+}
+
 fn resolve_theme(theme: Option<&str>) -> ResolvedTheme {
     let override_name = theme.unwrap_or("").trim();
-    if !override_name.is_empty() && override_name != "auto" {
-        if let Some(theme) = syntastica_themes::from_str(override_name) {
-            return theme;
-        }
+    if !override_name.is_empty()
+        && override_name != "auto"
+        && let Some(theme) = syntastica_themes::from_str(override_name)
+    {
+        return theme;
     }
 
     match dark_light::detect() {
@@ -317,17 +355,15 @@ pub async fn build_repository_overview(
     }
 }
 
-async fn build_workspace_summary(
-    repo_root: &Path,
-    db: &dyn Repository,
-) -> Option<String> {
+async fn build_workspace_summary(repo_root: &Path, db: &dyn Repository) -> Option<String> {
     let files = db.list_files().await.ok()?;
     if files.is_empty() {
         return None;
     }
-    let workspace =
-        crate::topology::workspace::detect_workspace_info(repo_root, &files).ok()?;
-    Some(crate::topology::workspace::format_workspace_summary(&workspace))
+    let workspace = crate::topology::workspace::detect_workspace_info(repo_root, &files).ok()?;
+    Some(crate::topology::workspace::format_workspace_summary(
+        &workspace,
+    ))
 }
 
 async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<String> {
@@ -339,15 +375,17 @@ async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<
         return lines;
     }
 
-    let workspace_config =
-        crate::topology::workspace::WorkspaceDetector::detect(repo_root, &files)
-            .ok()
-            .flatten();
+    let workspace_config = crate::topology::workspace::WorkspaceDetector::detect(repo_root, &files)
+        .ok()
+        .flatten();
     let package_map = workspace_config
         .as_ref()
         .map(crate::topology::workspace::build_package_map);
 
-    let ranks = db.file_dependency_pagerank(SUMMARY_LIMIT).await.unwrap_or_default();
+    let ranks = db
+        .file_dependency_pagerank(SUMMARY_LIMIT)
+        .await
+        .unwrap_or_default();
     let core_limit = SUMMARY_CORE_LIMIT.min(ranks.len());
     let mut ranked = std::collections::HashMap::new();
 
@@ -360,28 +398,28 @@ async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<
         if is_test_path(&display_path_value) {
             badges.push("test".to_string());
         }
-        if let Ok(commit_count) = db.file_commit_count(file_path).await {
-            if commit_count >= SUMMARY_HIGH_CHURN_COMMITS {
-                badges.push("high-churn".to_string());
-            }
+        if let Ok(commit_count) = db.file_commit_count(file_path).await
+            && commit_count >= SUMMARY_HIGH_CHURN_COMMITS
+        {
+            badges.push("high-churn".to_string());
         }
         if let Some(config) = &workspace_config {
             let package = crate::topology::workspace::WorkspaceDetector::get_package_for_file(
                 &display_path_value,
                 config,
             )
-                .or_else(|| {
-                    package_map.as_ref().and_then(|map| {
-                        map.iter()
-                            .filter(|(path, _)| {
-                                !path.is_empty()
-                                    && (display_path_value == path.as_str()
-                                        || display_path_value.starts_with(&format!("{path}/")))
-                            })
-                            .map(|(_, name)| name.clone())
-                            .next()
-                    })
-                });
+            .or_else(|| {
+                package_map.as_ref().and_then(|map| {
+                    map.iter()
+                        .filter(|(path, _)| {
+                            !path.is_empty()
+                                && (display_path_value == path.as_str()
+                                    || display_path_value.starts_with(&format!("{path}/")))
+                        })
+                        .map(|(_, name)| name.clone())
+                        .next()
+                })
+            });
             if let Some(package) = package {
                 badges.push(format!("pkg:{package}"));
             }
@@ -432,14 +470,12 @@ async fn build_repository_summary(repo_root: &Path, db: &dyn Repository) -> Vec<
 
 fn display_path(repo_root: &Path, file_path: &str) -> String {
     let path = Path::new(file_path);
-    if path.is_absolute() {
-        if let Ok(stripped) = path.strip_prefix(repo_root) {
-            if let Some(rel) = stripped.to_str() {
-                if !rel.is_empty() {
-                    return rel.replace('\\', "/");
-                }
-            }
-        }
+    if path.is_absolute()
+        && let Ok(stripped) = path.strip_prefix(repo_root)
+        && let Some(rel) = stripped.to_str()
+        && !rel.is_empty()
+    {
+        return rel.replace('\\', "/");
     }
     file_path.replace('\\', "/")
 }
@@ -477,15 +513,13 @@ async fn detect_tech_stack(repo_root: &Path, db: &dyn Repository) -> Vec<String>
 
     let mut stack = std::collections::BTreeSet::new();
     for file in &files {
-        let display = display_path(repo_root, &file);
+        let display = display_path(repo_root, file);
         detect_tech_stack_from_path(Path::new(&display), &mut stack);
         crate::topology::workspace::detect_stack_from_compose(repo_root, &display, &mut stack);
     }
     if let Ok(workspace) = crate::topology::workspace::detect_workspace_info(repo_root, &files) {
         for ecosystem in workspace.ecosystems {
-            if let Some(name) =
-                crate::topology::workspace::stack_name_for_ecosystem(&ecosystem)
-            {
+            if let Some(name) = crate::topology::workspace::stack_name_for_ecosystem(&ecosystem) {
                 stack.insert(name.to_string());
             }
         }
@@ -596,9 +630,7 @@ fn render_repo_map_tree(
                     .score
                     .map(|score| format!(" (rank {:.4})", score))
                     .unwrap_or_default();
-                out.push(format!(
-                    "{prefix}{connector}{name}{badge_text}{score_text}"
-                ));
+                out.push(format!("{prefix}{connector}{name}{badge_text}{score_text}"));
                 *count += 1;
                 if let Some(cochanges) = &entry.cochanges {
                     if *count >= max_entries {
@@ -699,10 +731,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("b.rs") && line.contains("(rank"))
             .expect("expected b.rs in summary map");
-        assert!(
-            b_line.contains("[core]"),
-            "expected core badge on b.rs"
-        );
+        assert!(b_line.contains("[core]"), "expected core badge on b.rs");
         let a_line = summary
             .iter()
             .find(|line| line.contains("a.rs") && line.contains("(rank"))

@@ -6,12 +6,12 @@ use tempfile::TempDir;
 use text_chunking::Tokenizer;
 use tokio::time::sleep;
 
+use crate::Db;
 use crate::db::{ChunkRecord, GraphData, ReferenceRecord, SymbolRecord, build_fts_text};
 use crate::graph::HistoryConfig;
 use crate::repository::Repository;
 use crate::search;
 use crate::test_support::{load_test_embedder, load_test_reranker, write_fixture_repo};
-use crate::Db;
 
 fn make_hash(byte: u8) -> [u8; 32] {
     [byte; 32]
@@ -20,9 +20,7 @@ fn make_hash(byte: u8) -> [u8; 32] {
 async fn setup_db() -> (Db, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("crumbs.db");
-    let db = Db::open(&db_path, Some(2))
-        .await
-        .expect("db open");
+    let db = Db::open(&db_path, Some(2)).await.expect("db open");
     (db, dir)
 }
 
@@ -84,7 +82,7 @@ fn decode_tokens(blob: &[u8]) -> Vec<i32> {
     if blob.is_empty() {
         return Vec::new();
     }
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         panic!("invalid token blob length {}", blob.len());
     }
     blob.chunks_exact(4)
@@ -166,7 +164,10 @@ async fn unchanged_file_chunks_should_not_bump_updated_at() {
         .expect("replace");
     let after = query_updated_at(&dir, "a.rs").await;
 
-    assert_eq!(before, after, "updated_at should not change for identical chunks");
+    assert_eq!(
+        before, after,
+        "updated_at should not change for identical chunks"
+    );
 }
 
 #[tokio::test]
@@ -189,7 +190,10 @@ async fn unchanged_file_graph_should_not_bump_updated_at() {
         .expect("graph replace");
     let after = query_updated_at(&dir, "a.rs").await;
 
-    assert_eq!(before, after, "updated_at should not change for identical graph");
+    assert_eq!(
+        before, after,
+        "updated_at should not change for identical graph"
+    );
 }
 
 #[tokio::test]
@@ -197,7 +201,10 @@ async fn replace_history_edges_should_preserve_existing_edges() {
     let (db, dir) = setup_db().await;
     insert_files(&db, &["a.rs", "b.rs"]).await;
     let db_path = dir.path().join("crumbs.db");
-    let test_db = Builder::new_local(db_path.clone()).build().await.expect("open db");
+    let test_db = Builder::new_local(db_path.clone())
+        .build()
+        .await
+        .expect("open db");
     let conn = test_db.connect().expect("open conn");
     conn.execute(
         "INSERT INTO file_commit_edges (file_path, commit_id) VALUES (?, ?)",
@@ -236,7 +243,10 @@ async fn refresh_file_dependency_edges_should_preserve_existing_edges() {
     let (db, dir) = setup_db().await;
     insert_files(&db, &["a.rs", "b.rs"]).await;
     let db_path = dir.path().join("crumbs.db");
-    let test_db = Builder::new_local(db_path.clone()).build().await.expect("open db");
+    let test_db = Builder::new_local(db_path.clone())
+        .build()
+        .await
+        .expect("open db");
     let conn = test_db.connect().expect("open conn");
     conn.execute(
         "INSERT INTO file_dependency_edges (src_path, dst_path, reference_count) VALUES (?, ?, ?)",
@@ -320,7 +330,11 @@ async fn tokens_should_update_without_embedding() {
         .expect("update");
 
     let tokens = query_tokens(&dir, "c1").await;
-    assert_eq!(tokens, vec![9, 9], "tokens should be updated for existing chunks");
+    assert_eq!(
+        tokens,
+        vec![9, 9],
+        "tokens should be updated for existing chunks"
+    );
 }
 
 #[tokio::test]
@@ -481,5 +495,8 @@ async fn refresh_file_dependency_edges_should_include_multi_definitions() {
         .expect("count query");
     let row = rows.next().await.expect("rows").expect("row");
     let count: i64 = row.get(0).expect("count");
-    assert!(count > 0, "multi-definition symbols should still create dependencies");
+    assert!(
+        count > 0,
+        "multi-definition symbols should still create dependencies"
+    );
 }

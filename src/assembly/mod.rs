@@ -1,5 +1,5 @@
-pub mod pipeline;
 pub mod output;
+pub mod pipeline;
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
