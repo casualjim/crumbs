@@ -348,6 +348,8 @@ async fn main() -> Result<()> {
                     };
                     let issue_context =
                         build_issue_context(&db, &issue, &pipeline_config.context).await?;
+                    let issue_header = (!options.no_issue_header)
+                        .then(|| render_issue_header_markdown(&issue, &issue_context));
                     let pipeline = assembly::pipeline::default_pipeline(&pipeline_config, budget);
                     let mut arena = assembly::Arena::new();
                     let input = arena.insert(assembly::pipeline::QueryInput {
@@ -371,6 +373,9 @@ async fn main() -> Result<()> {
                         assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
                     if let Some(spinner) = spinner {
                         spinner.finish_and_clear();
+                    }
+                    if let Some(issue_header) = issue_header {
+                        print!("{issue_header}");
                     }
                     print!("{rendered}");
                 }
@@ -1143,6 +1148,55 @@ async fn main() -> Result<()> {
                         print_issue_summary(&issue);
                     }
                 }
+                config::IssueCommand::Dashboard(options) => {
+                    let filters = IssueFilters {
+                        status: Some("in-progress".to_string()),
+                        assignee: options.assignee.clone(),
+                        label: None,
+                        issue_type: None,
+                        priority: None,
+                        limit: Some(options.in_progress_limit),
+                    };
+                    let in_progress = db.list_issues(filters).await?;
+                    if in_progress.is_empty() {
+                        println!("in-progress: none");
+                    } else {
+                        println!("in-progress:");
+                        for issue in in_progress {
+                            print_issue_summary(&issue);
+                        }
+                    }
+                    println!();
+
+                    let issues = db.list_all_issues().await?;
+                    let suggestions = issue_analysis::suggest_next_tasks(
+                        &issues,
+                        options.assignee.as_deref(),
+                        options.limit,
+                    )?;
+                    if suggestions.is_empty() {
+                        println!("ready: none");
+                    } else {
+                        println!("ready:");
+                        for suggestion in suggestions {
+                            let issue = suggestion.issue;
+                            let blockers = if suggestion.blockers.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" blockers={}", suggestion.blockers.join(","))
+                            };
+                            println!(
+                                "{id} [{status}] p{priority} {title} ({reason}){blockers}",
+                                id = issue.id,
+                                status = issue.status,
+                                priority = issue.priority,
+                                title = issue.title,
+                                reason = suggestion.reason,
+                                blockers = blockers
+                            );
+                        }
+                    }
+                }
                 config::IssueCommand::Sync(options) => {
                     issues::sync_with_git(
                         &db,
@@ -1586,6 +1640,115 @@ fn print_issue(issue: &issues::Issue) {
     if let Some(closed_at) = &issue.closed_at {
         println!("closed_at: {}", closed_at);
     }
+}
+
+fn render_issue_header_markdown(
+    issue: &issues::Issue,
+    issue_context: &assembly::pipeline::IssueContext,
+) -> String {
+    const MAX_FIELD_CHARS: usize = 4000;
+    const MAX_LINKED: usize = 10;
+
+    let mut out = String::new();
+    out.push_str("# Issue\n\n");
+    out.push_str("```yaml\n");
+    out.push_str(&format!("id: {}\n", issue.id));
+    out.push_str(&format!("title: {}\n", issue.title));
+    out.push_str(&format!("status: {}\n", issue.status));
+    out.push_str(&format!("priority: {}\n", issue.priority));
+    out.push_str(&format!("type: {}\n", issue.issue_type));
+    if let Some(assignee) = &issue.assignee
+        && !assignee.trim().is_empty() {
+            out.push_str(&format!("assignee: {assignee}\n"));
+        }
+    if let Some(external_ref) = &issue.external_ref
+        && !external_ref.trim().is_empty() {
+            out.push_str(&format!("external_ref: {external_ref}\n"));
+        }
+    if !issue.labels.is_empty() {
+        out.push_str(&format!("labels: [{}]\n", issue.labels.join(", ")));
+    }
+    if !issue.dependencies.is_empty() {
+        out.push_str(&format!(
+            "dependencies: [{}]\n",
+            format_dependencies(&issue.dependencies)
+        ));
+    }
+    if !issue.relates_to.is_empty() {
+        out.push_str(&format!("relates_to: [{}]\n", issue.relates_to.join(", ")));
+    }
+    if !issue.affected_symbols.is_empty() {
+        out.push_str(&format!(
+            "affected_symbols: [{}]\n",
+            issue.affected_symbols.join(", ")
+        ));
+    }
+    if !issue.duplicate_of.trim().is_empty() {
+        out.push_str(&format!("duplicate_of: {}\n", issue.duplicate_of));
+    }
+    if !issue.superseded_by.trim().is_empty() {
+        out.push_str(&format!("superseded_by: {}\n", issue.superseded_by));
+    }
+    if !issue.created_at.trim().is_empty() {
+        out.push_str(&format!("created_at: {}\n", issue.created_at));
+    }
+    if !issue.updated_at.trim().is_empty() {
+        out.push_str(&format!("updated_at: {}\n", issue.updated_at));
+    }
+    out.push_str("```\n\n");
+
+    let mut push_field = |label: &str, value: &str| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let (snippet, truncated) = truncate_markdown(trimmed, MAX_FIELD_CHARS);
+        out.push_str(&format!("## {label}\n\n"));
+        out.push_str(&snippet);
+        if truncated {
+            out.push_str("\n\n*(truncated)*\n");
+        }
+        out.push_str("\n\n");
+    };
+
+    push_field("Description", &issue.description);
+    push_field("Design", &issue.design);
+    push_field("Acceptance", &issue.acceptance_criteria);
+    push_field("Notes", &issue.notes);
+
+    let mut push_linked = |label: &str, issues: &[issues::Issue]| {
+        if issues.is_empty() {
+            return;
+        }
+        out.push_str(&format!("## {label}\n\n"));
+        for linked in issues.iter().take(MAX_LINKED) {
+            out.push_str(&format!(
+                "- {} [{}] p{} {}\n",
+                linked.id, linked.status, linked.priority, linked.title
+            ));
+        }
+        if issues.len() > MAX_LINKED {
+            out.push_str(&format!("- … ({} more)\n", issues.len() - MAX_LINKED));
+        }
+        out.push('\n');
+    };
+
+    push_linked("Dependencies", &issue_context.dependency_issues);
+    push_linked("Related", &issue_context.related_issues);
+    push_linked("Duplicates", &issue_context.duplicate_issues);
+
+    out
+}
+
+fn truncate_markdown(value: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (String::new(), !value.is_empty());
+    }
+    if value.chars().count() <= max_chars {
+        return (value.to_string(), false);
+    }
+    let snippet: String = value.chars().take(max_chars).collect();
+    (snippet, true)
 }
 
 fn format_dependencies(values: &[issues::Dependency]) -> String {

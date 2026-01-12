@@ -581,6 +581,11 @@ pub enum IssueCommand {
     Edit(IssueEditCli),
     #[command(about = "List issues")]
     List(IssueListCli),
+    #[command(
+        about = "Session hydration (in-progress + ready suggestions)",
+        alias = "pulse"
+    )]
+    Dashboard(IssueDashboardCli),
     #[command(about = "Sync issues.jsonl with git history")]
     Sync(IssueSyncCli),
     #[command(about = "Search issues by text")]
@@ -1003,6 +1008,20 @@ pub struct IssueListCli {
 }
 
 #[derive(Args)]
+pub struct IssueDashboardCli {
+    #[arg(long = "assignee", help = "Filter by assignee")]
+    pub assignee: Option<String>,
+    #[arg(long = "limit", default_value_t = 5, help = "Limit ready suggestions")]
+    pub limit: usize,
+    #[arg(
+        long = "in-progress-limit",
+        default_value_t = 20,
+        help = "Limit in-progress issues shown"
+    )]
+    pub in_progress_limit: usize,
+}
+
+#[derive(Args)]
 pub struct IssueSyncCli {
     #[arg(
         long = "message",
@@ -1026,6 +1045,8 @@ pub struct IssueSearchCli {
 pub struct ContextIssueCli {
     #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
     pub id: String,
+    #[arg(long = "no-issue-header", help = "Omit issue metadata header")]
+    pub no_issue_header: bool,
     #[arg(
         long = "depth",
         default_value_t = 1,

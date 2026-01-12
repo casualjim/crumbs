@@ -86,6 +86,7 @@ Example usage:
 ```
 crumbs issue create "Add reranking fallback" -d "Use FTS when reranker is unavailable" --label search
 crumbs issue update cr-abc123 --status in-progress --add-symbol "src/search.rs"
+crumbs issue dashboard
 crumbs issue list --status open
 crumbs issue ready --assignee ivan
 crumbs issue search "rerank"

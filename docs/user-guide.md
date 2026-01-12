@@ -70,7 +70,7 @@ Issues are stored in two places:
 Typical flow:
 ```
 crumbs issue create "Fix flaky topology test" -d "Track down nondeterminism in refactor plan" --label topology
-crumbs issue ready
+crumbs issue dashboard
 crumbs issue update cr-abc123 --status in-progress --add-symbol "src/topology/refactor.rs"
 crumbs issue edit cr-abc123
 crumbs issue close cr-abc123
@@ -85,7 +85,7 @@ Helpers:
 ## Using with Codex (GPT-5.2)
 
 A practical loop for agent-assisted work:
-1) Pick work: `crumbs issue ready`
+1) Pick work: `crumbs issue dashboard`
 2) Get full context: `crumbs context issue <id> --depth 2 --limit 30`
 3) Work and iterate, then keep the issue updated (`crumbs issue update` / `crumbs issue edit`)
 

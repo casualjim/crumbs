@@ -9,8 +9,8 @@ Goal: pick an actionable issue, assemble high-signal context, implement, then up
 ```
 You are working in a git repo that uses the `crumbs` CLI for local-first issue tracking and context retrieval.
 
-1) Run `crumbs issue ready` and pick the best issue to work on next.
-2) Run `crumbs issue get <id>` and `crumbs context issue <id> --depth 2 --limit 30`.
+1) Run `crumbs issue dashboard` and pick the best issue to work on next.
+2) Run `crumbs context issue <id> --depth 2 --limit 30`.
 3) Use the assembled context to make a concrete code change that resolves the issue.
 4) Update the issue with affected symbols/files and status using `crumbs issue update ...`.
 5) If the change introduces follow-ups, create new issues with clear titles and affected symbols.
@@ -55,4 +55,3 @@ Use crumbs topology tools to guide a refactor:
 4) Assemble context with `crumbs context task "apply topology refactor plan for <cycle>" --scope <dirs>/`.
 5) Implement and validate; then close the issue.
 ```
-
