@@ -258,8 +258,8 @@ mod tests {
     use std::process::Command;
 
     use super::{HistoryConfig, index_history};
+    use niblits::Tokenizer;
     use tempfile::TempDir;
-    use text_chunking::Tokenizer;
 
     use crate::db::Db;
     use crate::indexer::{Indexer, IndexerConfig};

@@ -2,6 +2,8 @@ use std::path::Path;
 
 use confique::Layer;
 use eyre::{Result, eyre};
+use seasoning::embedding::Client as EmbedClient;
+use seasoning::reranker::Client as RerankerClient;
 
 use crate::config;
 pub(crate) fn write_fixture_repo(root: &Path) -> Result<()> {
@@ -41,7 +43,7 @@ module.exports = { add, run };\n",
     Ok(())
 }
 
-pub(crate) fn load_test_embedder() -> Result<(crate::embedding::Client, usize)> {
+pub(crate) fn load_test_embedder() -> Result<(EmbedClient, usize)> {
     let cli = config::Cli {
         config_file: None,
         command: config::Command::Index(config::IndexCli {
@@ -63,7 +65,7 @@ pub(crate) fn load_test_embedder() -> Result<(crate::embedding::Client, usize)> 
     Ok((embedder, cfg.embedding.embedding_dim))
 }
 
-pub(crate) fn load_test_reranker() -> Result<crate::reranker::Client> {
+pub(crate) fn load_test_reranker() -> Result<RerankerClient> {
     let cli = config::Cli {
         config_file: None,
         command: config::Command::Search(config::SearchCli {

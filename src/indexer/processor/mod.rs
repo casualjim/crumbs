@@ -2,11 +2,12 @@ mod finalize;
 mod handlers;
 
 use eyre::{Result, eyre};
-use text_chunking::{Chunk, ProjectChunk};
+use niblits::{Chunk, ProjectChunk};
+use seasoning::BatchItem;
 
 use crate::repository::Repository;
 
-use super::batcher::BatchItem;
+use super::EmbedMeta;
 use super::state::IndexerState;
 
 pub(crate) struct IndexProcessor<'a> {
@@ -15,7 +16,7 @@ pub(crate) struct IndexProcessor<'a> {
 }
 
 pub(crate) enum ProcessorOutput {
-    Batch(BatchItem),
+    Batch(BatchItem<EmbedMeta>),
     RemoveFile(String),
     None,
 }

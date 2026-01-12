@@ -1,7 +1,6 @@
 mod assembly;
 mod config;
 mod db;
-mod embedding;
 mod graph;
 mod indexer;
 mod issue_analysis;
@@ -9,8 +8,6 @@ mod issues;
 mod logging;
 mod progress;
 mod repository;
-mod reqwestx;
-mod reranker;
 mod search;
 #[cfg(test)]
 mod test_support;
@@ -23,27 +20,55 @@ use std::time::Duration;
 use async_trait::async_trait;
 use clap::Parser;
 use eyre::{Result, eyre};
-use text_chunking::Tokenizer;
+use niblits::Tokenizer;
+use seasoning::embedding::{Client as EmbedClient, EmbedderConfig, ProviderDialect};
+use seasoning::reranker::{Client as RerankerClient, RerankerConfig};
+use seasoning::{RerankDocument, RerankQuery, RerankingProvider};
+use serde::{Deserialize, Serialize};
 
 use crate::assembly::pipeline::{
     AssembleContext, BudgetAndMerge, DefaultAssembleContext, DefaultBudgetAndMerge,
 };
 use crate::config::{Cli, Command};
 use crate::db::Db;
-use crate::embedding::{Client as EmbedClient, EmbedderConfig, ProviderDialect};
 use crate::indexer::{Indexer, IndexerConfig};
 use crate::issues::{IssueFilters, IssueSearchResult};
 use crate::repository::Repository;
-use crate::reranker::{Client as RerankerClient, RerankerConfig, RerankingProvider};
 use crate::topology::RefactorOptions;
 
 struct NoopReranker;
 
 #[async_trait]
 impl RerankingProvider for NoopReranker {
-    async fn rerank(&self, _query: &str, documents: &[String]) -> Result<Vec<f64>> {
+    async fn rerank(
+        &self,
+        _query: &RerankQuery,
+        documents: &[RerankDocument],
+    ) -> seasoning::Result<Vec<f64>> {
         Ok(vec![0.0; documents.len()])
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IssueFrontmatterDependency {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub dep_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IssueFrontmatter {
+    pub title: String,
+    pub status: String,
+    pub priority: i32,
+    #[serde(rename = "type")]
+    pub issue_type: String,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<IssueFrontmatterDependency>,
 }
 
 #[tokio::main]
@@ -164,151 +189,207 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Prompt(cmd) => {
+        Command::Context(cmd) => {
             let cfg = config::load_config(&cli)?;
             let project = config::resolve_project(&cfg, project_override(&cli.command))?;
-            let cwd = std::env::current_dir().unwrap_or_else(|_| project.repo_path.clone());
-            let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
             let db = Db::open(&project.database_path, Some(cfg.embedding.embedding_dim)).await?;
-            let progress_watch = progress::watch_spinner("assembling prompt");
+            let progress_watch = progress::watch_spinner("assembling context");
             let (spinner, progress_tx) = match progress_watch {
                 Some((spinner, tx)) => (Some(spinner), Some(tx)),
                 None => (None, None),
             };
 
-            let selection_opts = assembly::SelectionOptions {
-                scope_paths: cmd.scope.clone(),
-                explicit_includes: cmd.include.clone(),
-                explicit_excludes: cmd.exclude.clone(),
-                pinned_items: cmd.pin.clone(),
-            };
+            match &cmd.command {
+                config::ContextCommand::Task(task) => {
+                    let task = task.as_ref();
+                    let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+                    let selection_opts = assembly::SelectionOptions {
+                        scope_paths: task.scope.clone(),
+                        explicit_includes: task.include.clone(),
+                        explicit_excludes: task.exclude.clone(),
+                        pinned_items: task.pin.clone(),
+                    };
 
-            let max_tokens = if cmd.max_tokens == 0 {
-                Some(cfg.embedding.context_length)
-            } else {
-                Some(cmd.max_tokens)
-            };
-            let prompt_tokenizer_value = cmd
-                .prompt
-                .tokenizer
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| cfg.prompt.tokenizer.clone());
-            let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
-                tokenizer.clone()
-            } else {
-                parse_tokenizer(&prompt_tokenizer_value)?
-            };
-            let prompt_theme_value = cmd
-                .prompt
-                .theme
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| cfg.prompt.theme.clone());
-            let prompt_theme = if prompt_theme_value.trim().is_empty() {
-                None
-            } else {
-                Some(prompt_theme_value)
-            };
-            let budget = assembly::pipeline::BudgetOptions {
-                max_tokens,
-                reserved_output_tokens: cmd.reserved_output_tokens,
-                tokenizer: Some(prompt_tokenizer),
-            };
-            let sections = resolve_sections(&cmd.sections);
+                    let max_tokens = if task.max_tokens == 0 {
+                        Some(cfg.embedding.context_length)
+                    } else {
+                        Some(task.max_tokens)
+                    };
+                    let prompt_tokenizer_value = task
+                        .prompt
+                        .tokenizer
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| cfg.prompt.tokenizer.clone());
+                    let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
+                        tokenizer.clone()
+                    } else {
+                        parse_tokenizer(&prompt_tokenizer_value)?
+                    };
+                    let prompt_theme_value = task
+                        .prompt
+                        .theme
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| cfg.prompt.theme.clone());
+                    let prompt_theme = if prompt_theme_value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(prompt_theme_value)
+                    };
+                    let budget = assembly::pipeline::BudgetOptions {
+                        max_tokens,
+                        reserved_output_tokens: task.reserved_output_tokens,
+                        tokenizer: Some(prompt_tokenizer),
+                    };
+                    let sections = resolve_sections(&task.sections);
 
-            let (blocks, warnings) = if cmd.topology {
-                let snapshot =
-                    topology::TopologySnapshot::load_with_workspace(&db, &project.repo_path, &cwd)
+                    let embedder = build_embedder(&cfg.embedding)?;
+                    let reranker = build_reranker(&cfg)?;
+                    let ctx = assembly::AssemblyContext {
+                        repo_path: &project.repo_path,
+                        db: &db,
+                        embedder: Some(&embedder),
+                        reranker: &reranker as &dyn RerankingProvider,
+                        config: &cfg,
+                        selection: selection_opts.clone(),
+                    };
+
+                    let progress_callback = progress_tx.as_ref().map(|tx| {
+                        let tx = tx.clone();
+                        std::sync::Arc::new(move |message: &'static str| {
+                            let _ = tx.send(message);
+                        })
+                            as std::sync::Arc<dyn Fn(&'static str) + Send + Sync>
+                    });
+                    let pipeline_budget = assembly::pipeline::BudgetOptions {
+                        max_tokens: budget.max_tokens,
+                        reserved_output_tokens: budget.reserved_output_tokens,
+                        tokenizer: budget.tokenizer.clone(),
+                    };
+                    let pipeline = assembly::pipeline::default_pipeline_with_progress(
+                        &cfg,
+                        pipeline_budget,
+                        progress_callback,
+                    );
+                    let mut arena = assembly::Arena::new();
+                    let input = arena.insert(assembly::pipeline::QueryInput {
+                        text: task.task.clone(),
+                        issue_context: None,
+                    });
+                    let progress = progress_tx.clone();
+                    let handle = pipeline
+                        .run_with_progress(&ctx, &mut arena, input, |message| {
+                            if let Some(progress) = &progress {
+                                let _ = progress.send(message);
+                            }
+                        })
                         .await?;
-                let seed_sources = collect_seed_sources(
-                    &project.repo_path,
-                    &snapshot,
-                    &selection_opts,
-                    &cmd.include,
-                    &cmd.pin,
-                )?;
-                let selection = select_topology_files(
-                    &snapshot,
-                    &selection_opts,
-                    seed_sources,
-                    cmd.topology_depth,
-                    cmd.topology_limit,
-                )?;
-                let blocks = build_topology_blocks(&db, &selection, cmd.topology_per_file).await?;
-                let max_blocks = cmd
-                    .topology_limit
-                    .saturating_mul(cmd.topology_per_file.max(1));
-                let noop = NoopReranker;
-                let ctx = assembly::AssemblyContext {
-                    repo_path: &project.repo_path,
-                    db: &db,
-                    embedder: None,
-                    reranker: &noop,
-                    config: &cfg,
-                    selection: selection_opts.clone(),
-                };
-                budget_blocks(&ctx, blocks, selection.warnings, &budget, max_blocks).await?
-            } else {
-                let embedder = build_embedder(&cfg.embedding)?;
-                let reranker = build_reranker(&cfg)?;
-                let ctx = assembly::AssemblyContext {
-                    repo_path: &project.repo_path,
-                    db: &db,
-                    embedder: Some(&embedder),
-                    reranker: &reranker as &dyn RerankingProvider,
-                    config: &cfg,
-                    selection: selection_opts.clone(),
-                };
+                    let assembled = arena.get(handle);
 
-                let progress_callback = progress_tx.as_ref().map(|tx| {
-                    let tx = tx.clone();
-                    std::sync::Arc::new(move |message: &'static str| {
-                        let _ = tx.send(message);
-                    }) as std::sync::Arc<dyn Fn(&'static str) + Send + Sync>
-                });
-                let pipeline_budget = assembly::pipeline::BudgetOptions {
-                    max_tokens: budget.max_tokens,
-                    reserved_output_tokens: budget.reserved_output_tokens,
-                    tokenizer: budget.tokenizer.clone(),
-                };
-                let pipeline = assembly::pipeline::default_pipeline_with_progress(
-                    &cfg,
-                    pipeline_budget,
-                    progress_callback,
-                );
-                let mut arena = assembly::Arena::new();
-                let input = arena.insert(assembly::pipeline::QueryInput {
-                    text: cmd.task.clone(),
-                });
-                let progress = progress_tx.clone();
-                let handle = pipeline
-                    .run_with_progress(&ctx, &mut arena, input, |message| {
-                        if let Some(progress) = &progress {
-                            let _ = progress.send(message);
-                        }
-                    })
+                    let enriched =
+                        assembly::output::enrich_blocks(&project.repo_path, &db, &assembled.blocks)
+                            .await?;
+                    let overview =
+                        assembly::output::build_repository_overview(&project.repo_path, &db).await;
+                    let payload = assembly::output::PromptPayload {
+                        overview,
+                        task: task.task.clone(),
+                        blocks: enriched,
+                        warnings: assembled.warnings.clone(),
+                    };
+                    let rendered = assembly::output::render_prompt(
+                        &payload,
+                        sections,
+                        prompt_theme.as_deref(),
+                    );
+                    if let Some(spinner) = spinner {
+                        spinner.finish_and_clear();
+                    }
+                    print!("{rendered}");
+                }
+                config::ContextCommand::Issue(options) => {
+                    let options = options.as_ref();
+                    let issue = db
+                        .get_issue(&options.id)
+                        .await?
+                        .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
+                    let selection_opts = assembly::SelectionOptions::default();
+                    let theme_value = resolve_theme_value(&options.theme, &cfg.prompt.theme);
+                    let sections = resolve_sections(&options.sections);
+
+                    let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+                    let embedder = build_embedder(&cfg.embedding)?;
+                    let reranker = build_reranker(&cfg)?;
+                    let prompt_tokenizer_value = cfg.prompt.tokenizer.clone();
+                    let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
+                        tokenizer.clone()
+                    } else {
+                        parse_tokenizer(&prompt_tokenizer_value)?
+                    };
+                    let mut pipeline_config = cfg.clone();
+                    pipeline_config.context.topology_depth = options.depth;
+                    pipeline_config.context.topology_limit = options.limit;
+                    pipeline_config.context.per_file_limit = options.per_file;
+                    pipeline_config.context.max_blocks =
+                        options.limit.saturating_mul(options.per_file.max(1));
+                    let budget = assembly::pipeline::BudgetOptions {
+                        max_tokens: Some(cfg.embedding.context_length),
+                        reserved_output_tokens: 0,
+                        tokenizer: Some(prompt_tokenizer),
+                    };
+                    let ctx = assembly::AssemblyContext {
+                        repo_path: &project.repo_path,
+                        db: &db,
+                        embedder: Some(&embedder),
+                        reranker: &reranker as &dyn RerankingProvider,
+                        config: &pipeline_config,
+                        selection: selection_opts,
+                    };
+                    let issue_context =
+                        build_issue_context(&db, &issue, &pipeline_config.context).await?;
+                    let pipeline = assembly::pipeline::default_pipeline(&pipeline_config, budget);
+                    let mut arena = assembly::Arena::new();
+                    let input = arena.insert(assembly::pipeline::QueryInput {
+                        text: issue.summary_query(),
+                        issue_context: Some(issue_context),
+                    });
+                    let handle = pipeline.run(&ctx, &mut arena, input).await?;
+                    let assembled = arena.get(handle);
+                    let enriched =
+                        assembly::output::enrich_blocks(&project.repo_path, &db, &assembled.blocks)
+                            .await?;
+                    let overview =
+                        assembly::output::build_repository_overview(&project.repo_path, &db).await;
+                    let payload = assembly::output::PromptPayload {
+                        overview,
+                        task: issue.title.clone(),
+                        blocks: enriched,
+                        warnings: assembled.warnings.clone(),
+                    };
+                    let rendered =
+                        assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
+                    if let Some(spinner) = spinner {
+                        spinner.finish_and_clear();
+                    }
+                    print!("{rendered}");
+                }
+                config::ContextCommand::Topology(options) => {
+                    let options = options.as_ref();
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| project.repo_path.clone());
+                    let snapshot = topology::TopologySnapshot::load_with_workspace(
+                        &db,
+                        &project.repo_path,
+                        &cwd,
+                    )
                     .await?;
-                let assembled = arena.get(handle);
-                (assembled.blocks.clone(), assembled.warnings.clone())
-            };
-
-            let enriched =
-                assembly::output::enrich_blocks(&project.repo_path, &db, &blocks).await?;
-            let overview =
-                assembly::output::build_repository_overview(&project.repo_path, &db).await;
-            let payload = assembly::output::PromptPayload {
-                overview,
-                task: cmd.task.clone(),
-                blocks: enriched,
-                warnings,
-            };
-            let rendered =
-                assembly::output::render_prompt(&payload, sections, prompt_theme.as_deref());
-            if let Some(spinner) = spinner {
-                spinner.finish_and_clear();
+                    render_topology_prompt(&db, &project.repo_path, &cfg, &snapshot, options)
+                        .await?;
+                    if let Some(spinner) = spinner {
+                        spinner.finish_and_clear();
+                    }
+                }
             }
-            print!("{rendered}");
         }
         Command::Config(cmd) => match &cmd.command {
             config::ConfigCommand::Show => {
@@ -547,65 +628,6 @@ async fn main() -> Result<()> {
                         println!("warning: {warning}");
                     }
                 }
-                config::TopologyCommand::Assemble(options) => {
-                    let selection_opts = assembly::SelectionOptions::default();
-                    let seed_sources = collect_seed_sources(
-                        &project.repo_path,
-                        &snapshot,
-                        &selection_opts,
-                        &options.files,
-                        &[],
-                    )?;
-                    let selection = select_topology_files(
-                        &snapshot,
-                        &selection_opts,
-                        seed_sources,
-                        options.depth,
-                        options.limit,
-                    )?;
-                    let blocks = build_topology_blocks(&db, &selection, options.per_file).await?;
-                    let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-                    let prompt_tokenizer_value = cfg.prompt.tokenizer.clone();
-                    let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
-                        tokenizer
-                    } else {
-                        parse_tokenizer(&prompt_tokenizer_value)?
-                    };
-                    let budget = assembly::pipeline::BudgetOptions {
-                        max_tokens: Some(cfg.embedding.context_length),
-                        reserved_output_tokens: 0,
-                        tokenizer: Some(prompt_tokenizer),
-                    };
-                    let max_blocks = options.limit.saturating_mul(options.per_file.max(1));
-                    let noop = NoopReranker;
-                    let ctx = assembly::AssemblyContext {
-                        repo_path: &project.repo_path,
-                        db: &db,
-                        embedder: None,
-                        reranker: &noop,
-                        config: &cfg,
-                        selection: selection_opts,
-                    };
-                    let (blocks, warnings) =
-                        budget_blocks(&ctx, blocks, selection.warnings, &budget, max_blocks)
-                            .await?;
-
-                    let enriched =
-                        assembly::output::enrich_blocks(&project.repo_path, &db, &blocks).await?;
-                    let overview =
-                        assembly::output::build_repository_overview(&project.repo_path, &db).await;
-                    let payload = assembly::output::PromptPayload {
-                        overview,
-                        task: options.task.clone(),
-                        blocks: enriched,
-                        warnings,
-                    };
-                    let sections = resolve_sections(&options.sections);
-                    let theme_value = resolve_theme_value(&options.theme, &cfg.prompt.theme);
-                    let rendered =
-                        assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
-                    print!("{rendered}");
-                }
                 config::TopologyCommand::Export(options) => {
                     let export = snapshot.export_graph(options.include_cochange);
                     if options.format == "json" {
@@ -722,10 +744,27 @@ async fn main() -> Result<()> {
 
             match &cmd.command {
                 config::IssueCommand::Create(options) => {
-                    let mut issue = issues::Issue::new(options.title.clone());
-                    if let Some(description) = &options.description {
-                        issue.description = description.clone();
-                    }
+                    let options = options.as_ref();
+                    let description = options.description.clone().unwrap_or_default();
+                    let creator = options
+                        .sender
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("unknown");
+                    let prefix = db
+                        .get_config("issue_id_prefix")
+                        .await?
+                        .unwrap_or_else(|| "gr".to_string());
+                    let issue_id = db
+                        .generate_unique_id(&prefix, &options.title, &description, creator)
+                        .await?;
+                    let mut issue = issues::Issue::new(
+                        issue_id,
+                        options.title.clone(),
+                        description,
+                        options.issue_type.clone(),
+                        options.priority,
+                    );
                     if let Some(design) = &options.design {
                         issue.design = design.clone();
                     }
@@ -736,32 +775,51 @@ async fn main() -> Result<()> {
                         issue.notes = notes.clone();
                     }
                     issue.status = options.status.clone();
-                    issue.priority = options.priority;
-                    issue.issue_type = options.issue_type.clone();
                     issue.assignee = options.assignee.clone();
                     issue.labels = issues::normalize_tags(&options.labels);
-                    issue.dependencies = issues::normalize_dependencies(&options.dependencies);
+                    issue.dependencies =
+                        issues::build_dependencies(&issue.id, &options.dependencies, creator);
                     issue.relates_to = issues::normalize_ids(&options.relates_to);
                     issue.affected_symbols = issues::normalize_symbols(&options.affected_symbols);
-                    issue.external_refs = issues::normalize_external_refs(&options.external_refs);
-                    issue.estimate_minutes = options.estimate_minutes;
-                    issue.duplicate_of = options
-                        .duplicate_of
+                    issue.sender = creator.to_string();
+                    issue.ephemeral = options.ephemeral;
+                    if let Some(replies_to) = &options.replies_to {
+                        issue.replies_to = replies_to.clone();
+                    }
+                    issue.solid_volume = options
+                        .solid_volume
                         .clone()
                         .filter(|value| !value.trim().is_empty());
-                    issue.superseded_by = options
-                        .superseded_by
+                    if let Some(topology_hash) = &options.topology_hash {
+                        issue.topology_hash = topology_hash.clone();
+                    }
+                    issue.is_solid = options.is_solid;
+                    issue.external_ref = options
+                        .external_ref
                         .clone()
                         .filter(|value| !value.trim().is_empty());
-                    issue.comments = issues::build_comments(
-                        &options.comments,
-                        options.comment_author.as_deref(),
-                    );
+                    issue.estimated_minutes = options.estimated_minutes;
+                    if let Some(value) = &options.duplicate_of {
+                        let trimmed = value.trim();
+                        if !trimmed.is_empty() {
+                            issue.duplicate_of = trimmed.to_string();
+                        }
+                    }
+                    if let Some(value) = &options.superseded_by {
+                        let trimmed = value.trim();
+                        if !trimmed.is_empty() {
+                            issue.superseded_by = trimmed.to_string();
+                        }
+                    }
+                    let comment_author = options.comment_author.as_deref().unwrap_or(creator);
+                    issue.comments =
+                        issues::build_comments(&issue.id, &options.comments, comment_author);
                     db.upsert_issue(&issue).await?;
                     issues::export_to_jsonl(&db, &jsonl_path).await?;
                     println!("Created {}", issue.id);
                 }
                 config::IssueCommand::Update(options) => {
+                    let options = options.as_ref();
                     let mut issue = db
                         .get_issue(&options.id)
                         .await?
@@ -797,15 +855,28 @@ async fn main() -> Result<()> {
                             issue.assignee = Some(assignee.clone());
                         }
                     }
+                    let fallback_sender = if issue.sender.trim().is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        issue.sender.clone()
+                    };
+                    let dependency_actor = options
+                        .sender
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| value.to_string())
+                        .unwrap_or(fallback_sender);
                     issue.labels = issues::merge_tags(
                         &issue.labels,
                         &options.add_labels,
                         &options.remove_labels,
                     );
-                    issue.dependencies = issues::merge_dependencies(
+                    issue.dependencies = issues::apply_dependency_changes(
                         &issue.dependencies,
                         &options.add_dependencies,
                         &options.remove_dependencies,
+                        &issue.id,
+                        dependency_actor.as_str(),
                     );
                     issue.relates_to = issues::merge_ids(
                         &issue.relates_to,
@@ -817,64 +888,114 @@ async fn main() -> Result<()> {
                         &options.add_symbols,
                         &options.remove_symbols,
                     );
-                    issue.external_refs = issues::merge_external_refs(
-                        &issue.external_refs,
-                        &options.add_external_refs,
-                        &options.remove_external_refs,
-                    );
-                    if options.clear_estimate {
-                        issue.estimate_minutes = None;
+                    if let Some(sender) = &options.sender {
+                        if sender.trim().is_empty() {
+                            issue.sender.clear();
+                        } else {
+                            issue.sender = sender.clone();
+                        }
                     }
-                    if let Some(value) = options.estimate_minutes {
-                        issue.estimate_minutes = Some(value);
+                    if options.clear_ephemeral {
+                        issue.ephemeral = false;
+                    }
+                    if options.ephemeral {
+                        issue.ephemeral = true;
+                    }
+                    if let Some(replies_to) = &options.replies_to {
+                        issue.replies_to = replies_to.clone();
+                    }
+                    if let Some(value) = &options.solid_volume {
+                        if value.trim().is_empty() {
+                            issue.solid_volume = None;
+                        } else {
+                            issue.solid_volume = Some(value.clone());
+                        }
+                    }
+                    if let Some(value) = &options.topology_hash {
+                        if value.trim().is_empty() {
+                            issue.topology_hash.clear();
+                        } else {
+                            issue.topology_hash = value.clone();
+                        }
+                    }
+                    if options.clear_is_solid {
+                        issue.is_solid = false;
+                    }
+                    if options.is_solid {
+                        issue.is_solid = true;
+                    }
+                    if options.clear_external_ref {
+                        issue.external_ref = None;
+                    }
+                    if let Some(value) = &options.external_ref {
+                        if value.trim().is_empty() {
+                            issue.external_ref = None;
+                        } else {
+                            issue.external_ref = Some(value.clone());
+                        }
+                    }
+                    if options.clear_estimate {
+                        issue.estimated_minutes = None;
+                    }
+                    if let Some(value) = options.estimated_minutes {
+                        issue.estimated_minutes = Some(value);
                     }
                     if options.clear_duplicate {
-                        issue.duplicate_of = None;
+                        issue.duplicate_of.clear();
                     }
                     if let Some(value) = &options.duplicate_of {
                         if value.trim().is_empty() {
-                            issue.duplicate_of = None;
+                            issue.duplicate_of.clear();
                         } else {
-                            issue.duplicate_of = Some(value.clone());
+                            issue.duplicate_of = value.trim().to_string();
                         }
                     }
                     if options.clear_superseded {
-                        issue.superseded_by = None;
+                        issue.superseded_by.clear();
                     }
                     if let Some(value) = &options.superseded_by {
                         if value.trim().is_empty() {
-                            issue.superseded_by = None;
+                            issue.superseded_by.clear();
                         } else {
-                            issue.superseded_by = Some(value.clone());
+                            issue.superseded_by = value.trim().to_string();
                         }
                     }
-                    let new_comments = issues::build_comments(
-                        &options.add_comments,
-                        options.comment_author.as_deref(),
-                    );
+                    let comment_author = options
+                        .comment_author
+                        .as_deref()
+                        .unwrap_or(dependency_actor.as_str());
+                    let new_comments =
+                        issues::build_comments(&issue.id, &options.add_comments, comment_author);
                     if !new_comments.is_empty() {
                         issue.comments.extend(new_comments);
                     }
                     if options.restore {
                         issue.deleted_at = None;
-                        issue.deleted_by = None;
-                        issue.deleted_reason = None;
+                        issue.deleted_by.clear();
+                        issue.delete_reason.clear();
+                        if issue.status.trim().eq_ignore_ascii_case("tombstone") {
+                            issue.status = "open".to_string();
+                        }
                     }
                     if options.mark_deleted {
                         issue.deleted_at = Some(jiff::Timestamp::now().to_string());
+                        issue.status = "tombstone".to_string();
+                        if issue.original_type.trim().is_empty() {
+                            issue.original_type = issue.issue_type.clone();
+                        }
                     }
                     if let Some(value) = &options.deleted_by {
                         if value.trim().is_empty() {
-                            issue.deleted_by = None;
+                            issue.deleted_by.clear();
                         } else {
-                            issue.deleted_by = Some(value.clone());
+                            issue.deleted_by = value.clone();
                         }
                     }
-                    if let Some(value) = &options.deleted_reason {
+                    if let Some(value) = &options.delete_reason {
                         if value.trim().is_empty() {
-                            issue.deleted_reason = None;
+                            issue.delete_reason.clear();
                         } else {
-                            issue.deleted_reason = Some(value.clone());
+                            issue.delete_reason = value.clone();
                         }
                     }
                     issue.touch();
@@ -899,6 +1020,115 @@ async fn main() -> Result<()> {
                         .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
                     print_issue(&issue);
                 }
+                config::IssueCommand::Edit(options) => {
+                    let mut issue = db
+                        .get_issue(&options.id)
+                        .await?
+                        .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
+
+                    let editor_author = db
+                        .get_config("user.name")
+                        .await?
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| {
+                            let sender = issue.sender.trim();
+                            if sender.is_empty() {
+                                None
+                            } else {
+                                Some(sender.to_string())
+                            }
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let frontmatter = IssueFrontmatter {
+                        title: issue.title.clone(),
+                        status: issue.status.clone(),
+                        priority: issue.priority,
+                        issue_type: issue.issue_type.clone(),
+                        assignee: issue.assignee.clone(),
+                        labels: issue.labels.clone(),
+                        dependencies: issue
+                            .dependencies
+                            .iter()
+                            .map(|dep| IssueFrontmatterDependency {
+                                id: dep.depends_on_id.clone(),
+                                dep_type: dep.type_.clone(),
+                            })
+                            .collect(),
+                    };
+
+                    let yaml = serde_yaml::to_string(&frontmatter)?;
+                    let content = format!("---\n{}---\n\n{}", yaml, issue.description);
+
+                    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
+                    use std::io::Write as _;
+                    write!(file, "{content}")?;
+                    file.flush()?;
+
+                    edit::edit_file(file.path())?;
+
+                    let new_content = std::fs::read_to_string(file.path())?;
+                    if !new_content.starts_with("---") {
+                        return Err(eyre!("Invalid format: file must start with ---"));
+                    }
+
+                    let parts: Vec<&str> = new_content.splitn(3, "---").collect();
+                    if parts.len() < 3 {
+                        return Err(eyre!("Invalid format: missing frontmatter delimiters"));
+                    }
+
+                    let yaml_part = parts[1];
+                    let body_part = parts[2].trim().to_string();
+                    let new_frontmatter: IssueFrontmatter = serde_yaml::from_str(yaml_part)
+                        .map_err(|e| eyre!("Invalid frontmatter: {}", e))?;
+
+                    issue.title = new_frontmatter.title;
+                    issue.status = new_frontmatter.status;
+                    issue.priority = new_frontmatter.priority;
+                    issue.issue_type = new_frontmatter.issue_type;
+                    issue.assignee = new_frontmatter.assignee.and_then(|value| {
+                        if value.trim().is_empty() {
+                            None
+                        } else {
+                            Some(value)
+                        }
+                    });
+                    issue.labels = issues::normalize_tags(&new_frontmatter.labels);
+                    issue.description = body_part;
+
+                    // Reconcile dependencies, preserving metadata when possible.
+                    let mut new_deps = Vec::new();
+                    for dep in new_frontmatter.dependencies {
+                        if let Some(existing) = issue
+                            .dependencies
+                            .iter()
+                            .find(|d| d.depends_on_id == dep.id && d.type_ == dep.dep_type)
+                        {
+                            new_deps.push(existing.clone());
+                        } else {
+                            new_deps.push(crate::issues::Dependency {
+                                issue_id: issue.id.clone(),
+                                depends_on_id: dep.id,
+                                type_: dep.dep_type,
+                                created_at: jiff::Timestamp::now().to_string(),
+                                created_by: editor_author.clone(),
+                            });
+                        }
+                    }
+                    issue.dependencies = new_deps;
+
+                    if issue.status.trim().eq_ignore_ascii_case("closed")
+                        && issue.closed_at.is_none()
+                    {
+                        issue.close();
+                    } else {
+                        issue.touch();
+                    }
+
+                    db.upsert_issue(&issue).await?;
+                    issues::export_to_jsonl(&db, &jsonl_path).await?;
+                    println!("Updated {}", issue.id);
+                }
                 config::IssueCommand::List(options) => {
                     let filters = IssueFilters {
                         status: options.status.clone(),
@@ -913,6 +1143,17 @@ async fn main() -> Result<()> {
                         print_issue_summary(&issue);
                     }
                 }
+                config::IssueCommand::Sync(options) => {
+                    issues::sync_with_git(
+                        &db,
+                        &project.repo_path,
+                        &jsonl_path,
+                        &options.message,
+                        !options.no_push,
+                    )
+                    .await?;
+                    println!("Synced issues.");
+                }
                 config::IssueCommand::Search(options) => {
                     let results = db.search_issues(&options.query, options.limit).await?;
                     for IssueSearchResult { issue, score } in results {
@@ -926,132 +1167,7 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                config::IssueCommand::Context(options) => {
-                    let issue = db
-                        .get_issue(&options.id)
-                        .await?
-                        .ok_or_else(|| eyre!("issue not found: {}", options.id))?;
-                    let selection_opts = assembly::SelectionOptions::default();
-                    let theme_value = resolve_theme_value(&options.theme, &cfg.prompt.theme);
-                    let sections = resolve_sections(&options.sections);
-
-                    if issue.affected_symbols.is_empty() {
-                        let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-                        let embedder = build_embedder(&cfg.embedding)?;
-                        let reranker = build_reranker(&cfg)?;
-                        let ctx = assembly::AssemblyContext {
-                            repo_path: &project.repo_path,
-                            db: &db,
-                            embedder: Some(&embedder),
-                            reranker: &reranker as &dyn RerankingProvider,
-                            config: &cfg,
-                            selection: selection_opts,
-                        };
-                        let budget = assembly::pipeline::BudgetOptions {
-                            max_tokens: Some(cfg.embedding.context_length),
-                            reserved_output_tokens: 0,
-                            tokenizer: Some(tokenizer.clone()),
-                        };
-                        let pipeline = assembly::pipeline::default_pipeline(&cfg, budget);
-                        let mut arena = assembly::Arena::new();
-                        let input = arena.insert(assembly::pipeline::QueryInput {
-                            text: issue.summary_query(),
-                        });
-                        let handle = pipeline.run(&ctx, &mut arena, input).await?;
-                        let assembled = arena.get(handle);
-                        let enriched = assembly::output::enrich_blocks(
-                            &project.repo_path,
-                            &db,
-                            &assembled.blocks,
-                        )
-                        .await?;
-                        let overview =
-                            assembly::output::build_repository_overview(&project.repo_path, &db)
-                                .await;
-                        let payload = assembly::output::PromptPayload {
-                            overview,
-                            task: issue.title.clone(),
-                            blocks: enriched,
-                            warnings: assembled.warnings.clone(),
-                        };
-                        let rendered = assembly::output::render_prompt(
-                            &payload,
-                            sections,
-                            theme_value.as_deref(),
-                        );
-                        print!("{rendered}");
-                    } else {
-                        let cwd =
-                            std::env::current_dir().unwrap_or_else(|_| project.repo_path.clone());
-                        let snapshot = topology::TopologySnapshot::load_with_workspace(
-                            &db,
-                            &project.repo_path,
-                            &cwd,
-                        )
-                        .await?;
-                        let seed_sources = collect_seed_sources(
-                            &project.repo_path,
-                            &snapshot,
-                            &selection_opts,
-                            &issue.affected_symbols,
-                            &[],
-                        )?;
-                        let selection = select_topology_files(
-                            &snapshot,
-                            &selection_opts,
-                            seed_sources,
-                            options.depth,
-                            options.limit,
-                        )?;
-                        let blocks =
-                            build_topology_blocks(&db, &selection, options.per_file).await?;
-                        let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
-                        let prompt_tokenizer_value = cfg.prompt.tokenizer.clone();
-                        let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
-                            tokenizer
-                        } else {
-                            parse_tokenizer(&prompt_tokenizer_value)?
-                        };
-                        let budget = assembly::pipeline::BudgetOptions {
-                            max_tokens: Some(cfg.embedding.context_length),
-                            reserved_output_tokens: 0,
-                            tokenizer: Some(prompt_tokenizer),
-                        };
-                        let max_blocks = options.limit.saturating_mul(options.per_file.max(1));
-                        let noop = NoopReranker;
-                        let ctx = assembly::AssemblyContext {
-                            repo_path: &project.repo_path,
-                            db: &db,
-                            embedder: None,
-                            reranker: &noop,
-                            config: &cfg,
-                            selection: selection_opts,
-                        };
-                        let (blocks, warnings) =
-                            budget_blocks(&ctx, blocks, selection.warnings, &budget, max_blocks)
-                                .await?;
-
-                        let enriched =
-                            assembly::output::enrich_blocks(&project.repo_path, &db, &blocks)
-                                .await?;
-                        let overview =
-                            assembly::output::build_repository_overview(&project.repo_path, &db)
-                                .await;
-                        let payload = assembly::output::PromptPayload {
-                            overview,
-                            task: issue.title.clone(),
-                            blocks: enriched,
-                            warnings,
-                        };
-                        let rendered = assembly::output::render_prompt(
-                            &payload,
-                            sections,
-                            theme_value.as_deref(),
-                        );
-                        print!("{rendered}");
-                    }
-                }
-                config::IssueCommand::Next(options) => {
+                config::IssueCommand::Ready(options) => {
                     let issues = db.list_all_issues().await?;
                     let suggestions = issue_analysis::suggest_next_tasks(
                         &issues,
@@ -1353,7 +1469,7 @@ fn project_override(command: &Command) -> Option<&str> {
         Command::Init(_) => None,
         Command::Index(cmd) => cmd.project.project.as_deref(),
         Command::Search(cmd) => cmd.project.project.as_deref(),
-        Command::Prompt(cmd) => cmd.project.project.as_deref(),
+        Command::Context(cmd) => cmd.project.project.as_deref(),
         Command::Topology(cmd) => cmd.project.project.as_deref(),
         Command::Issue(cmd) => cmd.project.project.as_deref(),
         Command::Config(_) => None,
@@ -1403,29 +1519,44 @@ fn print_issue(issue: &issues::Issue) {
     if !issue.affected_symbols.is_empty() {
         println!("affected_symbols: {}", issue.affected_symbols.join(", "));
     }
-    if !issue.external_refs.is_empty() {
-        println!(
-            "external_refs: {}",
-            format_external_refs(&issue.external_refs)
-        );
+    if !issue.sender.trim().is_empty() {
+        println!("sender: {}", issue.sender);
     }
-    if let Some(estimate) = issue.estimate_minutes {
+    if issue.ephemeral {
+        println!("ephemeral: true");
+    }
+    if !issue.replies_to.trim().is_empty() {
+        println!("replies_to: {}", issue.replies_to);
+    }
+    if let Some(solid_volume) = &issue.solid_volume {
+        println!("solid_volume: {}", solid_volume);
+    }
+    if !issue.topology_hash.trim().is_empty() {
+        println!("topology_hash: {}", issue.topology_hash);
+    }
+    if issue.is_solid {
+        println!("is_solid: true");
+    }
+    if let Some(external_ref) = &issue.external_ref {
+        println!("external_ref: {}", external_ref);
+    }
+    if let Some(estimate) = issue.estimated_minutes {
         println!("estimate_minutes: {}", estimate);
     }
-    if let Some(duplicate_of) = &issue.duplicate_of {
-        println!("duplicate_of: {}", duplicate_of);
+    if !issue.duplicate_of.trim().is_empty() {
+        println!("duplicate_of: {}", issue.duplicate_of);
     }
-    if let Some(superseded_by) = &issue.superseded_by {
-        println!("superseded_by: {}", superseded_by);
+    if !issue.superseded_by.trim().is_empty() {
+        println!("superseded_by: {}", issue.superseded_by);
     }
     if let Some(deleted_at) = &issue.deleted_at {
         println!("deleted_at: {}", deleted_at);
     }
-    if let Some(deleted_by) = &issue.deleted_by {
-        println!("deleted_by: {}", deleted_by);
+    if !issue.deleted_by.trim().is_empty() {
+        println!("deleted_by: {}", issue.deleted_by);
     }
-    if let Some(deleted_reason) = &issue.deleted_reason {
-        println!("deleted_reason: {}", deleted_reason);
+    if !issue.delete_reason.trim().is_empty() {
+        println!("delete_reason: {}", issue.delete_reason);
     }
     if !issue.description.trim().is_empty() {
         println!("\ndescription:\n{}", issue.description);
@@ -1442,8 +1573,12 @@ fn print_issue(issue: &issues::Issue) {
     if !issue.comments.is_empty() {
         println!("\ncomments:");
         for comment in &issue.comments {
-            let author = comment.author.as_deref().unwrap_or("unknown");
-            println!("  {} {author}: {}", comment.created_at, comment.body);
+            let author = if comment.author.trim().is_empty() {
+                "unknown"
+            } else {
+                comment.author.as_str()
+            };
+            println!("  {} {author}: {}", comment.created_at, comment.text);
         }
     }
     println!("created_at: {}", issue.created_at);
@@ -1453,28 +1588,14 @@ fn print_issue(issue: &issues::Issue) {
     }
 }
 
-fn format_dependencies(values: &[issues::IssueDependency]) -> String {
+fn format_dependencies(values: &[issues::Dependency]) -> String {
     values
         .iter()
         .map(|dep| {
-            if dep.kind.trim().is_empty() {
-                dep.id.clone()
+            if dep.type_.trim().is_empty() || dep.type_.trim().eq_ignore_ascii_case("blocking") {
+                dep.depends_on_id.clone()
             } else {
-                format!("{}:{}", dep.id, dep.kind)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_external_refs(values: &[issues::IssueExternalRef]) -> String {
-    values
-        .iter()
-        .map(|reference| {
-            if reference.kind.trim().is_empty() {
-                reference.value.clone()
-            } else {
-                format!("{}:{}", reference.kind, reference.value)
+                format!("{}:{}", dep.depends_on_id, dep.type_)
             }
         })
         .collect::<Vec<_>>()
@@ -1511,6 +1632,9 @@ pub(crate) fn build_reranker(cfg: &config::AppConfig) -> Result<RerankerClient> 
         dialect,
         model: cfg.reranker.model.clone(),
         instruction: cfg.reranker.instruction.clone(),
+        requests_per_minute: cfg.embedding.requests_per_minute,
+        max_concurrent_requests: cfg.embedding.max_concurrent_requests,
+        tokens_per_minute: cfg.embedding.tokens_per_minute,
     };
     RerankerClient::new(config).map_err(|err| eyre!(err))
 }
@@ -1536,9 +1660,9 @@ fn normalize_search_language(language: &str) -> String {
         return "text".to_string();
     }
     let lower = trimmed.to_ascii_lowercase();
-    if text_chunking::languages::get_language(trimmed).is_some()
-        || text_chunking::languages::get_language(&lower).is_some()
-        || text_chunking::languages::is_language_supported(&lower)
+    if niblits::languages::get_language(trimmed).is_some()
+        || niblits::languages::get_language(&lower).is_some()
+        || niblits::languages::is_language_supported(&lower)
     {
         lower.replace(' ', "_")
     } else {
@@ -1643,6 +1767,7 @@ fn collect_seed_sources(
 struct TopologySelection {
     file_paths: Vec<String>,
     weights: HashMap<String, f64>,
+    distances: HashMap<String, usize>,
     seed_sources: HashMap<String, assembly::pipeline::CandidateSource>,
     warnings: Vec<String>,
 }
@@ -1719,6 +1844,7 @@ fn select_topology_files(
     }
 
     let mut weights = neighbor_weights;
+    let mut distances = neighbor_distances;
     for seed in &file_paths {
         if seed_set.contains(seed) {
             weights
@@ -1729,12 +1855,14 @@ fn select_topology_files(
                     }
                 })
                 .or_insert(1.0);
+            distances.entry(seed.clone()).or_insert(0);
         }
     }
 
     Ok(TopologySelection {
         file_paths,
         weights,
+        distances,
         seed_sources: seeds.sources,
         warnings,
     })
@@ -1755,8 +1883,15 @@ async fn build_topology_blocks(
         let source = selection
             .seed_sources
             .get(&chunk.file_path)
-            .copied()
-            .unwrap_or(assembly::pipeline::CandidateSource::Expanded);
+            .cloned()
+            .unwrap_or_else(|| {
+                let depth = selection
+                    .distances
+                    .get(&chunk.file_path)
+                    .copied()
+                    .unwrap_or(1);
+                assembly::pipeline::CandidateSource::TopologyNeighbor { depth }
+            });
         let score = selection
             .weights
             .get(&chunk.file_path)
@@ -1772,10 +1907,134 @@ async fn build_topology_blocks(
             end_line: chunk.end_line,
             text: chunk.text,
             score,
-            source,
+            source: source.clone(),
+            sources: vec![source],
         });
     }
     Ok(blocks)
+}
+
+async fn build_issue_context(
+    db: &Db,
+    issue: &issues::Issue,
+    context: &config::ContextOptions,
+) -> Result<assembly::pipeline::IssueContext> {
+    let mut dependency_issues = Vec::new();
+    for dep_id in issue.dependency_ids() {
+        if let Some(dep) = db.get_issue(&dep_id).await? {
+            dependency_issues.push(dep);
+        }
+    }
+
+    let mut related_issues = Vec::new();
+    for related_id in &issue.relates_to {
+        if let Some(related) = db.get_issue(related_id).await? {
+            related_issues.push(related);
+        }
+    }
+
+    let mut duplicate_issues = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_unique = |candidate: issues::Issue| {
+        if candidate.id == issue.id {
+            return;
+        }
+        if seen.insert(candidate.id.clone()) {
+            duplicate_issues.push(candidate);
+        }
+    };
+
+    if !issue.duplicate_of.trim().is_empty()
+        && let Some(dup) = db.get_issue(&issue.duplicate_of).await?
+    {
+        push_unique(dup);
+    }
+    if !issue.superseded_by.trim().is_empty()
+        && let Some(dup) = db.get_issue(&issue.superseded_by).await?
+    {
+        push_unique(dup);
+    }
+
+    if context.duplicate_limit > 0 {
+        let issues = db.list_all_issues().await?;
+        let pairs = issue_analysis::find_duplicates(
+            &issues,
+            context.duplicate_threshold,
+            context.duplicate_limit,
+        );
+        for pair in pairs {
+            if pair.issue_a.id == issue.id {
+                push_unique(pair.issue_b);
+            } else if pair.issue_b.id == issue.id {
+                push_unique(pair.issue_a);
+            }
+        }
+    }
+
+    Ok(assembly::pipeline::IssueContext {
+        issue: issue.clone(),
+        dependency_issues,
+        related_issues,
+        duplicate_issues,
+    })
+}
+
+async fn render_topology_prompt(
+    db: &Db,
+    repo_path: &std::path::Path,
+    cfg: &config::AppConfig,
+    snapshot: &topology::TopologySnapshot,
+    options: &config::TopologyAssembleCli,
+) -> Result<()> {
+    let selection_opts = assembly::SelectionOptions::default();
+    let seed_sources =
+        collect_seed_sources(repo_path, snapshot, &selection_opts, &options.files, &[])?;
+    let selection = select_topology_files(
+        snapshot,
+        &selection_opts,
+        seed_sources,
+        options.depth,
+        options.limit,
+    )?;
+    let blocks = build_topology_blocks(db, &selection, options.per_file).await?;
+    let tokenizer = parse_tokenizer(&cfg.embedding.tokenizer)?;
+    let prompt_tokenizer_value = cfg.prompt.tokenizer.clone();
+    let prompt_tokenizer = if prompt_tokenizer_value.trim().is_empty() {
+        tokenizer
+    } else {
+        parse_tokenizer(&prompt_tokenizer_value)?
+    };
+    let budget = assembly::pipeline::BudgetOptions {
+        max_tokens: Some(cfg.embedding.context_length),
+        reserved_output_tokens: 0,
+        tokenizer: Some(prompt_tokenizer),
+    };
+    let max_blocks = options.limit.saturating_mul(options.per_file.max(1));
+    let noop = NoopReranker;
+    let ctx = assembly::AssemblyContext {
+        repo_path,
+        db,
+        embedder: None,
+        reranker: &noop,
+        config: cfg,
+        selection: selection_opts,
+    };
+    let (blocks, warnings) =
+        budget_blocks(&ctx, blocks, selection.warnings, &budget, max_blocks).await?;
+
+    let enriched = assembly::output::enrich_blocks(repo_path, db, &blocks).await?;
+    let overview = assembly::output::build_repository_overview(repo_path, db).await;
+    let payload = assembly::output::PromptPayload {
+        overview,
+        task: options.task.clone(),
+        blocks: enriched,
+        warnings,
+    };
+    let sections = resolve_sections(&options.sections);
+    let theme_value = resolve_theme_value(&options.theme, &cfg.prompt.theme);
+    let rendered = assembly::output::render_prompt(&payload, sections, theme_value.as_deref());
+    print!("{rendered}");
+    Ok(())
 }
 
 async fn budget_blocks(
@@ -1786,7 +2045,7 @@ async fn budget_blocks(
     max_blocks: usize,
 ) -> Result<(Vec<assembly::pipeline::ContextBlock>, Vec<String>)> {
     let mut arena = assembly::Arena::new();
-    let input = arena.insert(assembly::pipeline::AstBlocks { blocks, warnings });
+    let input = arena.insert(assembly::pipeline::SelectedBlocks { blocks, warnings });
     let budget_stage = DefaultBudgetAndMerge {
         max_blocks,
         max_bytes: None,

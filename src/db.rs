@@ -1,19 +1,22 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use blake3::Hasher;
 use charabia::Tokenize;
 use eyre::{Result, eyre};
 use libsql::{Builder, Connection, Database, Value, params, params_from_iter};
 
-use crate::issues::{Issue, IssueFilters, IssueSearchResult};
+use crate::issues::{Comment, Dependency, Issue, IssueFilters, IssueSearchResult};
 use crate::repository::Repository;
 use crate::topology::TopologyExport;
 
-const ISSUE_COLUMNS: &str = "id, title, description, design, acceptance_criteria, notes, status, \
-priority, issue_type, assignee, labels, dependencies, relates_to, affected_symbols, external_refs, \
-comments, estimate_minutes, duplicate_of, superseded_by, deleted_at, deleted_by, deleted_reason, \
-created_at, updated_at, closed_at";
-const ISSUE_COLUMN_COUNT: i32 = 25;
+const ISSUE_COLUMNS: &str = "id, content_hash, title, description, design, acceptance_criteria, \
+notes, status, priority, issue_type, assignee, estimated_minutes, created_at, updated_at, \
+closed_at, external_ref, sender, ephemeral, replies_to, relates_to, duplicate_of, superseded_by, \
+deleted_at, deleted_by, delete_reason, original_type, affected_symbols, solid_volume, \
+topology_hash, is_solid";
+const ISSUE_COLUMN_COUNT: i32 = 30;
 
 pub struct Db {
     _db: Database,
@@ -142,7 +145,7 @@ impl Db {
           fts_text TEXT NOT NULL,
           kind TEXT NOT NULL,
           ordinal INTEGER NOT NULL,
-          tokens BLOB,
+          token_count INTEGER,
           embedding F32_BLOB({dim}) NOT NULL
         );
         CREATE TABLE IF NOT EXISTS file_chunk_edges (
@@ -185,30 +188,66 @@ impl Db {
         );
         CREATE TABLE IF NOT EXISTS issues (
           id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          description TEXT NOT NULL,
-          design TEXT NOT NULL,
-          acceptance_criteria TEXT NOT NULL,
-          notes TEXT NOT NULL,
-          status TEXT NOT NULL,
-          priority INTEGER NOT NULL,
-          issue_type TEXT NOT NULL,
+          content_hash TEXT DEFAULT '',
+          title TEXT,
+          description TEXT,
+          design TEXT DEFAULT '',
+          acceptance_criteria TEXT DEFAULT '',
+          notes TEXT DEFAULT '',
+          status TEXT,
+          priority INTEGER,
+          issue_type TEXT,
           assignee TEXT,
-          labels TEXT NOT NULL,
-          dependencies TEXT NOT NULL,
-          relates_to TEXT NOT NULL,
-          affected_symbols TEXT NOT NULL,
-          external_refs TEXT NOT NULL,
-          comments TEXT NOT NULL,
-          estimate_minutes INTEGER,
-          duplicate_of TEXT,
-          superseded_by TEXT,
+          estimated_minutes INTEGER,
+          created_at TEXT,
+          updated_at TEXT,
+          closed_at TEXT,
+          external_ref TEXT,
+          sender TEXT DEFAULT '',
+          ephemeral INTEGER NOT NULL DEFAULT 0,
+          replies_to TEXT DEFAULT '',
+          relates_to TEXT DEFAULT '',
+          duplicate_of TEXT DEFAULT '',
+          superseded_by TEXT DEFAULT '',
           deleted_at TEXT,
-          deleted_by TEXT,
-          deleted_reason TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          closed_at TEXT
+          deleted_by TEXT DEFAULT '',
+          delete_reason TEXT DEFAULT '',
+          original_type TEXT DEFAULT '',
+          affected_symbols TEXT DEFAULT '',
+          solid_volume TEXT,
+          topology_hash TEXT DEFAULT '',
+          is_solid INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS labels (
+          issue_id TEXT,
+          label TEXT,
+          PRIMARY KEY (issue_id, label)
+        );
+        CREATE TABLE IF NOT EXISTS dependencies (
+          issue_id TEXT,
+          depends_on_id TEXT,
+          type TEXT,
+          created_at TEXT,
+          created_by TEXT,
+          PRIMARY KEY (issue_id, depends_on_id, type)
+        );
+        CREATE TABLE IF NOT EXISTS comments (
+          id TEXT PRIMARY KEY,
+          issue_id TEXT,
+          author TEXT,
+          text TEXT,
+          created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS dirty_issues (
+          issue_id TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS config (
+          key TEXT PRIMARY KEY,
+          value TEXT
         );
         CREATE TABLE IF NOT EXISTS topology_snapshots (
           name TEXT PRIMARY KEY,
@@ -237,7 +276,6 @@ impl Db {
 
         self.conn.execute_batch(&create_sql).await?;
         self.ensure_fts_text_column().await?;
-        self.ensure_issue_columns().await?;
         self.conn
             .execute_batch(
                 "CREATE INDEX IF NOT EXISTS chunks_embedding_idx \
@@ -263,22 +301,22 @@ impl Db {
           INSERT INTO fts_chunks(rowid, fts_text) VALUES (new.rowid, new.fts_text); \
         END; \
         CREATE VIRTUAL TABLE IF NOT EXISTS fts_issues USING fts5( \
-          title, description, design, acceptance_criteria, notes, labels, affected_symbols, \
+          title, description, design, acceptance_criteria, notes, affected_symbols, \
           content='issues', content_rowid='rowid' \
         ); \
         CREATE TRIGGER IF NOT EXISTS issues_ai AFTER INSERT ON issues BEGIN \
-          INSERT INTO fts_issues(rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
-          VALUES (new.rowid, new.title, new.description, new.design, new.acceptance_criteria, new.notes, new.labels, new.affected_symbols); \
+          INSERT INTO fts_issues(rowid, title, description, design, acceptance_criteria, notes, affected_symbols) \
+          VALUES (new.rowid, new.title, new.description, new.design, new.acceptance_criteria, new.notes, new.affected_symbols); \
         END; \
         CREATE TRIGGER IF NOT EXISTS issues_ad AFTER DELETE ON issues BEGIN \
-          INSERT INTO fts_issues(fts_issues, rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
-          VALUES('delete', old.rowid, old.title, old.description, old.design, old.acceptance_criteria, old.notes, old.labels, old.affected_symbols); \
+          INSERT INTO fts_issues(fts_issues, rowid, title, description, design, acceptance_criteria, notes, affected_symbols) \
+          VALUES('delete', old.rowid, old.title, old.description, old.design, old.acceptance_criteria, old.notes, old.affected_symbols); \
         END; \
         CREATE TRIGGER IF NOT EXISTS issues_au AFTER UPDATE ON issues BEGIN \
-          INSERT INTO fts_issues(fts_issues, rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
-          VALUES('delete', old.rowid, old.title, old.description, old.design, old.acceptance_criteria, old.notes, old.labels, old.affected_symbols); \
-          INSERT INTO fts_issues(rowid, title, description, design, acceptance_criteria, notes, labels, affected_symbols) \
-          VALUES (new.rowid, new.title, new.description, new.design, new.acceptance_criteria, new.notes, new.labels, new.affected_symbols); \
+          INSERT INTO fts_issues(fts_issues, rowid, title, description, design, acceptance_criteria, notes, affected_symbols) \
+          VALUES('delete', old.rowid, old.title, old.description, old.design, old.acceptance_criteria, old.notes, old.affected_symbols); \
+          INSERT INTO fts_issues(rowid, title, description, design, acceptance_criteria, notes, affected_symbols) \
+          VALUES (new.rowid, new.title, new.description, new.design, new.acceptance_criteria, new.notes, new.affected_symbols); \
         END;";
         if let Err(err) = self.conn.execute_batch(fts_sql).await {
             tracing::warn!("failed to initialize FTS: {err}");
@@ -335,48 +373,6 @@ impl Db {
 
         self.conn
             .execute("UPDATE chunks SET fts_text = text WHERE fts_text = ''", ())
-            .await?;
-        Ok(())
-    }
-
-    async fn ensure_issue_columns(&self) -> Result<()> {
-        let stmt = self.conn.prepare("PRAGMA table_info(issues)").await?;
-        let mut rows = stmt.query(()).await?;
-        let mut columns = HashSet::new();
-        while let Some(row) = rows.next().await? {
-            let name: String = row.get(1)?;
-            columns.insert(name);
-        }
-
-        let required = [
-            ("external_refs", "TEXT NOT NULL DEFAULT '[]'"),
-            ("comments", "TEXT NOT NULL DEFAULT '[]'"),
-            ("estimate_minutes", "INTEGER"),
-            ("duplicate_of", "TEXT"),
-            ("superseded_by", "TEXT"),
-            ("deleted_at", "TEXT"),
-            ("deleted_by", "TEXT"),
-            ("deleted_reason", "TEXT"),
-        ];
-
-        for (name, definition) in required {
-            if !columns.contains(name) {
-                let sql = format!("ALTER TABLE issues ADD COLUMN {name} {definition}");
-                self.conn.execute(&sql, ()).await?;
-            }
-        }
-
-        self.conn
-            .execute(
-                "UPDATE issues SET external_refs = '[]' WHERE external_refs IS NULL",
-                (),
-            )
-            .await?;
-        self.conn
-            .execute(
-                "UPDATE issues SET comments = '[]' WHERE comments IS NULL",
-                (),
-            )
             .await?;
         Ok(())
     }
@@ -551,18 +547,17 @@ impl Db {
             ));
         }
 
-        let tokens_blob = record
-            .tokens
-            .as_ref()
-            .filter(|tokens| !tokens.is_empty())
-            .map(|tokens| encode_u32_blob(tokens));
-        let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
-        let embedding_json = encode_f32_json(embedding);
+        let token_count = record
+            .token_count
+            .filter(|token_count| *token_count > 0)
+            .map(|token_count| token_count as i64);
+        let token_count_sql = if token_count.is_some() { "?" } else { "NULL" };
+        let embedding_json = encode_f32_json(embedding)?;
         let sql = format!(
             "INSERT INTO chunks \
-      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, tokens, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?))",
-            tokens_sql = tokens_sql,
+      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, token_count, embedding) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {token_count_sql}, vector32(?))",
+            token_count_sql = token_count_sql,
         );
 
         let mut params_vec = Vec::with_capacity(13);
@@ -577,8 +572,8 @@ impl Db {
         params_vec.push(Value::Text(record.fts_text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Integer(record.ordinal as i64));
-        if let Some(tokens_blob) = tokens_blob {
-            params_vec.push(Value::Blob(tokens_blob));
+        if let Some(token_count) = token_count {
+            params_vec.push(Value::Integer(token_count));
         }
         params_vec.push(Value::Text(embedding_json));
 
@@ -621,17 +616,16 @@ impl Db {
             ));
         }
 
-        let tokens_blob = record
-            .tokens
-            .as_ref()
-            .filter(|tokens| !tokens.is_empty())
-            .map(|tokens| encode_u32_blob(tokens));
-        let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
-        let embedding_json = encode_f32_json(embedding);
+        let token_count = record
+            .token_count
+            .filter(|token_count| *token_count > 0)
+            .map(|token_count| token_count as i64);
+        let token_count_sql = if token_count.is_some() { "?" } else { "NULL" };
+        let embedding_json = encode_f32_json(embedding)?;
         let sql = format!(
             "INSERT INTO chunks \
-      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, tokens, embedding) \
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, vector32(?)) \
+      (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, token_count, embedding) \
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {token_count_sql}, vector32(?)) \
       ON CONFLICT(id) DO UPDATE SET \
         file_path = excluded.file_path, \
         start_byte = excluded.start_byte, \
@@ -643,9 +637,9 @@ impl Db {
         fts_text = excluded.fts_text, \
         kind = excluded.kind, \
         ordinal = excluded.ordinal, \
-        tokens = excluded.tokens, \
+        token_count = excluded.token_count, \
         embedding = excluded.embedding",
-            tokens_sql = tokens_sql,
+            token_count_sql = token_count_sql,
         );
 
         let mut params_vec = Vec::with_capacity(13);
@@ -660,8 +654,8 @@ impl Db {
         params_vec.push(Value::Text(record.fts_text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Integer(record.ordinal as i64));
-        if let Some(tokens_blob) = tokens_blob {
-            params_vec.push(Value::Blob(tokens_blob));
+        if let Some(token_count) = token_count {
+            params_vec.push(Value::Integer(token_count));
         }
         params_vec.push(Value::Text(embedding_json));
 
@@ -724,17 +718,16 @@ impl Db {
                 ));
             }
 
-            let tokens_blob = record
-                .tokens
-                .as_ref()
-                .filter(|tokens| !tokens.is_empty())
-                .map(|tokens| encode_u32_blob(tokens));
-            let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
+            let token_count = record
+                .token_count
+                .filter(|token_count| *token_count > 0)
+                .map(|token_count| token_count as i64);
+            let token_count_sql = if token_count.is_some() { "?" } else { "NULL" };
             let embed_sql = "vector32(?)";
 
             values_sql.push(format!(
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {tokens_sql}, {embed_sql})",
-                tokens_sql = tokens_sql,
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {token_count_sql}, {embed_sql})",
+                token_count_sql = token_count_sql,
                 embed_sql = embed_sql
             ));
             values_edges.push("(?, ?, ?)".to_string());
@@ -750,10 +743,10 @@ impl Db {
             params_vec.push(Value::Text(record.fts_text.clone()));
             params_vec.push(Value::Text(record.kind.clone()));
             params_vec.push(Value::Integer(record.ordinal as i64));
-            if let Some(tokens_blob) = tokens_blob {
-                params_vec.push(Value::Blob(tokens_blob));
+            if let Some(token_count) = token_count {
+                params_vec.push(Value::Integer(token_count));
             }
-            params_vec.push(Value::Text(encode_f32_json(embedding)));
+            params_vec.push(Value::Text(encode_f32_json(embedding)?));
 
             params_edges.push(Value::Text(record.file_path.clone()));
             params_edges.push(Value::Text(record.id.clone()));
@@ -761,7 +754,7 @@ impl Db {
         }
 
         let sql = format!(
-            "INSERT INTO chunks (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, tokens, embedding) \
+            "INSERT INTO chunks (id, file_path, start_byte, end_byte, chunk_hash, start_line, end_line, text, fts_text, kind, ordinal, token_count, embedding) \
              VALUES {values} \
              ON CONFLICT(id) DO UPDATE SET \
                file_path = excluded.file_path, \
@@ -774,7 +767,7 @@ impl Db {
                fts_text = excluded.fts_text, \
                kind = excluded.kind, \
                ordinal = excluded.ordinal, \
-               tokens = excluded.tokens, \
+               token_count = excluded.token_count, \
                embedding = excluded.embedding",
             values = values_sql.join(", ")
         );
@@ -793,18 +786,17 @@ impl Db {
 
     async fn update_chunk_without_embedding(&self, record: &ChunkRecord) -> Result<()> {
         self.ensure_file_exists(&record.file_path).await?;
-        let tokens_blob = record
-            .tokens
-            .as_ref()
-            .filter(|tokens| !tokens.is_empty())
-            .map(|tokens| encode_u32_blob(tokens));
-        let tokens_sql = if tokens_blob.is_some() { "?" } else { "NULL" };
+        let token_count = record
+            .token_count
+            .filter(|token_count| *token_count > 0)
+            .map(|token_count| token_count as i64);
+        let token_count_sql = if token_count.is_some() { "?" } else { "NULL" };
         let sql = format!(
             "UPDATE chunks SET \
            file_path = ?, start_byte = ?, end_byte = ?, chunk_hash = ?, start_line = ?, end_line = ?, \
-           text = ?, fts_text = ?, kind = ?, ordinal = ?, tokens = {tokens_sql} \
+           text = ?, fts_text = ?, kind = ?, ordinal = ?, token_count = {token_count_sql} \
            WHERE id = ?",
-            tokens_sql = tokens_sql
+            token_count_sql = token_count_sql
         );
         let mut params_vec = Vec::with_capacity(12);
         params_vec.push(Value::Text(record.file_path.clone()));
@@ -817,8 +809,8 @@ impl Db {
         params_vec.push(Value::Text(record.fts_text.clone()));
         params_vec.push(Value::Text(record.kind.clone()));
         params_vec.push(Value::Integer(record.ordinal as i64));
-        if let Some(tokens_blob) = tokens_blob {
-            params_vec.push(Value::Blob(tokens_blob));
+        if let Some(token_count) = token_count {
+            params_vec.push(Value::Integer(token_count));
         }
         params_vec.push(Value::Text(record.id.clone()));
         self.conn
@@ -943,20 +935,20 @@ impl Db {
     }
 
     pub async fn upsert_issue(&self, issue: &Issue) -> Result<()> {
-        let labels = serde_json::to_string(&issue.labels)?;
-        let dependencies = serde_json::to_string(&issue.dependencies)?;
         let relates_to = serde_json::to_string(&issue.relates_to)?;
         let affected_symbols = serde_json::to_string(&issue.affected_symbols)?;
-        let external_refs = serde_json::to_string(&issue.external_refs)?;
-        let comments = serde_json::to_string(&issue.comments)?;
         self.conn
             .execute(
-                "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, \
-                 priority, issue_type, assignee, labels, dependencies, relates_to, affected_symbols, \
-                 external_refs, comments, estimate_minutes, duplicate_of, superseded_by, deleted_at, \
-                 deleted_by, deleted_reason, created_at, updated_at, closed_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO issues (
+                   id, content_hash, title, description, design, acceptance_criteria, notes, status,
+                   priority, issue_type, assignee, estimated_minutes, created_at, updated_at, closed_at,
+                   external_ref, sender, ephemeral, replies_to, relates_to, duplicate_of, superseded_by,
+                   deleted_at, deleted_by, delete_reason, original_type, affected_symbols, solid_volume,
+                   topology_hash, is_solid
+                 )
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
+                   content_hash = excluded.content_hash, \
                    title = excluded.title, \
                    description = excluded.description, \
                    design = excluded.design, \
@@ -966,23 +958,28 @@ impl Db {
                    priority = excluded.priority, \
                    issue_type = excluded.issue_type, \
                    assignee = excluded.assignee, \
-                   labels = excluded.labels, \
-                   dependencies = excluded.dependencies, \
-                   relates_to = excluded.relates_to, \
-                   affected_symbols = excluded.affected_symbols, \
-                   external_refs = excluded.external_refs, \
-                   comments = excluded.comments, \
-                   estimate_minutes = excluded.estimate_minutes, \
+                   estimated_minutes = excluded.estimated_minutes, \
                    duplicate_of = excluded.duplicate_of, \
                    superseded_by = excluded.superseded_by, \
                    deleted_at = excluded.deleted_at, \
                    deleted_by = excluded.deleted_by, \
-                   deleted_reason = excluded.deleted_reason, \
+                   delete_reason = excluded.delete_reason, \
+                   original_type = excluded.original_type, \
                    created_at = excluded.created_at, \
                    updated_at = excluded.updated_at, \
-                   closed_at = excluded.closed_at",
+                   closed_at = excluded.closed_at, \
+                   external_ref = excluded.external_ref, \
+                   sender = excluded.sender, \
+                   ephemeral = excluded.ephemeral, \
+                   replies_to = excluded.replies_to, \
+                   relates_to = excluded.relates_to, \
+                   affected_symbols = excluded.affected_symbols, \
+                   solid_volume = excluded.solid_volume, \
+                   topology_hash = excluded.topology_hash, \
+                   is_solid = excluded.is_solid",
                 params![
                     issue.id.as_str(),
+                    issue.content_hash.as_str(),
                     issue.title.as_str(),
                     issue.description.as_str(),
                     issue.design.as_str(),
@@ -992,25 +989,274 @@ impl Db {
                     issue.priority as i64,
                     issue.issue_type.as_str(),
                     issue.assignee.as_deref(),
-                    labels,
-                    dependencies,
-                    relates_to,
-                    affected_symbols,
-                    external_refs,
-                    comments,
-                    issue.estimate_minutes.map(|value| value as i64),
-                    issue.duplicate_of.as_deref(),
-                    issue.superseded_by.as_deref(),
-                    issue.deleted_at.as_deref(),
-                    issue.deleted_by.as_deref(),
-                    issue.deleted_reason.as_deref(),
+                    issue.estimated_minutes.map(|value| value as i64),
                     issue.created_at.as_str(),
                     issue.updated_at.as_str(),
-                    issue.closed_at.as_deref()
+                    issue.closed_at.as_deref(),
+                    issue.external_ref.as_deref(),
+                    issue.sender.as_str(),
+                    i64::from(issue.ephemeral),
+                    issue.replies_to.as_str(),
+                    relates_to,
+                    issue.duplicate_of.as_str(),
+                    issue.superseded_by.as_str(),
+                    issue.deleted_at.as_deref(),
+                    issue.deleted_by.as_str(),
+                    issue.delete_reason.as_str(),
+                    issue.original_type.as_str(),
+                    affected_symbols,
+                    issue.solid_volume.as_deref(),
+                    issue.topology_hash.as_str(),
+                    i64::from(issue.is_solid)
                 ],
             )
             .await?;
+        self.conn
+            .execute(
+                "DELETE FROM labels WHERE issue_id = ?",
+                params![issue.id.as_str()],
+            )
+            .await?;
+        for label in &issue.labels {
+            self.conn
+                .execute(
+                    "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                    params![issue.id.as_str(), label.as_str()],
+                )
+                .await?;
+        }
+        self.conn
+            .execute(
+                "DELETE FROM dependencies WHERE issue_id = ?",
+                params![issue.id.as_str()],
+            )
+            .await?;
+        for dep in &issue.dependencies {
+            self.conn
+                .execute(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        dep.issue_id.as_str(),
+                        dep.depends_on_id.as_str(),
+                        dep.type_.as_str(),
+                        dep.created_at.as_str(),
+                        dep.created_by.as_str()
+                    ],
+                )
+                .await?;
+        }
+
+        let mut existing = HashSet::<(String, String)>::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT author, text FROM comments WHERE issue_id = ?",
+                params![issue.id.as_str()],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let author: String = row.get(0)?;
+            let text: String = row.get(1)?;
+            existing.insert((author, text));
+        }
+        for comment in &issue.comments {
+            if existing.contains(&(comment.author.clone(), comment.text.clone())) {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO comments (id, issue_id, author, text, created_at) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        comment.id.as_str(),
+                        comment.issue_id.as_str(),
+                        comment.author.as_str(),
+                        comment.text.as_str(),
+                        comment.created_at.as_str()
+                    ],
+                )
+                .await?;
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO dirty_issues (issue_id) VALUES (?)",
+                params![issue.id.as_str()],
+            )
+            .await?;
         Ok(())
+    }
+
+    pub async fn get_config(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT value FROM config WHERE key = ?", params![key])
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn generate_unique_id(
+        &self,
+        prefix: &str,
+        title: &str,
+        description: &str,
+        creator: &str,
+    ) -> Result<String> {
+        let timestamp_nanos = current_timestamp_nanos();
+        let base_length = 6;
+        let max_length = 8;
+
+        for length in base_length..=max_length {
+            for nonce in 0..10 {
+                let candidate = generate_hash_id(
+                    prefix,
+                    title,
+                    description,
+                    creator,
+                    timestamp_nanos,
+                    length,
+                    nonce,
+                );
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM issues WHERE id = ?",
+                        params![candidate.as_str()],
+                    )
+                    .await?;
+                let count: i64 = if let Some(row) = rows.next().await? {
+                    row.get(0)?
+                } else {
+                    0
+                };
+                if count == 0 {
+                    return Ok(candidate);
+                }
+            }
+        }
+        Err(eyre!("Failed to generate unique ID after retries"))
+    }
+
+    async fn get_all_labels(&self) -> Result<HashMap<String, Vec<String>>> {
+        let mut rows = self
+            .conn
+            .query("SELECT issue_id, label FROM labels", ())
+            .await?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let issue_id: String = row.get(0)?;
+            let label: String = row.get(1)?;
+            map.entry(issue_id).or_default().push(label);
+        }
+        Ok(map)
+    }
+
+    async fn get_all_dependencies(&self) -> Result<HashMap<String, Vec<Dependency>>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT issue_id, depends_on_id, type, created_at, created_by FROM dependencies",
+                (),
+            )
+            .await?;
+        let mut map: HashMap<String, Vec<Dependency>> = HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let dep = Dependency {
+                issue_id: row.get(0)?,
+                depends_on_id: row.get(1)?,
+                type_: row.get(2)?,
+                created_at: row.get(3)?,
+                created_by: row.get(4)?,
+            };
+            map.entry(dep.issue_id.clone()).or_default().push(dep);
+        }
+        Ok(map)
+    }
+
+    async fn get_all_comments(&self) -> Result<HashMap<String, Vec<Comment>>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, issue_id, author, text, created_at FROM comments",
+                (),
+            )
+            .await?;
+        let mut map: HashMap<String, Vec<Comment>> = HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let comment = Comment {
+                id: row.get(0)?,
+                issue_id: row.get(1)?,
+                author: row.get(2)?,
+                text: row.get(3)?,
+                created_at: row.get(4)?,
+            };
+            map.entry(comment.issue_id.clone())
+                .or_default()
+                .push(comment);
+        }
+        Ok(map)
+    }
+
+    async fn get_labels_for_issue(&self, issue_id: &str) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT label FROM labels WHERE issue_id = ?",
+                params![issue_id],
+            )
+            .await?;
+        let mut labels = Vec::new();
+        while let Some(row) = rows.next().await? {
+            labels.push(row.get(0)?);
+        }
+        Ok(labels)
+    }
+
+    async fn get_dependencies_for_issue(&self, issue_id: &str) -> Result<Vec<Dependency>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT issue_id, depends_on_id, type, created_at, created_by \
+                 FROM dependencies WHERE issue_id = ?",
+                params![issue_id],
+            )
+            .await?;
+        let mut deps = Vec::new();
+        while let Some(row) = rows.next().await? {
+            deps.push(Dependency {
+                issue_id: row.get(0)?,
+                depends_on_id: row.get(1)?,
+                type_: row.get(2)?,
+                created_at: row.get(3)?,
+                created_by: row.get(4)?,
+            });
+        }
+        Ok(deps)
+    }
+
+    async fn get_comments_for_issue(&self, issue_id: &str) -> Result<Vec<Comment>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = ?",
+                params![issue_id],
+            )
+            .await?;
+        let mut comments = Vec::new();
+        while let Some(row) = rows.next().await? {
+            comments.push(Comment {
+                id: row.get(0)?,
+                issue_id: row.get(1)?,
+                author: row.get(2)?,
+                text: row.get(3)?,
+                created_at: row.get(4)?,
+            });
+        }
+        Ok(comments)
     }
 
     pub async fn get_issue(&self, id: &str) -> Result<Option<Issue>> {
@@ -1022,7 +1268,11 @@ impl Db {
             )
             .await?;
         if let Some(row) = rows.next().await? {
-            Ok(Some(issue_from_row(&row)?))
+            let mut issue = issue_from_row(&row)?;
+            issue.labels = self.get_labels_for_issue(&issue.id).await?;
+            issue.dependencies = self.get_dependencies_for_issue(&issue.id).await?;
+            issue.comments = self.get_comments_for_issue(&issue.id).await?;
+            Ok(Some(issue))
         } else {
             Ok(None)
         }
@@ -1039,6 +1289,14 @@ impl Db {
         let mut issues = Vec::new();
         while let Some(row) = rows.next().await? {
             issues.push(issue_from_row(&row)?);
+        }
+        let labels_map = self.get_all_labels().await?;
+        let deps_map = self.get_all_dependencies().await?;
+        let comments_map = self.get_all_comments().await?;
+        for issue in &mut issues {
+            issue.labels = labels_map.get(&issue.id).cloned().unwrap_or_default();
+            issue.dependencies = deps_map.get(&issue.id).cloned().unwrap_or_default();
+            issue.comments = comments_map.get(&issue.id).cloned().unwrap_or_default();
         }
         Ok(issues)
     }
@@ -1083,6 +1341,14 @@ impl Db {
         let mut issues = Vec::new();
         while let Some(row) = rows.next().await? {
             issues.push(issue_from_row(&row)?);
+        }
+        let labels_map = self.get_all_labels().await?;
+        let deps_map = self.get_all_dependencies().await?;
+        let comments_map = self.get_all_comments().await?;
+        for issue in &mut issues {
+            issue.labels = labels_map.get(&issue.id).cloned().unwrap_or_default();
+            issue.dependencies = deps_map.get(&issue.id).cloned().unwrap_or_default();
+            issue.comments = comments_map.get(&issue.id).cloned().unwrap_or_default();
         }
 
         let mut issues = if let Some(label) = filters.label {
@@ -1129,6 +1395,15 @@ impl Db {
             let issue = issue_from_row(&row)?;
             let score: f64 = row.get(ISSUE_COLUMN_COUNT)?;
             results.push(IssueSearchResult { issue, score });
+        }
+        let labels_map = self.get_all_labels().await?;
+        let deps_map = self.get_all_dependencies().await?;
+        let comments_map = self.get_all_comments().await?;
+        for result in &mut results {
+            let issue = &mut result.issue;
+            issue.labels = labels_map.get(&issue.id).cloned().unwrap_or_default();
+            issue.dependencies = deps_map.get(&issue.id).cloned().unwrap_or_default();
+            issue.comments = comments_map.get(&issue.id).cloned().unwrap_or_default();
         }
         Ok(results)
     }
@@ -1183,7 +1458,7 @@ pub struct ChunkRecord {
     pub fts_text: String,
     pub kind: String,
     pub ordinal: usize,
-    pub tokens: Option<Vec<u32>>,
+    pub token_count: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1215,39 +1490,43 @@ pub struct GraphData {
 }
 
 fn issue_from_row(row: &libsql::Row) -> Result<Issue> {
-    let labels: String = row.get(10)?;
-    let dependencies: String = row.get(11)?;
-    let relates_to: String = row.get(12)?;
-    let affected_symbols: String = row.get(13)?;
-    let external_refs: String = row.get(14)?;
-    let comments: String = row.get(15)?;
+    let relates_to: String = row.get(19)?;
+    let affected_symbols: String = row.get(26)?;
 
     Ok(Issue {
         id: row.get(0)?,
-        title: row.get(1)?,
-        description: row.get(2)?,
-        design: row.get(3)?,
-        acceptance_criteria: row.get(4)?,
-        notes: row.get(5)?,
-        status: row.get(6)?,
-        priority: row.get::<i64>(7)? as i32,
-        issue_type: row.get(8)?,
-        assignee: row.get(9)?,
-        labels: parse_json_list(&labels),
-        dependencies: parse_dependency_list(&dependencies),
+        content_hash: row.get(1)?,
+        title: row.get(2)?,
+        description: row.get(3)?,
+        design: row.get(4)?,
+        acceptance_criteria: row.get(5)?,
+        notes: row.get(6)?,
+        status: row.get(7)?,
+        priority: row.get::<i64>(8)? as i32,
+        issue_type: row.get(9)?,
+        assignee: row.get(10)?,
+        estimated_minutes: row.get::<Option<i64>>(11)?.map(|value| value as i32),
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        closed_at: row.get(14)?,
+        external_ref: row.get(15)?,
+        sender: row.get(16)?,
+        ephemeral: row.get::<i64>(17)? != 0,
+        replies_to: row.get(18)?,
         relates_to: parse_json_list(&relates_to),
+        duplicate_of: row.get(20)?,
+        superseded_by: row.get(21)?,
+        deleted_at: row.get(22)?,
+        deleted_by: row.get(23)?,
+        delete_reason: row.get(24)?,
+        original_type: row.get(25)?,
+        labels: Vec::new(),
+        dependencies: Vec::new(),
+        comments: Vec::new(),
         affected_symbols: parse_json_list(&affected_symbols),
-        external_refs: parse_external_ref_list(&external_refs),
-        comments: parse_comment_list(&comments),
-        estimate_minutes: row.get::<Option<i64>>(16)?.map(|value| value as i32),
-        duplicate_of: row.get(17)?,
-        superseded_by: row.get(18)?,
-        deleted_at: row.get(19)?,
-        deleted_by: row.get(20)?,
-        deleted_reason: row.get(21)?,
-        created_at: row.get(22)?,
-        updated_at: row.get(23)?,
-        closed_at: row.get(24)?,
+        solid_volume: row.get(27)?,
+        topology_hash: row.get(28)?,
+        is_solid: row.get::<i64>(29)? != 0,
     })
 }
 
@@ -1260,63 +1539,62 @@ fn parse_json_list(value: &str) -> Vec<String> {
     }
 }
 
-fn parse_dependency_list(value: &str) -> Vec<crate::issues::IssueDependency> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
+fn encode_base36(data: &[u8], length: usize) -> String {
+    if length == 0 {
+        return String::new();
     }
-    let parsed = serde_json::from_str::<serde_json::Value>(trimmed);
-    let Ok(parsed) = parsed else {
-        return Vec::new();
+
+    let mut buf = [0u8; 16];
+    let buf_len = buf.len();
+    let len = data.len().min(buf_len);
+    let start = buf_len - len;
+    buf[start..].copy_from_slice(&data[(data.len() - len)..]);
+    let num = u128::from_be_bytes(buf);
+
+    let raw = radix_fmt::radix(num, 36).to_string().to_ascii_lowercase();
+    if raw.len() >= length {
+        raw[(raw.len() - length)..].to_string()
+    } else {
+        format!("{:0>width$}", raw, width = length)
+    }
+}
+
+fn generate_hash_id(
+    prefix: &str,
+    title: &str,
+    description: &str,
+    creator: &str,
+    timestamp_nanos: i128,
+    length: usize,
+    nonce: usize,
+) -> String {
+    let content = format!(
+        "{}|{}|{}|{}|{}",
+        title, description, creator, timestamp_nanos, nonce
+    );
+    let mut hasher = Hasher::new();
+    hasher.update(content.as_bytes());
+    let result = hasher.finalize();
+    let bytes = result.as_bytes();
+
+    let num_bytes = match length {
+        3 => 2,
+        4 => 3,
+        5 => 4,
+        6 => 4,
+        7 => 5,
+        8 => 5,
+        _ => 3,
     };
-    match parsed {
-        serde_json::Value::Array(values) => {
-            let mut deps = Vec::new();
-            for entry in values {
-                match entry {
-                    serde_json::Value::String(value) => {
-                        let (id, kind) = crate::issues::normalize_dependencies(&[value])
-                            .into_iter()
-                            .next()
-                            .map(|dep| (dep.id, dep.kind))
-                            .unwrap_or_else(|| (String::new(), "blocks".to_string()));
-                        if !id.trim().is_empty() {
-                            deps.push(crate::issues::IssueDependency { id, kind });
-                        }
-                    }
-                    serde_json::Value::Object(_) => {
-                        if let Ok(dep) =
-                            serde_json::from_value::<crate::issues::IssueDependency>(entry)
-                            && !dep.id.trim().is_empty()
-                        {
-                            deps.push(dep);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            deps
-        }
-        _ => Vec::new(),
-    }
+    let short_hash = encode_base36(&bytes[..num_bytes], length);
+    format!("{}-{}", prefix, short_hash)
 }
 
-fn parse_external_ref_list(value: &str) -> Vec<crate::issues::IssueExternalRef> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(trimmed).unwrap_or_default()
-    }
-}
-
-fn parse_comment_list(value: &str) -> Vec<crate::issues::IssueComment> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(trimmed).unwrap_or_default()
-    }
+fn current_timestamp_nanos() -> i128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as i128)
+        .unwrap_or(0)
 }
 
 pub struct SearchRow {
@@ -1341,14 +1619,6 @@ pub struct FtsRow {
     pub end_line: i64,
     pub text: String,
     pub score: f64,
-}
-
-fn array_value_placeholder(count: usize) -> String {
-    let mut vars = "?,".repeat(count).trim_end_matches(',').to_string();
-    if vars.is_empty() {
-        vars.push('?');
-    }
-    vars
 }
 
 pub(crate) fn build_fts_text(text: &str) -> String {
@@ -1469,25 +1739,8 @@ fn split_identifier(token: &str) -> Vec<String> {
     parts
 }
 
-fn encode_u32_blob(tokens: &[u32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(tokens.len() * 4);
-    for token in tokens {
-        buf.extend_from_slice(&token.to_le_bytes());
-    }
-    buf
-}
-
-fn encode_f32_json(embedding: &[f32]) -> String {
-    let mut out = String::with_capacity(embedding.len() * 8 + 2);
-    out.push('[');
-    for (idx, value) in embedding.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&value.to_string());
-    }
-    out.push(']');
-    out
+fn encode_f32_json(embedding: &[f32]) -> Result<String> {
+    serde_json::to_string(embedding).map_err(|err| eyre::eyre!(err))
 }
 
 #[async_trait::async_trait]
@@ -2023,7 +2276,7 @@ impl Repository for Db {
                 query_embedding.len()
             ));
         }
-        let query_json = encode_f32_json(query_embedding);
+        let query_json = encode_f32_json(query_embedding)?;
         let sql = "SELECT c.id, c.file_path, c.start_byte, c.end_byte, c.chunk_hash, c.start_line, \
        c.end_line, c.text, vector_distance_cos(c.embedding, vector32(?)) AS distance \
        FROM vector_top_k('chunks_embedding_idx', vector32(?), ?) v \
@@ -2107,43 +2360,6 @@ impl Repository for Db {
                 text: row.get::<String>(7)?,
                 score: row.get::<f64>(8)?,
             });
-        }
-        Ok(results)
-    }
-
-    async fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>> {
-        if seeds.is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let array_sql = array_value_placeholder(seeds.len());
-        let sql = format!(
-            "SELECT other_path FROM ( \
-        SELECT dst_path AS other_path, weight \
-          FROM file_cochange_edges \
-         WHERE src_path IN ({array}) \
-        UNION ALL \
-        SELECT src_path AS other_path, weight \
-          FROM file_cochange_edges \
-         WHERE dst_path IN ({array}) \
-      ) sq \
-      GROUP BY other_path \
-      ORDER BY SUM(weight) DESC \
-      LIMIT ?",
-            array = array_sql
-        );
-
-        let mut params_vec = Vec::with_capacity(seeds.len() * 2 + 1);
-        params_vec.extend(seeds.iter().cloned().map(Value::Text));
-        params_vec.extend(seeds.iter().cloned().map(Value::Text));
-        params_vec.push(Value::Integer(limit as i64));
-
-        let stmt = self.conn.prepare(&sql).await?;
-        let mut rows = stmt.query(params_from_iter(params_vec)).await?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let path: String = row.get::<String>(0)?;
-            results.push(path);
         }
         Ok(results)
     }
@@ -2489,7 +2705,7 @@ mod tests {
             fts_text: build_fts_text("hello"),
             kind: "text".to_string(),
             ordinal: 0,
-            tokens: None,
+            token_count: None,
         };
         let result = db.insert_chunk(&record, &[0.1, 0.2]).await;
 
@@ -2521,7 +2737,7 @@ mod tests {
             fts_text: build_fts_text("broken"),
             kind: "text".to_string(),
             ordinal: 0,
-            tokens: None,
+            token_count: None,
         };
         let result = db.insert_chunk(&record, &[0.1, 0.2]).await;
 

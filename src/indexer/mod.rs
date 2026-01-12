@@ -1,5 +1,3 @@
-mod batcher;
-mod embedder;
 mod processor;
 mod state;
 
@@ -7,17 +5,23 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::embedding::EmbeddingProvider;
 use crate::graph::{HistoryConfig, index_history};
 use crate::progress;
 use crate::repository::Repository;
 use eyre::{Result, eyre};
 use futures::StreamExt;
-use text_chunking::{Tokenizer, WalkOptions, walk_project};
+use niblits::{Tokenizer, WalkOptions, walk_project};
+use seasoning::EmbeddingProvider;
+use seasoning::service::EmbedderService;
 use tokio_util::sync::CancellationToken;
 
-use self::embedder::EmbedderService;
 use self::processor::{IndexProcessor, ProcessorOutput};
+
+#[derive(Clone, Debug)]
+pub(crate) struct EmbedMeta {
+    pub(crate) chunk_id: String,
+    pub(crate) file_path: String,
+}
 
 pub struct IndexerConfig {
     pub repo_path: PathBuf,
@@ -60,7 +64,6 @@ impl<'a> Indexer<'a> {
         let mut total_files = 0usize;
         let mut total_batches = 0usize;
         let mut completed_batches = 0usize;
-        let mut buffered_batch = false;
         let mut seen_files = HashSet::new();
         let update_progress =
             |files_processed: usize,
@@ -87,6 +90,8 @@ impl<'a> Indexer<'a> {
             large_file_threads: self.config.large_file_threads,
             existing_hashes,
             cancel_token: self.config.cancel_token.clone(),
+            custom_ignore_filename: Some(".crumbsignore".to_string()),
+            entry_filter: None,
         };
 
         let mut stream = walk_project(&self.config.repo_path, options);
@@ -116,13 +121,13 @@ impl<'a> Indexer<'a> {
                                 total_files,
                                 completed_batches,
                                 total_batches,
-                                buffered_batch,
+                                false,
                                 stream_done,
                                 &progress,
                             );
                         }
                         Some(Err(err)) => {
-                            return Err(err);
+                            return Err(eyre!(err));
                         }
                         None => {
                             if pending_batches > 0 {
@@ -147,20 +152,22 @@ impl<'a> Indexer<'a> {
                                     total_files,
                                     completed_batches,
                                     total_batches,
-                                    buffered_batch,
+                                    false,
                                     stream_done,
                                     &progress,
                                 );
                             }
                             let file_done = matches!(
                                 &project_chunk.chunk,
-                                text_chunking::Chunk::EndOfFile { .. }
-                                    | text_chunking::Chunk::Delete { .. }
+                                niblits::Chunk::EndOfFile { .. }
+                                    | niblits::Chunk::Delete { .. }
                             );
                             match processor.handle_chunk(project_chunk).await? {
                                 ProcessorOutput::Batch(batch_item) => {
-                                    let enqueued = embedder_service.enqueue(batch_item).await?;
-                                    buffered_batch = embedder_service.has_pending_batch();
+                                    let enqueued = embedder_service
+                                        .enqueue(batch_item)
+                                        .await
+                                        .map_err(|err| eyre!(err))?;
                                     if enqueued {
                                         pending_batches = pending_batches.saturating_add(1);
                                         total_batches = total_batches.saturating_add(1);
@@ -169,15 +176,14 @@ impl<'a> Indexer<'a> {
                                             total_files,
                                             completed_batches,
                                             total_batches,
-                                            buffered_batch,
+                                            false,
                                             stream_done,
                                             &progress,
                                         );
                                     }
                                 }
                                 ProcessorOutput::RemoveFile(file_path) => {
-                                    embedder_service.remove_file(&file_path);
-                                    buffered_batch = embedder_service.has_pending_batch();
+                                    let _ = file_path;
                                 }
                                 ProcessorOutput::None => {}
                             }
@@ -188,7 +194,7 @@ impl<'a> Indexer<'a> {
                                     total_files,
                                     completed_batches,
                                     total_batches,
-                                    buffered_batch,
+                                    false,
                                     stream_done,
                                     &progress,
                                 );
@@ -199,17 +205,20 @@ impl<'a> Indexer<'a> {
                         }
                         None => {
                             stream_done = true;
-                            if embedder_service.flush().await? {
+                            if embedder_service
+                                .flush()
+                                .await
+                                .map_err(|err| eyre!(err))?
+                            {
                                 pending_batches = pending_batches.saturating_add(1);
                                 total_batches = total_batches.saturating_add(1);
                             }
-                            buffered_batch = embedder_service.has_pending_batch();
                             update_progress(
                                 files_processed,
                                 total_files,
                                 completed_batches,
                                 total_batches,
-                                buffered_batch,
+                                false,
                                 stream_done,
                                 &progress,
                             );

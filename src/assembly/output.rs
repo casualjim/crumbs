@@ -5,12 +5,12 @@ use std::path::Path;
 
 use dark_light::Mode as DarkLightMode;
 use eyre::Result;
+use niblits::languages;
 use syntastica::Processor;
 use syntastica::language_set::SupportedLanguage;
 use syntastica::renderer::TerminalRenderer;
 use syntastica::theme::ResolvedTheme;
 use syntastica_parsers::{Lang, LanguageSetImpl};
-use text_chunking::languages;
 
 use crate::assembly::pipeline::{CandidateSource, ContextBlock};
 use crate::repository::Repository;
@@ -28,6 +28,7 @@ pub struct EnrichedBlock {
     pub end_line: usize,
     pub relevance: f64,
     pub source: CandidateSource,
+    pub sources: Vec<CandidateSource>,
     pub language: String,
     pub symbols: Vec<String>,
     pub text: String,
@@ -129,7 +130,8 @@ pub async fn enrich_blocks(
             start_line,
             end_line,
             relevance: block.score.clamp(0.0, 1.0),
-            source: block.source,
+            source: block.source.clone(),
+            sources: block.sources.clone(),
             language,
             symbols: symbol_names.into_iter().collect(),
             text: block.text.clone(),
@@ -221,8 +223,17 @@ fn write_markdown_group(out: &mut String, label: &str, blocks: &[EnrichedBlock])
         writeln!(out, "path: {}", block.file_path).ok();
         writeln!(out, "Lines: {}-{}", block.start_line, block.end_line).ok();
         writeln!(out, "relevance: {:.4}", block.relevance).ok();
-        writeln!(out, "source: {}", source_label(block.source)).ok();
-        writeln!(out, "reason: {}", reason_label(block.source)).ok();
+        writeln!(out, "source: {}", source_label(&block.source)).ok();
+        writeln!(out, "reason: {}", reason_label(&block.source)).ok();
+        if block.sources.len() > 1 {
+            let sources = block
+                .sources
+                .iter()
+                .map(source_label)
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(out, "sources: {}", sources).ok();
+        }
         writeln!(out, "language: {}", block.language).ok();
         if !block.symbols.is_empty() {
             let symbols = block
@@ -304,31 +315,52 @@ fn split_blocks(blocks: &[EnrichedBlock]) -> (Vec<EnrichedBlock>, Vec<EnrichedBl
     let mut primary = Vec::new();
     let mut expanded = Vec::new();
     for block in blocks {
-        match block.source {
-            CandidateSource::Explicit | CandidateSource::Pinned | CandidateSource::Primary => {
-                primary.push(block.clone())
-            }
-            CandidateSource::Expanded => expanded.push(block.clone()),
+        if is_primary_block(block) {
+            primary.push(block.clone());
+        } else {
+            expanded.push(block.clone());
         }
     }
     (primary, expanded)
 }
 
-fn source_label(source: CandidateSource) -> &'static str {
+fn is_primary_block(block: &EnrichedBlock) -> bool {
+    if is_primary_source(&block.source) {
+        return true;
+    }
+    block.sources.iter().any(is_primary_source)
+}
+
+fn is_primary_source(source: &CandidateSource) -> bool {
+    matches!(
+        source,
+        CandidateSource::Explicit | CandidateSource::Pinned | CandidateSource::SemanticRetrieval
+    )
+}
+
+fn source_label(source: &CandidateSource) -> &'static str {
     match source {
         CandidateSource::Explicit => "explicit",
         CandidateSource::Pinned => "pinned",
-        CandidateSource::Primary => "primary",
-        CandidateSource::Expanded => "expanded",
+        CandidateSource::SemanticRetrieval => "semantic",
+        CandidateSource::TopologyNeighbor { .. } => "topology",
+        CandidateSource::CochangeExpansion => "cochange",
+        CandidateSource::DependencyIssue { .. } => "dependency",
+        CandidateSource::RelatedIssue { .. } => "related",
+        CandidateSource::DuplicateIssue { .. } => "duplicate",
     }
 }
 
-fn reason_label(source: CandidateSource) -> &'static str {
+fn reason_label(source: &CandidateSource) -> &'static str {
     match source {
         CandidateSource::Explicit => "explicit_include",
         CandidateSource::Pinned => "pinned",
-        CandidateSource::Primary => "retrieval",
-        CandidateSource::Expanded => "expanded_neighbor",
+        CandidateSource::SemanticRetrieval => "retrieval",
+        CandidateSource::TopologyNeighbor { .. } => "topology_neighbor",
+        CandidateSource::CochangeExpansion => "cochange_neighbor",
+        CandidateSource::DependencyIssue { .. } => "dependency_issue",
+        CandidateSource::RelatedIssue { .. } => "related_issue",
+        CandidateSource::DuplicateIssue { .. } => "duplicate_issue",
     }
 }
 

@@ -1,11 +1,12 @@
 use blake3::Hasher;
 use eyre::{Result, eyre};
-use text_chunking::{FileMetadata, SemanticChunk};
+use niblits::{FileMetadata, SemanticChunk};
+use seasoning::BatchItem;
 use uuid::Uuid;
 
 use crate::db::{ChunkRecord, GraphData, ReferenceRecord, SymbolRecord, build_fts_text};
 
-use super::super::batcher::BatchItem;
+use super::super::EmbedMeta;
 use super::super::state::{PendingEof, PendingFile};
 use super::IndexProcessor;
 
@@ -23,7 +24,7 @@ impl<'a> IndexProcessor<'a> {
         file_size: u64,
         chunk: SemanticChunk,
         kind: &str,
-    ) -> Result<Option<BatchItem>> {
+    ) -> Result<Option<BatchItem<EmbedMeta>>> {
         let SemanticChunk {
             start_byte,
             end_byte,
@@ -70,7 +71,7 @@ impl<'a> IndexProcessor<'a> {
             fts_text,
             kind: kind.to_string(),
             ordinal,
-            tokens,
+            token_count: Some(token_count),
         };
 
         let is_existing = existing_id.is_some();
@@ -131,8 +132,10 @@ impl<'a> IndexProcessor<'a> {
         entry.pending_embeddings.insert(chunk_id.clone());
 
         let batch_item = BatchItem {
-            chunk_id,
-            file_path: record_file_path,
+            meta: EmbedMeta {
+                chunk_id,
+                file_path: record_file_path,
+            },
             text: record_text,
             token_count,
         };
@@ -206,11 +209,5 @@ fn stable_id(
     hasher.update(&start_byte.to_le_bytes());
     hasher.update(&end_byte.to_le_bytes());
     hasher.update(name.as_bytes());
-    let hash = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in hash.as_bytes() {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{:02x}", byte);
-    }
-    out
+    hasher.finalize().to_hex().to_string()
 }

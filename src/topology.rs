@@ -2,7 +2,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use eyre::{Result, eyre};
+use petgraph::algo::{astar, maximal_cliques, tarjan_scc as petgraph_tarjan_scc};
+use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
+use petgraph::unionfind::UnionFind;
 use serde::{Deserialize, Serialize};
+use sparse_bin_mat::SparseBinMat;
 
 use crate::repository::{CochangeEdge, DependencyEdge, Repository};
 
@@ -285,43 +289,23 @@ impl TopologySnapshot {
             return Ok(vec![start.to_string()]);
         }
 
-        let mut queue = VecDeque::new();
-        let mut visited = vec![false; self.nodes.len()];
-        let mut prev = vec![None; self.nodes.len()];
-        visited[start_idx] = true;
-        queue.push_back(start_idx);
-
-        while let Some(node) = queue.pop_front() {
-            for &edge_idx in &self.outgoing[node] {
-                let edge = &self.edges[edge_idx];
-                if edge.kind != EdgeKind::Dependency {
-                    continue;
-                }
-                let next = edge.dst;
-                if visited[next] {
-                    continue;
-                }
-                visited[next] = true;
-                prev[next] = Some(node);
-                if next == end_idx {
-                    break;
-                }
-                queue.push_back(next);
-            }
-        }
-
-        if !visited[end_idx] {
+        let graph = dependency_graph(self.nodes.len(), &self.edges);
+        let start_node = NodeIndex::new(start_idx);
+        let end_node = NodeIndex::new(end_idx);
+        let result = astar(
+            &graph,
+            start_node,
+            |finish| finish == end_node,
+            |_| 1usize,
+            |_| 0usize,
+        );
+        let Some((_, path)) = result else {
             return Ok(Vec::new());
-        }
-
-        let mut path = Vec::new();
-        let mut current = Some(end_idx);
-        while let Some(idx) = current {
-            path.push(self.nodes[idx].clone());
-            current = prev[idx];
-        }
-        path.reverse();
-        Ok(path)
+        };
+        Ok(path
+            .into_iter()
+            .map(|node| self.nodes[node.index()].clone())
+            .collect())
     }
 
     pub fn hotspots(&self, limit: usize, iterations: usize, damping: f64) -> Vec<(String, f64)> {
@@ -464,14 +448,8 @@ impl TopologySnapshot {
         }
 
         let (cochange_weights, max_cochange) = cochange_map(cochange_edges, &index);
-        let (stats, cycles) = analyze_topology(
-            &nodes,
-            &edges,
-            &outgoing,
-            &undirected,
-            &cochange_weights,
-            max_cochange,
-        );
+        let (stats, cycles) =
+            analyze_topology(&nodes, &edges, &undirected, &cochange_weights, max_cochange);
 
         Self {
             stats,
@@ -634,7 +612,6 @@ fn cochange_map(
 fn analyze_topology(
     nodes: &[String],
     edges: &[Edge],
-    outgoing: &[Vec<usize>],
     undirected: &[Vec<usize>],
     cochange_weights: &HashMap<(usize, usize), f64>,
     max_cochange: f64,
@@ -673,7 +650,7 @@ fn analyze_topology(
         triangle_count.saturating_sub(rank)
     };
 
-    let sccs = tarjan_scc(node_count, outgoing, edges);
+    let sccs = tarjan_scc(node_count, edges);
     let scc_count = sccs.len();
     let mut cycles = Vec::new();
     let mut cyclic_scc_count = 0;
@@ -806,98 +783,65 @@ fn cochange_for_edge(edge: &Edge, cochange_weights: &HashMap<(usize, usize), f64
     cochange_weights.get(&key).copied().unwrap_or(0.0)
 }
 
-fn connected_components(undirected: &[Vec<usize>]) -> Vec<Vec<usize>> {
-    let mut visited = vec![false; undirected.len()];
-    let mut components = Vec::new();
-    for start in 0..undirected.len() {
-        if visited[start] {
+fn dependency_graph(node_count: usize, edges: &[Edge]) -> DiGraph<(), ()> {
+    let dependency_edges = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Dependency)
+        .count();
+    let mut graph = DiGraph::with_capacity(node_count, dependency_edges);
+    for _ in 0..node_count {
+        graph.add_node(());
+    }
+    for edge in edges {
+        if edge.kind != EdgeKind::Dependency {
             continue;
         }
-        let mut stack = vec![start];
-        visited[start] = true;
-        let mut component = Vec::new();
-        while let Some(node) = stack.pop() {
-            component.push(node);
-            for &neighbor in &undirected[node] {
-                if !visited[neighbor] {
-                    visited[neighbor] = true;
-                    stack.push(neighbor);
-                }
-            }
-        }
-        components.push(component);
+        graph.add_edge(NodeIndex::new(edge.src), NodeIndex::new(edge.dst), ());
     }
-    components
+    graph
 }
 
-fn tarjan_scc(node_count: usize, outgoing: &[Vec<usize>], edges: &[Edge]) -> Vec<Vec<usize>> {
-    let mut index = 0usize;
-    let mut stack = Vec::new();
-    let mut on_stack = vec![false; node_count];
-    let mut indices = vec![None; node_count];
-    let mut lowlink = vec![0usize; node_count];
-    let mut result = Vec::new();
-
-    fn strongconnect(
-        v: usize,
-        index: &mut usize,
-        stack: &mut Vec<usize>,
-        on_stack: &mut Vec<bool>,
-        indices: &mut Vec<Option<usize>>,
-        lowlink: &mut Vec<usize>,
-        outgoing: &[Vec<usize>],
-        edges: &[Edge],
-        result: &mut Vec<Vec<usize>>,
-    ) {
-        indices[v] = Some(*index);
-        lowlink[v] = *index;
-        *index += 1;
-        stack.push(v);
-        on_stack[v] = true;
-
-        for &edge_idx in &outgoing[v] {
-            let edge = &edges[edge_idx];
-            let w = edge.dst;
-            if indices[w].is_none() {
-                strongconnect(
-                    w, index, stack, on_stack, indices, lowlink, outgoing, edges, result,
-                );
-                lowlink[v] = lowlink[v].min(lowlink[w]);
-            } else if on_stack[w] {
-                lowlink[v] = lowlink[v].min(indices[w].unwrap());
+fn undirected_graph(undirected: &[Vec<usize>]) -> UnGraph<(), ()> {
+    let node_count = undirected.len();
+    let edge_count = undirected
+        .iter()
+        .enumerate()
+        .map(|(src, neighbors)| neighbors.iter().filter(|&&dst| dst > src).count())
+        .sum();
+    let mut graph = UnGraph::with_capacity(node_count, edge_count);
+    for _ in 0..node_count {
+        graph.add_node(());
+    }
+    for (src, neighbors) in undirected.iter().enumerate() {
+        for &dst in neighbors {
+            if dst > src {
+                graph.add_edge(NodeIndex::new(src), NodeIndex::new(dst), ());
             }
         }
-
-        if indices[v] == Some(lowlink[v]) {
-            let mut scc = Vec::new();
-            while let Some(w) = stack.pop() {
-                on_stack[w] = false;
-                scc.push(w);
-                if w == v {
-                    break;
-                }
-            }
-            result.push(scc);
-        }
     }
+    graph
+}
 
-    for v in 0..node_count {
-        if indices[v].is_none() {
-            strongconnect(
-                v,
-                &mut index,
-                &mut stack,
-                &mut on_stack,
-                &mut indices,
-                &mut lowlink,
-                outgoing,
-                edges,
-                &mut result,
-            );
-        }
+fn connected_components(undirected: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    if undirected.is_empty() {
+        return Vec::new();
     }
+    let graph = undirected_graph(undirected);
+    petgraph_tarjan_scc(&graph)
+        .into_iter()
+        .map(|component| component.into_iter().map(|node| node.index()).collect())
+        .collect()
+}
 
-    result
+fn tarjan_scc(node_count: usize, edges: &[Edge]) -> Vec<Vec<usize>> {
+    if node_count == 0 {
+        return Vec::new();
+    }
+    let graph = dependency_graph(node_count, edges);
+    petgraph_tarjan_scc(&graph)
+        .into_iter()
+        .map(|scc| scc.into_iter().map(|node| node.index()).collect())
+        .collect()
 }
 
 fn pagerank(snapshot: &TopologySnapshot, iterations: usize, damping: f64) -> Vec<f64> {
@@ -958,38 +902,36 @@ fn find_triangles(snapshot: &TopologySnapshot, max_triangles: usize) -> Vec<[usi
 }
 
 fn collect_triangles(undirected: &[Vec<usize>], max_triangles: usize) -> Vec<[usize; 3]> {
-    let mut triangles = Vec::new();
     if undirected.len() < 3 {
-        return triangles;
+        return Vec::new();
     }
-    let mut neighbor_sets = Vec::with_capacity(undirected.len());
-    for neighbors in undirected {
-        let set: HashSet<usize> = neighbors.iter().copied().collect();
-        neighbor_sets.push(set);
-    }
-
-    for u in 0..undirected.len() {
-        let neighbors = &undirected[u];
-        for i in 0..neighbors.len() {
-            let v = neighbors[i];
-            if v <= u {
-                continue;
-            }
-            for j in (i + 1)..neighbors.len() {
-                let w = neighbors[j];
-                if w <= v {
-                    continue;
-                }
-                if neighbor_sets[v].contains(&w) {
-                    triangles.push([u, v, w]);
+    let graph = undirected_graph(undirected);
+    let mut triangles = HashSet::new();
+    for clique in maximal_cliques(&graph) {
+        if clique.len() < 3 {
+            continue;
+        }
+        let mut nodes: Vec<usize> = clique.into_iter().map(|node| node.index()).collect();
+        nodes.sort_unstable();
+        let n = nodes.len();
+        for i in 0..n.saturating_sub(2) {
+            for j in (i + 1)..n.saturating_sub(1) {
+                for k in (j + 1)..n {
+                    triangles.insert((nodes[i], nodes[j], nodes[k]));
                     if max_triangles > 0 && triangles.len() >= max_triangles {
-                        return triangles;
+                        let mut result: Vec<[usize; 3]> =
+                            triangles.into_iter().map(|(a, b, c)| [a, b, c]).collect();
+                        result.sort_unstable();
+                        return result;
                     }
                 }
             }
         }
     }
-    triangles
+
+    let mut result: Vec<[usize; 3]> = triangles.into_iter().map(|(a, b, c)| [a, b, c]).collect();
+    result.sort_unstable();
+    result
 }
 
 fn build_edge_index(edges: &HashSet<(usize, usize)>) -> HashMap<(usize, usize), usize> {
@@ -1010,11 +952,9 @@ fn triangle_boundary_rank(
     if edge_count == 0 || triangles.is_empty() {
         return 0;
     }
-    let word_len = edge_count.div_ceil(64);
-    let mut rows: Vec<Vec<u64>> = Vec::with_capacity(triangles.len());
-
+    let mut rows = Vec::with_capacity(triangles.len());
     for triangle in triangles {
-        let mut row = vec![0u64; word_len];
+        let mut row = Vec::with_capacity(3);
         let mut edges = [
             (triangle[0], triangle[1]),
             (triangle[0], triangle[2]),
@@ -1025,41 +965,21 @@ fn triangle_boundary_rank(
                 std::mem::swap(a, b);
             }
             if let Some(&idx) = edge_index.get(&(*a, *b)) {
-                row[idx / 64] ^= 1u64 << (idx % 64);
+                row.push(idx);
             }
         }
-        rows.push(row);
-    }
-
-    let mut rank = 0usize;
-    for col in 0..edge_count {
-        let word = col / 64;
-        let mask = 1u64 << (col % 64);
-        let mut pivot = None;
-        for r in rank..rows.len() {
-            if rows[r][word] & mask != 0 {
-                pivot = Some(r);
-                break;
-            }
-        }
-        let Some(pivot) = pivot else {
-            continue;
-        };
-        rows.swap(rank, pivot);
-        for r in (rank + 1)..rows.len() {
-            if rows[r][word] & mask != 0 {
-                for w in word..word_len {
-                    rows[r][w] ^= rows[rank][w];
-                }
-            }
-        }
-        rank += 1;
-        if rank == rows.len() {
-            break;
+        row.sort_unstable();
+        row.dedup();
+        if !row.is_empty() {
+            rows.push(row);
         }
     }
+    if rows.is_empty() {
+        return 0;
+    }
 
-    rank
+    let matrix = SparseBinMat::new(edge_count, rows);
+    matrix.rank()
 }
 
 struct VolumeGroup {
@@ -1072,22 +992,7 @@ fn group_triangles(snapshot: &TopologySnapshot, triangles: &[[usize; 3]]) -> Vec
     if triangles.is_empty() {
         return Vec::new();
     }
-    let mut parent: Vec<usize> = (0..triangles.len()).collect();
-
-    fn find(parent: &mut [usize], idx: usize) -> usize {
-        if parent[idx] != idx {
-            parent[idx] = find(parent, parent[idx]);
-        }
-        parent[idx]
-    }
-
-    fn union(parent: &mut [usize], a: usize, b: usize) {
-        let root_a = find(parent, a);
-        let root_b = find(parent, b);
-        if root_a != root_b {
-            parent[root_b] = root_a;
-        }
-    }
+    let mut union_find = UnionFind::new(triangles.len());
 
     let mut edge_to_triangles: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for (idx, triangle) in triangles.iter().enumerate() {
@@ -1110,13 +1015,13 @@ fn group_triangles(snapshot: &TopologySnapshot, triangles: &[[usize; 3]]) -> Vec
         }
         let first = indices[0];
         for other in indices.iter().skip(1) {
-            union(&mut parent, first, *other);
+            union_find.union(first, *other);
         }
     }
 
     let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
     for idx in 0..triangles.len() {
-        let root = find(&mut parent, idx);
+        let root = union_find.find(idx);
         groups.entry(root).or_default().push(idx);
     }
 

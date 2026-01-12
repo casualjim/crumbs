@@ -53,25 +53,27 @@ crumbs init --local
 
 Optional: assemble prompt-ready context:
 ```
-crumbs prompt "refactor the search pipeline"
+crumbs context task "refactor the search pipeline"
 ```
 
 Output is Markdown with lightweight XML tags by default.
 
 Optional: set prompt token budgets:
 ```
-crumbs prompt --max-tokens 400000 --reserved-output-tokens 4000 "refactor the search pipeline"
+crumbs context task --max-tokens 400000 --reserved-output-tokens 4000 "refactor the search pipeline"
 ```
 
 Optional: use a separate tokenizer for prompt budgeting:
 ```
-crumbs prompt --prompt-tokenizer tiktoken:o200k_base "refactor the search pipeline"
+crumbs context task --prompt-tokenizer tiktoken:o200k_base "refactor the search pipeline"
 ```
 
-Optional: retrieval tweaks (filters, decomposition, rerank):
+Optional: retrieval tweaks (scope + pinning):
 ```
-crumbs prompt --path-prefix src/ --file-ext rs --decompose --rerank "refactor the search pipeline"
+crumbs context task --scope src/ --pin src/search.rs "refactor the search pipeline"
 ```
+
+For more examples and workflows, see `docs/user-guide.md`.
 
 ## Issue management (inspired by Grits)
 
@@ -85,8 +87,10 @@ Example usage:
 crumbs issue create "Add reranking fallback" -d "Use FTS when reranker is unavailable" --label search
 crumbs issue update cr-abc123 --status in-progress --add-symbol "src/search.rs"
 crumbs issue list --status open
+crumbs issue ready --assignee ivan
 crumbs issue search "rerank"
-crumbs issue context cr-abc123 --depth 2 --limit 30
+crumbs issue edit cr-abc123
+crumbs context issue cr-abc123 --depth 2 --limit 30
 ```
 
 Credit: Issue management workflow and JSONL + SQLite dual storage are inspired by
@@ -157,8 +161,8 @@ hybrid_weight = 0.6
 ## Build & test
 
 ```
-cargo build
-cargo test --all
+mise test
+mise format
 ```
 
 ## Install from source

@@ -78,7 +78,6 @@ pub trait Repository: Send + Sync {
     fn fts_loaded(&self) -> bool;
     async fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchRow>>;
     async fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsRow>>;
-    async fn cochange_neighbors(&self, seeds: &[String], limit: usize) -> Result<Vec<String>>;
     async fn cochange_partners(&self, file_path: &str, limit: usize) -> Result<Vec<(String, f64)>>;
     async fn file_commit_count(&self, file_path: &str) -> Result<i64>;
     async fn update_file_dependency_edges(&self, file_path: &str) -> Result<()>;

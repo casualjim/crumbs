@@ -2,14 +2,14 @@ use std::collections::HashSet;
 
 use eyre::{Result, eyre};
 
-use super::super::batcher::BatchMeta;
+use super::super::EmbedMeta;
 use super::super::state::{PendingEof, PendingFile};
 use super::IndexProcessor;
 
 impl<'a> IndexProcessor<'a> {
     pub(crate) async fn apply_embeddings(
         &mut self,
-        batch: Vec<BatchMeta>,
+        batch: Vec<EmbedMeta>,
         embeddings: Vec<Vec<f32>>,
     ) -> Result<()> {
         if embeddings.len() != batch.len() {

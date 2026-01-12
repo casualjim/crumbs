@@ -7,8 +7,9 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use crate::config::AppConfig;
-use crate::embedding::EmbeddingProvider;
 use crate::repository::Repository;
+use seasoning::EmbeddingProvider;
+use seasoning::RerankingProvider;
 
 #[derive(Clone, Debug, Default)]
 pub struct SelectionOptions {
@@ -24,7 +25,7 @@ pub struct AssemblyContext<'a> {
     pub repo_path: &'a Path,
     pub db: &'a dyn Repository,
     pub embedder: Option<&'a dyn EmbeddingProvider>,
-    pub reranker: &'a dyn crate::reranker::RerankingProvider,
+    pub reranker: &'a dyn RerankingProvider,
     #[allow(dead_code)]
     pub config: &'a AppConfig,
     pub selection: SelectionOptions,

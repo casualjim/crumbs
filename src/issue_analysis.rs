@@ -67,12 +67,14 @@ pub fn suggest_next_tasks(
 
         let mut blockers = Vec::new();
         for dep in &issue.dependencies {
-            if dep.id.trim().is_empty() || !dep.is_blocking() {
+            if dep.depends_on_id.trim().is_empty()
+                || !dep.type_.trim().eq_ignore_ascii_case("blocking")
+            {
                 continue;
             }
-            match status_map.get(&dep.id) {
-                Some(status) if status != "closed" => blockers.push(dep.id.clone()),
-                None => blockers.push(dep.id.clone()),
+            match status_map.get(&dep.depends_on_id) {
+                Some(status) if status != "closed" => blockers.push(dep.depends_on_id.clone()),
+                None => blockers.push(dep.depends_on_id.clone()),
                 _ => {}
             }
         }
@@ -529,9 +531,13 @@ mod tests {
     use super::*;
 
     fn make_issue(id: &str, title: &str) -> Issue {
-        let mut issue = Issue::new(title.to_string());
-        issue.id = id.to_string();
-        issue
+        Issue::new(
+            id.to_string(),
+            title.to_string(),
+            String::new(),
+            "task".to_string(),
+            3,
+        )
     }
 
     #[test]
@@ -541,9 +547,12 @@ mod tests {
         ready.updated_at = Timestamp::now().to_string();
 
         let mut blocked = make_issue("cr-blocked", "Blocked");
-        blocked.dependencies = vec![crate::issues::IssueDependency {
-            id: "cr-missing".to_string(),
-            kind: "blocks".to_string(),
+        blocked.dependencies = vec![crate::issues::Dependency {
+            issue_id: blocked.id.clone(),
+            depends_on_id: "cr-missing".to_string(),
+            type_: "blocking".to_string(),
+            created_at: Timestamp::now().to_string(),
+            created_by: "tests".to_string(),
         }];
 
         let mut closed = make_issue("cr-closed", "Closed");

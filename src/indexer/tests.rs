@@ -2,8 +2,8 @@ use super::*;
 use std::time::Duration;
 
 use libsql::{Builder, Value, params};
+use niblits::Tokenizer;
 use tempfile::TempDir;
-use text_chunking::Tokenizer;
 use tokio::time::sleep;
 
 use crate::Db;
@@ -28,7 +28,7 @@ fn chunk_record(
     id: &str,
     file_path: &str,
     chunk_hash: [u8; 32],
-    tokens: Option<Vec<u32>>,
+    token_count: Option<usize>,
 ) -> ChunkRecord {
     ChunkRecord {
         id: id.to_string(),
@@ -42,7 +42,7 @@ fn chunk_record(
         fts_text: build_fts_text("hello world"),
         kind: "text".to_string(),
         ordinal: 0,
-        tokens,
+        token_count,
     }
 }
 
@@ -61,33 +61,24 @@ async fn query_updated_at(dir: &TempDir, file_path: &str) -> String {
     row.get::<String>(0).expect("updated_at")
 }
 
-async fn query_tokens(dir: &TempDir, chunk_id: &str) -> Vec<i32> {
+async fn query_token_count(dir: &TempDir, chunk_id: &str) -> i64 {
     let db_path = dir.path().join("crumbs.db");
     let db = Builder::new_local(db_path).build().await.expect("open db");
     let conn = db.connect().expect("open conn");
     let mut rows = conn
-        .query("SELECT tokens FROM chunks WHERE id = ?", params![chunk_id])
+        .query(
+            "SELECT token_count FROM chunks WHERE id = ?",
+            params![chunk_id],
+        )
         .await
-        .expect("query tokens");
+        .expect("query token_count");
     let row = rows.next().await.expect("rows").expect("row");
-    let value: Value = row.get(0).expect("tokens");
+    let value: Value = row.get(0).expect("token_count");
     match value {
-        Value::Blob(blob) => decode_tokens(&blob),
-        Value::Null => Vec::new(),
-        other => panic!("unexpected tokens value: {other:?}"),
+        Value::Integer(value) => value,
+        Value::Null => 0,
+        other => panic!("unexpected token_count value: {other:?}"),
     }
-}
-
-fn decode_tokens(blob: &[u8]) -> Vec<i32> {
-    if blob.is_empty() {
-        return Vec::new();
-    }
-    if !blob.len().is_multiple_of(4) {
-        panic!("invalid token blob length {}", blob.len());
-    }
-    blob.chunks_exact(4)
-        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
 }
 
 async fn insert_files(db: &Db, paths: &[&str]) {
@@ -313,7 +304,7 @@ async fn find_chunk_id_should_dedupe_when_offsets_shift() {
 async fn tokens_should_update_without_embedding() {
     let (db, dir) = setup_db().await;
     let hash = make_hash(5);
-    let record = chunk_record("c1", "a.rs", hash, Some(vec![1, 2]));
+    let record = chunk_record("c1", "a.rs", hash, Some(2));
     db.upsert_file_metadata("a.rs", 10, hash, None)
         .await
         .expect("insert file");
@@ -322,18 +313,17 @@ async fn tokens_should_update_without_embedding() {
         .expect("insert chunk");
 
     let updated = ChunkRecord {
-        tokens: Some(vec![9, 9]),
+        token_count: Some(3),
         ..record
     };
     db.update_chunk_without_embedding(&updated)
         .await
         .expect("update");
 
-    let tokens = query_tokens(&dir, "c1").await;
+    let token_count = query_token_count(&dir, "c1").await;
     assert_eq!(
-        tokens,
-        vec![9, 9],
-        "tokens should be updated for existing chunks"
+        token_count, 3,
+        "token count should be updated for existing chunks"
     );
 }
 

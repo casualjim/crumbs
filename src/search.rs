@@ -6,10 +6,11 @@ use tracing::warn;
 use std::path::Path;
 
 use crate::db::{FtsRow, SearchRow};
-use crate::embedding::{EmbeddingInput, EmbeddingProvider};
 use crate::repository::Repository;
-use crate::reranker::RerankingProvider;
-use text_chunking::Tokenizer as ChunkTokenizer;
+use niblits::Tokenizer as ChunkTokenizer;
+use seasoning::{
+    EmbeddingInput, EmbeddingProvider, RerankDocument, RerankQuery, RerankingProvider,
+};
 use tiktoken_rs::{cl100k_base, o200k_base, p50k_base, p50k_edit, r50k_base};
 use tokenizers::Tokenizer as HfTokenizer;
 
@@ -102,6 +103,23 @@ pub async fn search(
     query: &str,
     config: SearchConfig,
 ) -> Result<Vec<SearchResult>> {
+    search_internal(ctx, query, config, true).await
+}
+
+pub async fn search_without_rerank(
+    ctx: &SearchContext<'_>,
+    query: &str,
+    config: SearchConfig,
+) -> Result<Vec<SearchResult>> {
+    search_internal(ctx, query, config, false).await
+}
+
+async fn search_internal(
+    ctx: &SearchContext<'_>,
+    query: &str,
+    config: SearchConfig,
+    rerank: bool,
+) -> Result<Vec<SearchResult>> {
     let config = config.normalize();
     report_progress(ctx.progress, "preparing query");
     let mut combined = search_single(ctx, query, config.limit, config.hybrid_weight)
@@ -115,28 +133,45 @@ pub async fn search(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     combined.truncate(config.limit);
-    let documents: Vec<String> = combined.iter().map(|item| item.text.clone()).collect();
-    report_progress(ctx.progress, "reranking results");
-    let scores = ctx
-        .reranker
-        .rerank(query, &documents)
-        .await
-        .map_err(|err| eyre!("reranking failed: {err}"))?;
-    if scores.len() != combined.len() {
-        return Err(eyre!(
-            "reranker returned {} scores for {} results",
-            scores.len(),
-            combined.len()
-        ));
+    if rerank {
+        let documents: Vec<String> = combined.iter().map(|item| item.text.clone()).collect();
+        report_progress(ctx.progress, "reranking results");
+        let token_count = count_tokens(ctx.tokenizer, query)?;
+        let query = RerankQuery {
+            text: query.to_string(),
+            token_count,
+        };
+        let documents = documents
+            .iter()
+            .map(|text| {
+                Ok(RerankDocument {
+                    token_count: count_tokens(ctx.tokenizer, text)?,
+                    text: text.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let scores = ctx
+            .reranker
+            .rerank(&query, &documents)
+            .await
+            .map_err(|err| eyre!("reranking failed: {err}"))?;
+        if scores.len() != combined.len() {
+            return Err(eyre!(
+                "reranker returned {} scores for {} results",
+                scores.len(),
+                combined.len()
+            ));
+        }
+        for (result, score) in combined.iter_mut().zip(scores.iter()) {
+            result.score = *score;
+        }
+        combined.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
-    for (result, score) in combined.iter_mut().zip(scores.iter()) {
-        result.score = *score;
-    }
-    combined.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+
     combined.retain(|item| item.score >= config.min_score);
     Ok(combined)
 }
@@ -187,7 +222,7 @@ async fn search_single(
     merge_results(vector_results, fts_results, limit, hybrid_weight)
 }
 
-fn count_tokens(tokenizer: &ChunkTokenizer, text: &str) -> Result<usize> {
+pub(crate) fn count_tokens(tokenizer: &ChunkTokenizer, text: &str) -> Result<usize> {
     match tokenizer {
         ChunkTokenizer::Characters => Ok(text.chars().count()),
         ChunkTokenizer::Tiktoken(encoding) => {

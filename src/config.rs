@@ -27,6 +27,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub search: SearchOptions,
     #[config(nested)]
+    pub context: ContextOptions,
+    #[config(nested)]
     pub prompt: Prompting,
 }
 
@@ -284,6 +286,96 @@ pub struct SearchOptions {
 
 #[derive(confique::Config, Debug, Clone, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone)))]
+pub struct ContextOptions {
+    #[config(default = 50, env = "CRUMBS_CONTEXT_SEMANTIC_LIMIT")]
+    pub semantic_limit: usize,
+    #[config(default = 2, env = "CRUMBS_CONTEXT_TOPOLOGY_DEPTH")]
+    pub topology_depth: usize,
+    #[config(default = 30, env = "CRUMBS_CONTEXT_TOPOLOGY_LIMIT")]
+    pub topology_limit: usize,
+    #[config(default = 20, env = "CRUMBS_CONTEXT_COCHANGE_LIMIT")]
+    pub cochange_limit: usize,
+    #[config(default = 10, env = "CRUMBS_CONTEXT_DEPENDENCY_ISSUE_LIMIT")]
+    pub dependency_issue_limit: usize,
+    #[config(default = 10, env = "CRUMBS_CONTEXT_RELATED_ISSUE_LIMIT")]
+    pub related_issue_limit: usize,
+    #[config(default = 3, env = "CRUMBS_CONTEXT_DUPLICATE_LIMIT")]
+    pub duplicate_limit: usize,
+    #[config(default = 0.6, env = "CRUMBS_CONTEXT_DUPLICATE_THRESHOLD")]
+    pub duplicate_threshold: f64,
+    #[config(default = 5, env = "CRUMBS_CONTEXT_PER_FILE_LIMIT")]
+    pub per_file_limit: usize,
+    #[config(default = 40, env = "CRUMBS_CONTEXT_MAX_BLOCKS")]
+    pub max_blocks: usize,
+    #[config(default = 5, env = "CRUMBS_CONTEXT_MAX_PER_FILE")]
+    pub max_per_file: usize,
+    #[config(default = 0.7, env = "CRUMBS_CONTEXT_DIVERSITY_LAMBDA")]
+    pub diversity_lambda: f64,
+    #[config(default = 30, env = "CRUMBS_CONTEXT_RERANK_TOP_N")]
+    pub rerank_top_n: usize,
+    #[config(default = 0.7, env = "CRUMBS_CONTEXT_RERANK_BLEND")]
+    pub rerank_blend: f64,
+    #[config(default = 0.40, env = "CRUMBS_CONTEXT_SEMANTIC_WEIGHT")]
+    pub semantic_weight: f64,
+    #[config(default = 0.25, env = "CRUMBS_CONTEXT_TOPOLOGY_WEIGHT")]
+    pub topology_weight: f64,
+    #[config(default = 0.15, env = "CRUMBS_CONTEXT_COCHANGE_WEIGHT")]
+    pub cochange_weight: f64,
+    #[config(default = 0.10, env = "CRUMBS_CONTEXT_RECENCY_WEIGHT")]
+    pub recency_weight: f64,
+    #[config(default = 0.05, env = "CRUMBS_CONTEXT_CENTRALITY_WEIGHT")]
+    pub centrality_weight: f64,
+    #[config(default = 0.05, env = "CRUMBS_CONTEXT_METADATA_WEIGHT")]
+    pub metadata_weight: f64,
+    #[config(default = 1.0, env = "CRUMBS_CONTEXT_TOPOLOGY_DISTANCE_DECAY")]
+    pub topology_distance_decay: f64,
+    #[config(default = 0.05, env = "CRUMBS_CONTEXT_LABEL_MATCH_BOOST")]
+    pub label_match_boost: f64,
+    #[config(default = 0.10, env = "CRUMBS_CONTEXT_DEPENDENCY_BOOST")]
+    pub dependency_boost: f64,
+    #[config(default = 0.08, env = "CRUMBS_CONTEXT_RELATES_TO_BOOST")]
+    pub relates_to_boost: f64,
+    #[config(default = 0.05, env = "CRUMBS_CONTEXT_DUPLICATE_BOOST")]
+    pub duplicate_boost: f64,
+    #[config(default = 0.10, env = "CRUMBS_CONTEXT_MULTI_SOURCE_BONUS")]
+    pub multi_source_bonus: f64,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        Self {
+            semantic_limit: 50,
+            topology_depth: 2,
+            topology_limit: 30,
+            cochange_limit: 20,
+            dependency_issue_limit: 10,
+            related_issue_limit: 10,
+            duplicate_limit: 3,
+            duplicate_threshold: 0.6,
+            per_file_limit: 5,
+            max_blocks: 40,
+            max_per_file: 5,
+            diversity_lambda: 0.7,
+            rerank_top_n: 30,
+            rerank_blend: 0.7,
+            semantic_weight: 0.40,
+            topology_weight: 0.25,
+            cochange_weight: 0.15,
+            recency_weight: 0.10,
+            centrality_weight: 0.05,
+            metadata_weight: 0.05,
+            topology_distance_decay: 1.0,
+            label_match_boost: 0.05,
+            dependency_boost: 0.10,
+            relates_to_boost: 0.08,
+            duplicate_boost: 0.05,
+            multi_source_bonus: 0.10,
+        }
+    }
+}
+
+#[derive(confique::Config, Debug, Clone, Serialize)]
+#[config(layer_attr(derive(clap::Args, Clone)))]
 pub struct Prompting {
     #[config(default = "", env = "CRUMBS_PROMPT_TOKENIZER")]
     #[config(layer_attr(arg(
@@ -326,11 +418,11 @@ pub enum Command {
     Index(IndexCli),
     #[command(about = "Search the index with a natural language query")]
     Search(SearchCli),
-    #[command(about = "Assemble prompt-ready context for a task")]
-    Prompt(PromptCli),
+    #[command(about = "Assemble prompt-ready context for a task, issue, or topology")]
+    Context(ContextCli),
     #[command(about = "Analyze dependency topology and suggest refactors")]
     Topology(TopologyCli),
-    #[command(about = "Manage local issues and topology context")]
+    #[command(about = "Manage local issues")]
     Issue(IssueCli),
     #[command(about = "Manage configuration files")]
     Config(ConfigCli),
@@ -369,6 +461,24 @@ pub struct SearchCli {
 }
 
 #[derive(Args)]
+pub struct ContextCli {
+    #[command(flatten)]
+    pub project: ProjectCli,
+    #[command(subcommand)]
+    pub command: ContextCommand,
+}
+
+#[derive(Subcommand)]
+pub enum ContextCommand {
+    #[command(about = "Assemble prompt-ready context for a task")]
+    Task(Box<ContextTaskCli>),
+    #[command(about = "Assemble issue context (unified retrieval)")]
+    Issue(Box<ContextIssueCli>),
+    #[command(about = "Assemble a topology-driven mini codebase")]
+    Topology(Box<TopologyAssembleCli>),
+}
+
+#[derive(Args)]
 pub struct InitCli {
     #[arg(
         long = "local",
@@ -380,13 +490,11 @@ pub struct InitCli {
 }
 
 #[derive(Args)]
-pub struct PromptCli {
+pub struct ContextTaskCli {
     #[command(flatten)]
     pub embedding: <Embedding as confique::Config>::Layer,
     #[command(flatten)]
     pub reranker: <Reranker as confique::Config>::Layer,
-    #[command(flatten)]
-    pub project: ProjectCli,
     #[command(flatten)]
     pub search: <SearchOptions as confique::Config>::Layer,
     #[command(flatten)]
@@ -403,30 +511,6 @@ pub struct PromptCli {
         help = "Tokens reserved for model output"
     )]
     pub reserved_output_tokens: usize,
-    #[arg(
-        long = "topology",
-        default_value_t = false,
-        help = "Use topology-driven mini codebase assembly instead of retrieval"
-    )]
-    pub topology: bool,
-    #[arg(
-        long = "topology-depth",
-        default_value_t = 1,
-        help = "Neighbor depth for topology assembly"
-    )]
-    pub topology_depth: usize,
-    #[arg(
-        long = "topology-limit",
-        default_value_t = 25,
-        help = "Maximum files to include for topology assembly"
-    )]
-    pub topology_limit: usize,
-    #[arg(
-        long = "topology-per-file",
-        default_value_t = 5,
-        help = "Maximum chunks per file for topology assembly"
-    )]
-    pub topology_per_file: usize,
     #[arg(
         long = "sections",
         value_enum,
@@ -486,21 +570,23 @@ pub struct IssueCli {
 #[derive(Subcommand)]
 pub enum IssueCommand {
     #[command(about = "Create a new issue")]
-    Create(IssueCreateCli),
+    Create(Box<IssueCreateCli>),
     #[command(about = "Update an existing issue")]
-    Update(IssueUpdateCli),
+    Update(Box<IssueUpdateCli>),
     #[command(about = "Close an issue")]
     Close(IssueCloseCli),
     #[command(about = "Show issue details")]
     Get(IssueGetCli),
+    #[command(about = "Edit an issue in your $EDITOR")]
+    Edit(IssueEditCli),
     #[command(about = "List issues")]
     List(IssueListCli),
+    #[command(about = "Sync issues.jsonl with git history")]
+    Sync(IssueSyncCli),
     #[command(about = "Search issues by text")]
     Search(IssueSearchCli),
-    #[command(about = "Assemble issue context (topology or semantic search)")]
-    Context(IssueContextCli),
-    #[command(about = "Suggest the next task to work on")]
-    Next(IssueNextCli),
+    #[command(about = "Show issues ready to work on (unblocked/actionable)")]
+    Ready(IssueReadyCli),
     #[command(about = "Show stale issues by last update time")]
     Stale(IssueStaleCli),
     #[command(about = "Apply a triage update to multiple issues")]
@@ -529,8 +615,6 @@ pub enum TopologyCommand {
     Layers(TopologyLayersCli),
     #[command(about = "Suggest edges to cut to break cycles")]
     Refactor(TopologyRefactorCli),
-    #[command(about = "Assemble a topology-driven mini codebase")]
-    Assemble(TopologyAssembleCli),
     #[command(about = "Export topology graph data")]
     Export(TopologyExportCli),
     #[command(about = "Save a topology snapshot into the database")]
@@ -759,10 +843,22 @@ pub struct IssueCreateCli {
     pub relates_to: Vec<String>,
     #[arg(long = "add-symbol", value_delimiter = ',', num_args = 0.., help = "Affected symbols or files")]
     pub affected_symbols: Vec<String>,
-    #[arg(long = "external-ref", value_delimiter = ',', num_args = 0.., help = "External refs (kind:value or value)")]
-    pub external_refs: Vec<String>,
+    #[arg(long = "sender", help = "Sender identifier")]
+    pub sender: Option<String>,
+    #[arg(long = "ephemeral", help = "Mark issue as ephemeral")]
+    pub ephemeral: bool,
+    #[arg(long = "replies-to", help = "Reply to issue ID")]
+    pub replies_to: Option<String>,
+    #[arg(long = "solid-volume", help = "Solid volume identifier")]
+    pub solid_volume: Option<String>,
+    #[arg(long = "topology-hash", help = "Topology hash")]
+    pub topology_hash: Option<String>,
+    #[arg(long = "is-solid", help = "Mark issue as solid")]
+    pub is_solid: bool,
+    #[arg(long = "external-ref", help = "External ref (kind:value or value)")]
+    pub external_ref: Option<String>,
     #[arg(long = "estimate-minutes", help = "Estimated effort in minutes")]
-    pub estimate_minutes: Option<i32>,
+    pub estimated_minutes: Option<i32>,
     #[arg(long = "duplicate-of", help = "Mark as duplicate of issue ID")]
     pub duplicate_of: Option<String>,
     #[arg(long = "superseded-by", help = "Mark as superseded by issue ID")]
@@ -811,12 +907,37 @@ pub struct IssueUpdateCli {
     pub add_symbols: Vec<String>,
     #[arg(long = "remove-symbol", value_delimiter = ',', num_args = 0.., help = "Affected symbols or files to remove")]
     pub remove_symbols: Vec<String>,
-    #[arg(long = "add-external-ref", value_delimiter = ',', num_args = 0.., help = "External refs to add (kind:value or value)")]
-    pub add_external_refs: Vec<String>,
-    #[arg(long = "remove-external-ref", value_delimiter = ',', num_args = 0.., help = "External refs to remove")]
-    pub remove_external_refs: Vec<String>,
+    #[arg(long = "sender", help = "Update sender (empty string clears)")]
+    pub sender: Option<String>,
+    #[arg(long = "ephemeral", help = "Mark issue as ephemeral")]
+    pub ephemeral: bool,
+    #[arg(long = "clear-ephemeral", help = "Clear ephemeral flag")]
+    pub clear_ephemeral: bool,
+    #[arg(
+        long = "replies-to",
+        help = "Update reply-to issue ID (empty string clears)"
+    )]
+    pub replies_to: Option<String>,
+    #[arg(
+        long = "solid-volume",
+        help = "Update solid volume (empty string clears)"
+    )]
+    pub solid_volume: Option<String>,
+    #[arg(
+        long = "topology-hash",
+        help = "Update topology hash (empty string clears)"
+    )]
+    pub topology_hash: Option<String>,
+    #[arg(long = "is-solid", help = "Mark issue as solid")]
+    pub is_solid: bool,
+    #[arg(long = "clear-is-solid", help = "Clear solid flag")]
+    pub clear_is_solid: bool,
+    #[arg(long = "external-ref", help = "Set external ref (empty clears)")]
+    pub external_ref: Option<String>,
+    #[arg(long = "clear-external-ref", help = "Clear external ref")]
+    pub clear_external_ref: bool,
     #[arg(long = "estimate-minutes", help = "Set estimate in minutes")]
-    pub estimate_minutes: Option<i32>,
+    pub estimated_minutes: Option<i32>,
     #[arg(long = "clear-estimate", help = "Clear estimate")]
     pub clear_estimate: bool,
     #[arg(
@@ -841,8 +962,8 @@ pub struct IssueUpdateCli {
     pub mark_deleted: bool,
     #[arg(long = "deleted-by", help = "Deleted-by identifier")]
     pub deleted_by: Option<String>,
-    #[arg(long = "deleted-reason", help = "Deletion reason")]
-    pub deleted_reason: Option<String>,
+    #[arg(long = "delete-reason", help = "Deletion reason")]
+    pub delete_reason: Option<String>,
     #[arg(long = "restore", help = "Clear deletion metadata")]
     pub restore: bool,
 }
@@ -855,6 +976,12 @@ pub struct IssueCloseCli {
 
 #[derive(Args)]
 pub struct IssueGetCli {
+    #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct IssueEditCli {
     #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
     pub id: String,
 }
@@ -876,6 +1003,18 @@ pub struct IssueListCli {
 }
 
 #[derive(Args)]
+pub struct IssueSyncCli {
+    #[arg(
+        long = "message",
+        default_value = "Sync issues",
+        help = "Commit message for the sync"
+    )]
+    pub message: String,
+    #[arg(long = "no-push", help = "Do not push after syncing")]
+    pub no_push: bool,
+}
+
+#[derive(Args)]
 pub struct IssueSearchCli {
     #[arg(value_name = "QUERY", help = "Search query")]
     pub query: String,
@@ -884,7 +1023,7 @@ pub struct IssueSearchCli {
 }
 
 #[derive(Args)]
-pub struct IssueContextCli {
+pub struct ContextIssueCli {
     #[arg(value_name = "ID", help = "Issue ID (or prefix)")]
     pub id: String,
     #[arg(
@@ -912,7 +1051,7 @@ pub struct IssueContextCli {
 }
 
 #[derive(Args)]
-pub struct IssueNextCli {
+pub struct IssueReadyCli {
     #[arg(long = "assignee", help = "Filter by assignee")]
     pub assignee: Option<String>,
     #[arg(long = "limit", default_value_t = 5, help = "Limit results")]
@@ -1084,12 +1223,17 @@ pub fn load_config(cli: &Cli) -> eyre::Result<AppConfig> {
             cli_layer.reranker = cmd.reranker.clone();
             cli_layer.search = cmd.search.clone();
         }
-        Command::Prompt(cmd) => {
-            cli_layer.embedding = cmd.embedding.clone();
-            cli_layer.reranker = cmd.reranker.clone();
-            cli_layer.search = cmd.search.clone();
-            cli_layer.prompt = cmd.prompt.clone();
-        }
+        Command::Context(cmd) => match &cmd.command {
+            ContextCommand::Task(task) => {
+                let task = task.as_ref();
+                cli_layer.embedding = task.embedding.clone();
+                cli_layer.reranker = task.reranker.clone();
+                cli_layer.search = task.search.clone();
+                cli_layer.prompt = task.prompt.clone();
+            }
+            ContextCommand::Issue(_) => {}
+            ContextCommand::Topology(_) => {}
+        },
         Command::Topology(_) => {}
         Command::Issue(_) => {}
         Command::Config(_) => {}
@@ -1710,6 +1854,7 @@ mod tests {
                 path_prefixes: Vec::new(),
                 file_exts: Vec::new(),
             },
+            context: ContextOptions::default(),
             prompt: Prompting {
                 tokenizer: String::new(),
                 theme: String::new(),
@@ -1807,6 +1952,7 @@ mod tests {
                 path_prefixes: Vec::new(),
                 file_exts: Vec::new(),
             },
+            context: ContextOptions::default(),
             prompt: Prompting {
                 tokenizer: String::new(),
                 theme: String::new(),
